@@ -155,9 +155,14 @@ $pushTool = Join-Path $here 'push_weixin.py'
 $wxPushOk = $false
 
 if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
-    Log "[$([DateTime]::Now)] pushing report to WeChat via Hermes..."
+    # Only push the "⚡ 高优先级关注" section (typically ~1 chunk). The full
+    # report still goes to disk + email fallback, so nothing is lost. Keeps
+    # daily push volume well under iLink's ~10/session quota.
+    $pushSection = 0xE2,0x9A,0xA1   # UTF-8 bytes for "⚡" — keeps this .ps1 pure ASCII
+    $pushSection = [System.Text.Encoding]::UTF8.GetString([byte[]]$pushSection)
+    Log "[$([DateTime]::Now)] pushing '$pushSection' section to WeChat via Hermes..."
     try {
-        $pushOut = & $venvPy $pushTool $reportFile 2>&1
+        $pushOut = & $venvPy $pushTool $reportFile --section $pushSection 2>&1
         foreach ($line in $pushOut) { Log "    [push] $line" }
         if ($LASTEXITCODE -eq 0) {
             $wxPushOk = $true

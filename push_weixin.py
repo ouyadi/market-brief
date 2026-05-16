@@ -3,13 +3,19 @@ Push a markdown file to WeChat via Hermes Agent's iLink adapter.
 
 Usage:
   python push_weixin.py <markdown_file>
+  python push_weixin.py <markdown_file> --section "⚡"
   python push_weixin.py --message "short literal message"
 
 Reads credentials from ~/.hermes/.env (written by qr_login_bootstrap.py).
 Falls back to ~/.hermes/weixin/accounts/<id>.json if .env is incomplete.
 
+When --section is given, only the H2 section whose heading contains that
+substring is pushed, prefixed with the report's pre-H2 header (title +
+mode + scan-window metadata). This keeps each push to ~1 chunk and stays
+well under iLink's ~10/session quota.
+
 Exit codes:
-  0 success, 2 config error, 3 send error.
+  0 success, 2 config error, 3 send error, 4 section not found.
 """
 
 from __future__ import annotations
@@ -18,12 +24,38 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from gateway.platforms.weixin import send_weixin_direct
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def extract_section(markdown: str, needle: str) -> str | None:
+    """
+    Return the report header (everything before the first H2) + the H2 section
+    whose heading contains ``needle``. Returns None if no matching section.
+    """
+    lines = markdown.splitlines()
+    h2_re = re.compile(r"^##\s+(.*)$")
+
+    # Find indices of all H2 lines + the index of the first one (= where header ends).
+    h2_idxs = [i for i, ln in enumerate(lines) if h2_re.match(ln)]
+    if not h2_idxs:
+        return None
+
+    header = "\n".join(lines[: h2_idxs[0]]).rstrip()
+
+    needle_lower = needle.lower()
+    for pos, idx in enumerate(h2_idxs):
+        title = h2_re.match(lines[idx]).group(1)
+        if needle_lower in title.lower():
+            end = h2_idxs[pos + 1] if pos + 1 < len(h2_idxs) else len(lines)
+            section = "\n".join(lines[idx:end]).rstrip()
+            return f"{header}\n\n{section}\n" if header else section + "\n"
+    return None
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -120,6 +152,15 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("path", nargs="?", help="Path to a markdown file to push.")
     group.add_argument("--message", "-m", help="Literal message string to push.")
+    parser.add_argument(
+        "--section",
+        "-s",
+        help=(
+            "Only push the H2 section whose heading contains this substring "
+            "(plus the report's pre-H2 header). Ignored when --message is used. "
+            'Example: --section "⚡" picks "## ⚡ 高优先级关注".'
+        ),
+    )
     args = parser.parse_args()
 
     if args.message:
@@ -130,6 +171,17 @@ def main() -> int:
             print(f"[ERROR] file not found: {p}", file=sys.stderr)
             return 2
         text = p.read_text(encoding="utf-8")
+
+        if args.section:
+            extracted = extract_section(text, args.section)
+            if extracted is None:
+                print(
+                    f"[ERROR] no H2 section contains substring {args.section!r}; "
+                    f"file: {p}",
+                    file=sys.stderr,
+                )
+                return 4
+            text = extracted
 
     if not text.strip():
         print("[ERROR] empty message", file=sys.stderr)

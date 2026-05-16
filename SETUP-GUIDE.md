@@ -370,6 +370,66 @@ Get-Content C:\Users\<你>\chatlog\chatlog\log\chatlog.log -Tail 20
 
 ---
 
+## Step 8 — 入站监听 (可选,让你能在微信里跟 Claude 聊天)
+
+到此为止 outbound 已经完成(Claude → 你的微信)。如果你还想让 inbound 也通(**你给 bot 发消息 → Claude 用同样的 MCP 工具帮你回答 → 推回你的微信**),装入站 listener。
+
+架构:
+
+```
+你在微信里发任何消息给 bot
+     ↓
+WeixinListener (At log on 启动的隐藏 daemon)
+     ↓
+listen_weixin.py long-poll iLink /getupdates
+     ↓
+  斜杠命令(零 Claude 消耗):
+    /ping   listener 在线测试
+    /brief  立刻触发一次 MarketBrief
+    /help   命令列表
+  其他文本 → claude --print 带"股票情报员"人设 + 所有 MCP 工具
+     ↓
+send_weixin_direct 回推到同一个聊天
+```
+
+只回复来自 `WEIXIN_HOME_CHANNEL`(也就是你自己)的消息,陌生人 DM 这个 bot 不会被响应。
+
+### 8.1 安装 + 启动
+
+```powershell
+# 注册 At-log-on 隐藏窗口的 task
+powershell -NoProfile -ExecutionPolicy Bypass `
+    -File C:\Users\<你>\Scripts\market-brief\install-listener.ps1
+
+# 立刻启动(不必等下次登录)
+Start-ScheduledTask -TaskName WeixinListener
+
+# 确认有且仅有一对(venv shim + base interpreter)listener 进程
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    Where-Object { $_.CommandLine -match 'listen_weixin' } |
+    Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine |
+    Format-List
+```
+
+### 8.2 测试
+
+1. 在微信发 `/ping` → 应当几秒内收到 `pong (listener up Xh Ym Zs)`
+2. 发 `/help` → 收到命令列表
+3. 发个真问题(`月哥下午说啥了`)→ 20s-3min 后收到 Claude 的中文回答(带具体出处和数字)
+
+日志位置:
+- `C:\Users\<你>\Scripts\market-brief\logs\listen_weixin.log` — listener 自己的结构化日志
+- `listener.YYYY-MM-DD.err.log` — PowerShell wrapper 的 stderr(parse 错误会落这里)
+
+### 8.3 注意事项
+
+- **run-listener.ps1 必须纯 ASCII**(无中文、无中划线 `—`、无智能引号)。Task Scheduler spawn `powershell.exe -File <脚本>` 时,没 BOM 的 .ps1 用系统 codepage 解析,非 ASCII 字节会破坏引号配对导致 parse 失败
+- **入站 + 出站共享同一个 iLink token**,但走不同 endpoint(`/getupdates` vs `/sendmessage`),不会互抢长连接锁
+- **任意时刻只跑一个 listener python 进程对**(shim + base interpreter 是一对,parent-child)。如果看到多对独立进程,先 `Stop-Process` 杀掉残留再重启 task
+- **每次自由问答都会跑一次 `claude --print`**,消耗 OAuth subscription 的 token。频繁问可能撞 Claude API rate limit
+
+---
+
 ## 踩坑清单
 
 | 症状 | 根因 | 修法 |
@@ -386,6 +446,8 @@ Get-Content C:\Users\<你>\chatlog\chatlog\log\chatlog.log -Tail 20
 | Task 在 14:59:58 fire 写到 14 点的文件 | Windows clock skew | run.ps1 已经 `AddSeconds(30)` 加偏移 |
 | OneDrive 把 chatlog 数据吃成 cloud-only | Files-On-Demand 默认行为 | `attrib +P` pin 那些目录强制本地 |
 | iLink 推到一半 rate limit | Hermes adapter 自己有退避重试,看 log 里 `backing off Ns` 即可 | 一般不用动,Hermes 会自己重试 |
+| WeixinListener task 启动了但 `Get-CimInstance` 看不到 python 进程 | `run-listener.ps1` 含非 ASCII 字符 + 无 BOM,task spawn 的 powershell.exe 解析挂掉 | 看 `listener.YYYY-MM-DD.err.log`;把所有非 ASCII 字符(em-dash、中文、智能引号)换成纯 ASCII |
+| 微信里发消息给 bot 没反应 | listener 没起 / 多个 listener 进程互相踢 | `Get-CimInstance Win32_Process -Filter "Name='python.exe'" \| ?{ $_.CommandLine -match 'listen_weixin' }` 看进程对数。多个就 Stop-Process 杀掉再 Start-ScheduledTask |
 
 ---
 
@@ -428,6 +490,9 @@ C:\Users\<你>\
         ├── push_weixin.py
         ├── qr_login_bootstrap.py
         ├── schedule-install.ps1
+        ├── listen_weixin.py            # 入站 listener (Step 8)
+        ├── run-listener.ps1            # listener wrapper (load secrets + scrub env)
+        ├── install-listener.ps1        # 注册 WeixinListener task
         ├── secrets.json
         ├── README.md
         └── logs\
@@ -437,6 +502,7 @@ Task Scheduler 里应该有这些任务:
 - `MarketBrief` - 每小时 08:00-22:00 EDT
 - `ChatlogServer` - At Log On
 - `DiscordSelfbot` - At Log On
+- `WeixinListener` (可选,Step 8) - At Log On,隐藏窗口
 - `ChatlogDailyRestart` (可选) - 03:00 EDT
 - `ChatlogMidDayRestart` (可选) - 12:30 EDT
 

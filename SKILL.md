@@ -1,6 +1,6 @@
 ---
 name: market-brief-setup
-description: Install or maintain "market-brief" — a Windows scheduled task that runs Claude Code hourly to scan Discord + WeChat investing chat groups and push the resulting report to the user's WeChat (primary channel) with email as fallback. Use when the user wants to set up hourly chat-intel automation, asks how to push AI-generated reports to WeChat, asks about combining chatlog + discord-selfbot + Hermes Agent + Claude Code into one pipeline, or wants to migrate an existing install to a new machine. Requires the chat-mcp-setup skill to have already been run (chatlog + discord-selfbot MCP servers must be reachable on localhost). Windows host only — macOS variant noted at the end.
+description: Install or maintain "market-brief" — a Windows scheduled task that runs Claude Code hourly to scan Discord + WeChat investing chat groups and push the resulting report to the user's WeChat (primary channel) with email as fallback. Optionally also install an inbound listener so the user can chat with Claude directly from WeChat (long-poll iLink → claude --print → reply, with /ping /brief /help slash commands). Use when the user wants to set up hourly chat-intel automation, asks how to push AI-generated reports to WeChat, asks how to chat with Claude via WeChat, asks about combining chatlog + discord-selfbot + Hermes Agent + Claude Code into one pipeline, or wants to migrate an existing install to a new machine. Requires the chat-mcp-setup skill to have already been run (chatlog + discord-selfbot MCP servers must be reachable on localhost). Windows host only — macOS variant noted at the end.
 ---
 
 # Market-brief setup
@@ -294,6 +294,73 @@ Get-ScheduledTaskInfo -TaskName MarketBrief
 ```
 
 Done. Next hourly fire will run automatically.
+
+### Step 9 — Optional: install inbound listener (chat with Claude from WeChat)
+
+Skip if the user only wants the scheduled outbound briefs. Otherwise this
+adds a long-running daemon that:
+
+- long-polls iLink for messages the user sends to the bot
+- ignores messages from anyone except the bot owner (your own `WEIXIN_HOME_CHANNEL`)
+- handles slash commands cheaply (`/ping`, `/brief`, `/help`)
+- forwards anything else to `claude --print --dangerously-skip-permissions`
+  with a stock-intel persona system prompt, so Claude can use the same MCP
+  tools (chatlog, discord-selfbot, WebFetch, etc.) you have configured
+- pushes the reply back via `send_weixin_direct`
+
+Install:
+
+```powershell
+# Register the WeixinListener scheduled task (At log on, hidden window)
+powershell -NoProfile -ExecutionPolicy Bypass `
+    -File C:\Users\$env:USERNAME\Scripts\market-brief\install-listener.ps1
+
+# Start immediately
+Start-ScheduledTask -TaskName WeixinListener
+
+# After ~3 seconds, verify there is exactly ONE listener python proc.
+# (The PEP 405 venv shim spawns a base interpreter child — that's the
+# expected parent+child pair; not two independent listeners.)
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    Where-Object { $_.CommandLine -match 'listen_weixin' } |
+    Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine |
+    Format-List
+```
+
+Smoke test:
+
+1. In WeChat, send `/ping` to the bot. Expect reply `pong (listener up …)`
+   within ~2 seconds.
+2. Send `/help`. Expect command listing.
+3. Send a real question in Chinese, e.g. `月哥下午说啥了`. Expect a 20s–3min
+   delay (Claude is running with MCP tools) and then a Chinese answer.
+
+Logs:
+
+```
+C:\Users\<u>\Scripts\market-brief\logs\
+├── listen_weixin.log                 # listener's own structured log
+├── listener.YYYY-MM-DD.out.log       # PowerShell wrapper stdout
+└── listener.YYYY-MM-DD.err.log       # PowerShell wrapper stderr (parse errors land here)
+```
+
+#### Encoding pitfall to remember
+
+`run-listener.ps1` MUST be pure ASCII (no em-dashes, no smart quotes, no
+Chinese). When Task Scheduler spawns `powershell.exe -File <script>`, the new
+PowerShell process reads the .ps1 with system codepage if there is no BOM —
+non-ASCII bytes break quote pairing and the script fails to parse. Logs land
+in `listener.YYYY-MM-DD.err.log`. Stick to ASCII; build any Chinese strings
+in memory from `[byte[]](...)` + `UTF8.GetString`.
+
+#### Listener vs scheduled-outbound coexistence
+
+Both share the same iLink token but use different endpoints (long-poll
+`/getupdates` for inbound, `/sendmessage` for outbound). They do NOT contend
+for the long-poll exclusive lock unless you spin up a *second* listener
+process. If you ever see the listener replying twice or messages disappearing,
+check for stale `listen_weixin.py` processes with the CIM query above and
+kill them before restarting the task.
 
 ---
 

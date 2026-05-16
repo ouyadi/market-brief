@@ -3,9 +3,12 @@
 > Windows scheduled task + Claude Code skill that, hourly during US trading
 > hours, scans your Discord and WeChat investing chat groups, summarizes them
 > into a tier-tagged markdown brief, and pushes it to your WeChat (primary)
-> with email as fallback.
+> with email as fallback. **Optionally** runs a long-poll listener so you can
+> chat with Claude (and trigger the same MCP tools) directly from WeChat.
 
 ## What it does
+
+### Scheduled outbound (the core)
 
 ```
 Task Scheduler (08:00–22:00 EDT, hourly)
@@ -14,20 +17,45 @@ run.ps1
         ↓
 claude --print  (prompt.md → uses mcp__chatlog + mcp__discord-selfbot tools)
         ↓
-Reports\YYYY-MM-DD-HH-brief.md
+Reports\YYYY-MM-DD-HH-brief.md   (full report kept on disk)
         ↓
-push_weixin.py  → Hermes Agent → iLink → your WeChat (3–5 chunks)
+push_weixin.py --section "⚡"  → Hermes Agent → iLink → your WeChat
         ↓ (if WeChat push fails)
-Send-MailMessage → Gmail SMTP → your inbox
+Send-MailMessage → Gmail SMTP → your inbox (full report)
 ```
 
 - **Tier-aware**: pre-market (24h window) / market hours (90min) / after-hours
   (90min) — same `prompt.md` switches structure based on EDT hour
-- **Markdown chunking**: handled inside Hermes Agent (`_split_text_for_weixin_delivery`,
-  2000-char limit, preserves code blocks / tables / headings)
+- **WeChat push is just the "⚡ 高优先级关注" section** (~1 iLink message, 15
+  msgs/day) so we stay under iLink's ~10/session quota; the full report still
+  lives on disk and shows up in the email fallback when push fails
 - **Fail-soft to email**: WeChat is the primary channel; email is only sent
-  when push fails. Operationally, if you start getting hourly fallback emails
-  you know your iLink session needs refresh.
+  when push fails. Operationally, if hourly fallback emails start arriving you
+  either need to send any message to the bot in WeChat (to refresh the iLink
+  session quota) or re-bind via `qr_login_bootstrap.py`
+
+### Optional inbound (chat with the bot)
+
+```
+You text the bot in WeChat
+        ↓
+WeixinListener task (At log on, run-listener.ps1)
+        ↓
+listen_weixin.py long-polls iLink /getupdates
+        ↓
+  Slash commands (cheap, no Claude spend):
+    /ping    health check
+    /brief   trigger MarketBrief now
+    /help    list commands
+  Anything else → claude --print --dangerously-skip-permissions
+                  (same MCP tools as the scheduled run; ad-hoc questions
+                   like "月哥下午说啥了" / "现在 TSLA 多少人在喊买")
+        ↓
+send_weixin_direct → reply back into the same WeChat chat
+```
+
+The listener filters strictly to the bot owner (your own `WEIXIN_HOME_CHANNEL`)
+so even if a stranger DMs the bot, it stays silent.
 
 ## Install
 
@@ -78,11 +106,12 @@ written linearly for a human operator.
 
 | Path | Purpose |
 |---|---|
-| `C:\Users\<u>\Scripts\market-brief\` | The launcher dir (run.ps1, prompt.md, push_weixin.py, etc.) |
+| `C:\Users\<u>\Scripts\market-brief\` | The launcher dir (run.ps1, prompt.md, push_weixin.py, listen_weixin.py, etc.) |
 | `C:\Users\<u>\hermes-agent\.venv\` | Python 3.11 venv with Hermes Agent (only if WeChat push enabled) |
 | `C:\Users\<u>\.hermes\.env` | iLink credentials from QR scan |
 | `C:\Users\<u>\Reports\YYYY-MM-DD-HH-brief.md` | Hourly report output |
 | Scheduled Task `MarketBrief` | Fires hourly 08:00–22:00 local time |
+| Scheduled Task `WeixinListener` *(if inbound enabled)* | At-log-on hidden listener that bridges WeChat ↔ Claude |
 
 ## Repo contents
 
@@ -92,9 +121,12 @@ written linearly for a human operator.
 | [`SETUP-GUIDE.md`](SETUP-GUIDE.md) | Long-form human-facing install doc |
 | [`prompt.template.md`](prompt.template.md) | Scanning prompt template — fill in your groups |
 | [`run.ps1`](run.ps1) | PowerShell launcher (claude → WeChat push → email fallback) |
-| [`push_weixin.py`](push_weixin.py) | One-shot WeChat sender via Hermes' `send_weixin_direct` |
+| [`push_weixin.py`](push_weixin.py) | One-shot WeChat sender via Hermes' `send_weixin_direct`; supports `--section "⚡"` to push only one H2 |
 | [`qr_login_bootstrap.py`](qr_login_bootstrap.py) | One-time iLink QR-scan binding |
 | [`schedule-install.ps1`](schedule-install.ps1) | Registers the `MarketBrief` Task Scheduler entry |
+| [`listen_weixin.py`](listen_weixin.py) | Long-poll inbound listener (WeChat → `claude --print` → reply) |
+| [`run-listener.ps1`](run-listener.ps1) | Wrapper that loads secrets + scrubs env, then launches `listen_weixin.py` |
+| [`install-listener.ps1`](install-listener.ps1) | Registers `WeixinListener` Task Scheduler entry (At log on) |
 | [`secrets.example.json`](secrets.example.json) | Template for `secrets.json` (OAuth + Gmail) |
 | [`hermes-py.ps1`](hermes-py.ps1) | Legacy wrapper kept for emergency fallback |
 
