@@ -1,0 +1,17 @@
+# End-user-filled files — never commit, even by accident
+secrets.json
+prompt.md
+logs/
+Reports/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Python venv / cache (in case anyone develops the helpers in-place)
+__pycache__/
+*.pyc
+.venv/
