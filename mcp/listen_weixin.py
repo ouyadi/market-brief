@@ -73,7 +73,7 @@ log = logging.getLogger("listen")
 START_TIME = time.monotonic()
 GET_UPDATES_TIMEOUT_MS = 30_000
 LONG_POLL_RETRY_BACKOFF_S = 5.0
-CLAUDE_TIMEOUT_S = 600  # 10 min; long enough for MCP-heavy answers
+CLAUDE_TIMEOUT_S = 900  # 15 min ceiling; long enough for MCP-heavy answers like /critique that re-fetch raw chat windows. Most slash commands finish in <2 min; this is the safety net.
 
 # Experimental: periodically ping iLink with a typing indicator (status=1
 # then immediately status=0) to test whether the typing endpoint refreshes
@@ -251,7 +251,7 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/plan` (从最新 brief 选 top 3) / `/plan TSLA NVDA INTC`\n"
         "  /ticker TICKER     单 ticker 的 X 讨论速读 (cashtag search)\n"
         "                     例: `/ticker SKM` / `/ticker INTC 6h` / `/ticker NVDA 30 top`\n"
-        "  /critique [N]      meta-审查最近一份简报有没有漏窗口内的明显信号 + 改 prompt 建议\n"
+        "  /critique [N]      meta-审查最近简报漏了哪些 gap(轻量版,采样 6 个高信号源,3-5 min)\n"
         "                     例: `/critique` (最新) / `/critique 2` (n 份前)\n"
         "  /kol_drift         (A) 检测大 V 主战场漂移,>30% 偏离时建议更新描述\n"
         "  /heat [N]          (B) 从最近 N 份简报抽未在 watchlist 的高频 ticker(默认 4 份)\n"
@@ -510,20 +510,23 @@ async def _handle_critique(text: str = "") -> str:
         window_s, mode = 5400, "盘后 (90min 窗口)"
 
     prompt = (
-        f"# 简报质量审查任务\n\n"
-        f"审查最近一份简报有没有漏掉**窗口内可见的明显信号**,产出可应用的改进建议。"
-        f"这是 meta-review,不是新简报 — 你的输出会被发回用户做 review,**最后 1-2 周**人工审核多次后可能转成"
-        f"自动化的周度审查。\n\n"
+        f"# 简报质量审查任务(轻量版)\n\n"
+        f"审查最近一份简报有没有漏掉**窗口内可见的明显信号**。**重要**:为了在合理时间内完成,**只采样最高信噪比的源**,不重扫全部 26 个频道/群。这是 trade-off — 会漏一些 gap 但能在 3-5 min 内出结果。如果你发现 critique 频繁漏关键 gap,可以考虑改成定时任务后台跑(那个 ok 跑 10+ min)。\n\n"
         f"## 步骤\n\n"
         f"**步骤 1**:Read 待审简报 `{target}`(模式:{mode})。\n\n"
         f"**步骤 2**:Read 当前的 `{PROMPT_MD_PATH}` 和 `{MEMORY_MD_PATH}`,知道目前哪些群/频道/大V/watchlist 在跟踪 + 用户的真实角度。\n\n"
-        f"**步骤 3**:重新拉**同一窗口**的原始数据。简报文件名隐含时间;用 `mcp__chatlog__current_time` 拿当前 EDT,**确认简报发布时刻**(`{name}` 时刻),计算 since = 那一刻 - {window_s} 秒。然后:\n"
-        f"  - prompt.md 里所有 Discord 频道并行调 `mcp__discord-selfbot__read_channel_messages` limit=80\n"
-        f"  - prompt.md 里所有微信群并行调 `mcp__chatlog__wx_history` with `since` and limit=250\n"
-        f"  - 跟踪的大 V 各调一次 `mcp__twitter__fetch_user_tweets`(limit=15 for 盘前/12 for 其他)\n"
-        f"  - 简报 ⚡/🎯 提到的每个 ticker 调一次 `mcp__twitter__search_tweets(query='$TICKER', limit=8, mode='live')`\n"
-        f"  - 若 prompt.md 启用 polymarket layer,调 `mcp__polymarket__short_movers(window_hours={window_s//3600 if window_s>=3600 else 1}, limit=8)`\n\n"
-        f"**步骤 4**:**对比**简报 vs 原始数据,找出**应该收进简报但漏了**的 actionable 信号。\n\n"
+        f"**步骤 3**:**采样式**重新拉同窗口的原始数据(不全扫):\n"
+        f"  - 用 `mcp__chatlog__current_time` 拿当前 EDT,**确认简报发布时刻**(`{name}` 时刻),算 since = 那一刻 - {window_s} 秒\n"
+        f"  - **采样 prompt.md 的高信号源**(限 6 个并行调用):\n"
+        f"    a. 大菊观「机构带飞」(channel_id 1434770162573250560)— 研报源,不会漏关键\n"
+        f"    b. 月哥「实盘校场🎖」(channel_id 1359098492462825633)— 实仓位硬信号\n"
+        f"    c. 顺哥「🐦🔥热股热议」(channel_id 1088870436558872587)— 中文短线主流\n"
+        f"    d. 微信群「美股科研小组1」(6219042027@chatroom)— 用 wx_history\n"
+        f"    e. 微信群「📝宏观分析+基本面研究📚」(26072906361@chatroom)\n"
+        f"    f. 微信群「🌊 🌊 🌊」(6228971957@chatroom)\n"
+        f"  - **不拉**:大 V 推 / X search / Polymarket 重扫 — 这些信号简报本身已经在 Phase B 调过,gap 通常在群讨论里\n"
+        f"  - **不拉**其他 7 个 Discord + 10 个微信群 — sample 6 个已经覆盖主要信号面\n\n"
+        f"**步骤 4**:**对比**简报 vs 这 6 个采样源的原始数据,找出**应该收进简报但漏了**的 actionable 信号。\n\n"
         f"### 算 gap 的标准(必须满足客观可验证)\n"
         f"- **个股漏**:某 ticker 被 **≥3 个不同 sender** (跨群算) 提及,但简报 🎯/⚡ 都没出现\n"
         f"- **仓位漏**:实盘校场/某 KOL 发了**具体 entry/stop/target 或仓位调整数字**,但简报 ⚡ 没提\n"
