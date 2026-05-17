@@ -253,6 +253,11 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/ticker SKM` / `/ticker INTC 6h` / `/ticker NVDA 30 top`\n"
         "  /critique [N]      meta-审查最近一份简报有没有漏窗口内的明显信号 + 改 prompt 建议\n"
         "                     例: `/critique` (最新) / `/critique 2` (n 份前)\n"
+        "  /kol_drift         (A) 检测大 V 主战场漂移,>30% 偏离时建议更新描述\n"
+        "  /heat [Nh|Nd]      (B) 找过去 24h(或自定义)群里高频但不在 watchlist 的 ticker\n"
+        "                     例: `/heat` / `/heat 6h` / `/heat 3d`\n"
+        "  /score [Nd] [hzn]  (C) 过去 N 天盘前简报 ⚡ section 推荐的命中率\n"
+        "                     例: `/score` (7d, horizon 3d) / `/score 14d 1w`\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -553,6 +558,167 @@ async def _handle_critique(text: str = "") -> str:
     return await _ask_claude(prompt)
 
 
+async def _handle_kol_drift(text: str = "") -> str:
+    """A: 周度 KOL 漂移检测。对 prompt.md 跟踪的每个大 V 拉过去 30 天推,
+    跟当前 memory.md / prompt.md 里的"主战场"对比;**只列 ≥中等漂移**。
+
+    用法:`/kol_drift` (全部 KOL)
+    """
+    prompt = (
+        f"# KOL 主战场漂移审查\n\n"
+        f"**步骤 1**:Read `{PROMPT_MD_PATH}` 的'### 大 V X 账号'表 + Read "
+        f"`{MEMORY_MD_PATH}`的'KOL 真实角度'章节,知道每个大 V 当前**应该**是什么主战场。\n\n"
+        f"**步骤 2**:对表里**每个**大 V 并行调 "
+        f"`mcp__twitter__fetch_user_tweets(username=handle, limit=30)`。\n\n"
+        f"**步骤 3**:对每个大 V 分析最近 30 条推的**主题分布**:\n"
+        f"  - 主要谈什么 ticker / sector / 宏观主题\n"
+        f"  - 占比最高的 2-3 个 theme 是什么\n"
+        f"  - 跟 prompt.md/memory.md 里描述的'主战场'/'真实角度'比较\n\n"
+        f"**步骤 4**:判断漂移程度:\n"
+        f"  - **无漂移**:主战场跟描述一致,推占比 60%+ 跟描述对得上\n"
+        f"  - **轻微**:60%-30% 跟描述对得上 — **不报**\n"
+        f"  - **中等**:<30% 跟描述对得上,新主题占据主导 — **报**\n"
+        f"  - **重大**:几乎完全转向 — **报**\n\n"
+        f"**步骤 5**:对反指 KOL(Cramer/Schiff)特殊处理:他们 content 永远会变化,**只要**他们仍是"
+        f"逆向作用 (consensus 跟实际反向相关) 就不算漂移。如果他们突然变成顺指,那是真漂移要报。\n\n"
+        f"## 输出格式 (严格)\n\n"
+        f"```\n"
+        f"## KOL 漂移审查 ({{日期}})\n\n"
+        f"### @handle (drift: 中/重)\n"
+        f"- **当前描述**: <copy from prompt.md / memory.md 一句话>\n"
+        f"- **实际最近 30 天主战场**: <具体描述 + 引用 1-2 条最 representative 推作为证据>\n"
+        f"- **建议新描述**: <新一句话主战场,反映真实焦点>\n"
+        f"- **置信度**: 高/中/低\n"
+        f"```\n\n"
+        f"**全部无 ≥中等漂移**时:输出 `## KOL 漂移审查 ({{日期}}): 全部 KOL 主战场跟当前描述一致,无需更新。`\n\n"
+        f"**约束**:\n"
+        f"- 总输出 < 1500 字(微信单条上限)\n"
+        f"- 只列 ≥中等漂移,**不报**轻微漂移(否则信噪比太低)\n"
+        f"- 反指 KOL 仍维持 inverse 关系不算漂移\n"
+        f"- 必须用具体推作证据,不允许'感觉漂了'这种主观判断\n"
+        f"- 建议描述要可直接 copy 进 prompt.md / memory.md 表里,不要加额外评论"
+    )
+    return await _ask_claude(prompt)
+
+
+async def _handle_heat(text: str = "") -> str:
+    """B: Watchlist 热度推荐。扫过去 24h 群里被多次讨论但**不在 watchlist** 的
+    ticker,排序后建议加进 watchlist。
+
+    用法:`/heat` (默认 24h) / `/heat 6h` (短窗口)
+    """
+    args = text.split()[1:]
+    window_arg = args[0] if args else "24h"
+    m = re.match(r"^(\d+)([hd])$", window_arg.lower())
+    if not m:
+        return "用法:/heat [Nh|Nd]   例:/heat / /heat 6h / /heat 3d"
+    n, unit = int(m.group(1)), m.group(2)
+    secs = n * (3600 if unit == "h" else 86400)
+
+    prompt = (
+        f"# Watchlist 热度审查 (过去 {window_arg})\n\n"
+        f"**步骤 1**:Read `{PROMPT_MD_PATH}` 的'### 个股 watchlist'表,记下当前 watchlist 所有 ticker(大写)。\n\n"
+        f"**步骤 2**:调 `mcp__chatlog__current_time` 拿 EDT 当前时刻;算 since = now - {secs} 秒。\n\n"
+        f"**步骤 3**:并行从 prompt.md 列的**所有** Discord 频道 + 微信群拉窗口内消息:\n"
+        f"  - Discord:每个频道 `mcp__discord-selfbot__read_channel_messages(limit=100)`,过滤 timestamp ≥ since\n"
+        f"  - 微信:每个群 `mcp__chatlog__wx_history(since=since, limit=250)`\n\n"
+        f"**步骤 4**:从所有 text content regex `\\$([A-Z]{{1,5}})\\b` 抽 ticker。**对每个 ticker**统计:\n"
+        f"  - 总提及次数\n"
+        f"  - 不同 sender 数(跨群算)\n"
+        f"  - 不同群/频道数\n\n"
+        f"**步骤 5**:过滤:\n"
+        f"  - **排除** watchlist 里已有的 ticker\n"
+        f"  - **排除**单字母 ticker($A, $I, $K 这类极可能是 typo / 不真实)\n"
+        f"  - **排除**常见非 ticker 假阳性:$USD, $CAD, $EUR, $JPY, $GBP, $CNY 等\n"
+        f"  - **保留** ≥3 不同 sender **且** ≥2 个不同群 的 ticker\n\n"
+        f"**步骤 6**:按 `sender_count × group_count` 打分,降序排,取 top 5。\n\n"
+        f"## 输出格式 (严格)\n\n"
+        f"```\n"
+        f"## Watchlist 热度审查 (过去 {window_arg})\n\n"
+        f"### 候选加进 watchlist (按热度):\n"
+        f"\n"
+        f"1. **$XYZ** ─ N 人/M 群,共 K 次提及\n"
+        f"   - 出处样本:`HH:MM` @user1 (群名1):'群里说的一句'\n"
+        f"               `HH:MM` @user2 (群名2):'另一句'\n"
+        f"   - **建议 thesis**: `<待你 confirm 后补充>`\n"
+        f"\n"
+        f"2. ... (最多 5 个)\n"
+        f"```\n\n"
+        f"**全部无 ≥3-sender 且 ≥2-群 的候选**时:\n"
+        f"`## Watchlist 热度审查: 过去 {window_arg} 无符合阈值的 non-watchlist ticker。`\n\n"
+        f"**约束**:\n"
+        f"- 总输出 < 1500 字\n"
+        f"- 最多 5 个候选,严格按热度降序\n"
+        f"- 每个候选给 1-2 条原话引用 + 群名 + sender,便于你验证\n"
+        f"- **绝不**自己编 thesis 描述(generic 描述是历史 bug,memory.md 'KOL/Watchlist 角度填法'有规则)\n"
+        f"- 想加进 watchlist 你确认后,在微信回'个股加 XYZ:<你的真实角度>',listener 按配置管理流程处理"
+    )
+    return await _ask_claude(prompt)
+
+
+async def _handle_score(text: str = "") -> str:
+    """C: 命中率记分。统计过去 N 天盘前简报里 ⚡ section 推荐的实际表现。
+
+    用法:`/score` (默认 7 天 / horizon 3d) / `/score 14d 1w` 等
+    """
+    args = text.split()[1:]
+    lookback_days = 7
+    horizon = "3d"
+    if args:
+        m = re.match(r"^(\d+)d$", args[0].lower())
+        if m: lookback_days = int(m.group(1))
+    if len(args) > 1 and re.match(r"^\d+[dwh]$", args[1].lower()):
+        horizon = args[1].lower()
+
+    prompt = (
+        f"# ⚡ Setup 命中率审查\n\n"
+        f"**窗口**:过去 **{lookback_days} 天**的盘前简报;**评估 horizon**:{horizon}\n\n"
+        f"**步骤 1**:`ls ~/Reports/` 找最近 {lookback_days} 天的盘前简报。文件名格式 `YYYY-MM-DD-HH-brief.md`,**只取 HH < 09** 的(盘前)。逐份 Read。\n\n"
+        f"**步骤 2**:从每份简报的 `## ⚡ 高优先级关注` section 提取每个 setup 的元组 `(ticker, brief_publish_time, 立场[多/空/观望], target?, source[群/大V/Polymarket])`:\n"
+        f"  - 立场写在'**可执行**'子节的'立场:多/空/观望'\n"
+        f"  - source 从'**消息面/基本面**'子节里 actionable 推/群消息的 @ 或群名提取\n"
+        f"  - **观望**不参与命中率统计,跳过\n\n"
+        f"**步骤 3**:对每个 (ticker, brief_time) 调 `mcp__stock-price__check_post_hoc(ticker, at_time=brief_time, horizon='{horizon}')`(可并行)。拿 `net_move_pct`。\n\n"
+        f"**步骤 4**:判 hit:\n"
+        f"  - 立场=多 且 `net_move >= +1.0%` → **win**\n"
+        f"  - 立场=多 且 `net_move <= -1.0%` → **loss**\n"
+        f"  - 立场=空 且 `net_move <= -1.0%` → **win**\n"
+        f"  - 立场=空 且 `net_move >= +1.0%` → **loss**\n"
+        f"  - `-1.0% < net_move < +1.0%` → **flat**(不计入)\n\n"
+        f"**步骤 5**:聚合统计:\n"
+        f"  - **整体**:W / L / Flat,胜率 = W / (W + L)\n"
+        f"  - **按 ticker**:每个 ticker 的 setup 次数 + W/L/F + 胜率(只列 ≥2 个 setup 的)\n"
+        f"  - **按大 V 关联**:setup 的 source 里跟踪的大 V (查 prompt.md 表),分别统计相关 ticker 的胜率;反指 KOL (Cramer/Schiff) 把方向 flip 后再算\n\n"
+        f"## 输出格式 (严格)\n\n"
+        f"```\n"
+        f"## ⚡ Setup 命中率 (最近 {lookback_days} 天,horizon={horizon})\n\n"
+        f"### 整体\n"
+        f"- 多:**W**/**L**/**F** → 胜率 **X%**\n"
+        f"- 空:**W**/**L**/**F** → 胜率 **X%**\n"
+        f"- 综合:**X%** 胜率(共 **N** 个 actionable setup,**M** 个 flat 不计)\n"
+        f"\n"
+        f"### 按 ticker (≥2 setup 的)\n"
+        f"- **$XYZ**:N setup,W-L-F → 胜率\n"
+        f"- ... (按 setup 数 × 胜率排,top 5)\n"
+        f"\n"
+        f"### 按大 V 关联\n"
+        f"- **@imnotharsh** (INTC bull):N 个相关 setup,胜率 X%\n"
+        f"- **@Cramer-flipped**:... (注:Cramer 反指后看)\n"
+        f"- ... (只列 ≥2 setup 的)\n"
+        f"\n"
+        f"### 建议\n"
+        f"一句话:**信号金字塔**应该调整哪些权重?哪些 ticker / KOL 命中率持续低需要重新审视 thesis?\n"
+        f"```\n\n"
+        f"**数据不足**(N < 5 actionable setup)时:输出 `## 命中率:数据不足({{N}} 个 setup,至少需要 5 个才有统计意义)。继续观察。`\n\n"
+        f"**约束**:\n"
+        f"- 总输出 < 1500 字\n"
+        f"- 数字必须真实(从 check_post_hoc 实际返回值算),不允许估算\n"
+        f"- 标注 sample size,N < 5 直接说不足而非硬编故事\n"
+        f"- 反指 KOL 一定要 flip 后算 — 否则结果会被错误负相关污染"
+    )
+    return await _ask_claude(prompt)
+
+
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
@@ -561,6 +727,9 @@ COMMANDS = {
     "/plan": _handle_plan,
     "/ticker": _handle_ticker,
     "/critique": _handle_critique,
+    "/kol_drift": _handle_kol_drift,
+    "/heat": _handle_heat,
+    "/score": _handle_score,
     "/help": _handle_help,
 }
 
