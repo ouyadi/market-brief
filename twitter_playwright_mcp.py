@@ -1,5 +1,5 @@
 """
-twitter_playwright_mcp.py -- stdio MCP server.
+twitter_playwright_mcp.py -- HTTP MCP server (transport=streamable-http).
 
 Uses headless Chromium + the user's own X cookies to fetch tweets the user's
 browser would see. Avoids the broken scraper-lib ecosystem (twscrape /
@@ -11,8 +11,10 @@ Tools:
   fetch_user_tweets(username, limit=10)
   search_tweets(query, limit=10, mode='live'|'top')
 
-Cookies are read once from ~/twitter-mcp/.env at first request:
-  TWITTER_COOKIES=["auth_token=...; Domain=.twitter.com", "ct0=...; ...", "twid=...; ..."]
+Cookies are read once from ~/twitter-mcp/.env at first request. Only the
+cookie VALUE is extracted; Domain= in the .env line is decorative because
+_read_cookies() always injects them with domain=.x.com.
+  TWITTER_COOKIES=["auth_token=...; Domain=.x.com", "ct0=...; ...", "twid=...; ..."]
 
 A single headless Chromium instance is kept alive across requests so we
 don't pay 3-5s launch cost per call.
@@ -28,6 +30,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -330,17 +333,15 @@ async def fetch_home_timeline(tab: str = "for_you", limit: int = 15) -> dict:
 
 if __name__ == "__main__":
     log.info("twitter-playwright MCP starting on http://127.0.0.1:%s/mcp", mcp.settings.port)
-    log.info("env: USERNAME=%s USERPROFILE=%s LOCALAPPDATA=%s",
-             os.environ.get("USERNAME"), os.environ.get("USERPROFILE"),
-             os.environ.get("LOCALAPPDATA"))
-    # Probe playwright's view of the browsers dir
+    # Diagnostic: confirm we can see Playwright's bundled chromium dir at all
+    # (we don't actually use it -- channel='chrome' uses user-installed Chrome,
+    # see _ensure_ctx -- but 0 hits here historically signaled the Defender-
+    # quarantine-style sandbox issue that pushed us to channel='chrome').
     import glob as _glob
-    cand = _glob.glob(
-        r"C:\Users\ouyad\AppData\Local\ms-playwright\chromium-*\chrome-win64\chrome.exe"
-    )
-    log.info("chrome.exe glob hits %d: %s", len(cand), cand)
-    cand2 = _glob.glob(
-        r"C:\Users\ouyad\AppData\Local\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe"
-    )
-    log.info("chrome-headless-shell.exe glob hits %d: %s", len(cand2), cand2)
+    if sys.platform == "win32":
+        pw_browsers = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+    else:  # macOS / Linux
+        pw_browsers = Path.home() / "Library" / "Caches" / "ms-playwright"
+    cand = _glob.glob(str(pw_browsers / "chromium-*"))
+    log.info("playwright bundled chromium dirs visible: %d (%s)", len(cand), pw_browsers)
     mcp.run(transport="streamable-http")

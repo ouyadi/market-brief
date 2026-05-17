@@ -31,7 +31,11 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDi
 $nowEdt     = (Get-Date).ToUniversalTime().AddHours(-4).AddSeconds(30)
 $date       = $nowEdt.ToString("yyyy-MM-dd")
 $hour       = $nowEdt.ToString("HH")
-$reportFile = "C:\Users\ouyad\Reports\$date-$hour-brief.md"
+$reportFile = Join-Path $env:USERPROFILE "Reports\$date-$hour-brief.md"
+# Mirror what listen_weixin.py does -- ensure Reports/ exists so any user (not
+# just the original author) gets the directory auto-created on first run.
+$reportsDir = Join-Path $env:USERPROFILE "Reports"
+if (-not (Test-Path $reportsDir)) { New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null }
 $logFile    = Join-Path $logDir "$date.log"
 
 # Logging helper. Tee-Object holds a file handle for the whole pipeline and
@@ -150,7 +154,9 @@ if (-not (Test-Path $reportFile)) {
 Log "[$([DateTime]::Now)] report ready: $reportFile"
 
 # --- 5. Push to WeChat via Hermes Agent iLink (primary channel) --------
-$venvPy   = 'C:\Users\ouyad\hermes-agent\.venv\Scripts\python.exe'
+# Allow power users to point at a non-default venv via $env:HERMES_VENV.
+$venvPy   = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
+            else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $pushTool = Join-Path $here 'push_weixin.py'
 $wxPushOk = $false
 
@@ -193,8 +199,16 @@ Log "[$([DateTime]::Now)] sending fallback email to $($secrets.toAddress)..."
 
 # Subject is constructed in-memory from ASCII pieces + UTF-8 bytes so the
 # .ps1 file itself stays pure ASCII and never trips PowerShell's parser.
-$tagBytes  = [byte[]](0xE7,0xBE,0x8E,0xE8,0x82,0xA1,0xE7,0x9B,0x98,0xE5,0x89,0x8D,0xE6,0x83,0x85,0xE6,0x8A,0xA5)
-$tagText   = [System.Text.Encoding]::UTF8.GetString($tagBytes)
+# Session-tag the Chinese label so the inbox shows 盘前 / 盘中 / 盘后 directly.
+$prefixBytes = [byte[]](0xE7,0xBE,0x8E,0xE8,0x82,0xA1,0xE7,0x9B,0x98)            # 美股盘
+$suffixBytes = [byte[]](0xE6,0x83,0x85,0xE6,0x8A,0xA5)                            # 情报
+switch ($sessionTag) {
+    'pre-market'  { $midBytes = [byte[]](0xE5,0x89,0x8D) }   # 前
+    'market'      { $midBytes = [byte[]](0xE4,0xB8,0xAD) }   # 中
+    'after-hours' { $midBytes = [byte[]](0xE5,0x90,0x8E) }   # 后
+    default       { $midBytes = [byte[]](0xE5,0x89,0x8D) }
+}
+$tagText   = [System.Text.Encoding]::UTF8.GetString($prefixBytes + $midBytes + $suffixBytes)
 $subject   = "[Brief $date $hour:00 $sessionTag fallback] $tagText"
 $body      = Get-Content -Raw -Encoding UTF8 $reportFile
 

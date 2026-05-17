@@ -6,7 +6,9 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $here     = Split-Path -Parent $MyInvocation.MyCommand.Path
-$venvPy   = 'C:\Users\ouyad\hermes-agent\.venv\Scripts\python.exe'
+# Allow power users to point at a non-default venv via $env:HERMES_VENV.
+$venvPy   = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
+            else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $listener = Join-Path $here 'listen_weixin.py'
 $secrets  = Join-Path $here 'secrets.json'
 

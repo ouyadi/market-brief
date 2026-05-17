@@ -9,7 +9,8 @@
 $ErrorActionPreference = "Stop"
 
 $here    = Split-Path -Parent $MyInvocation.MyCommand.Path
-$venvPy  = 'C:\Users\ouyad\hermes-agent\.venv\Scripts\python.exe'
+$venvPy  = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
+           else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $script  = Join-Path $here 'stock_price_mcp.py'
 $logDir  = Join-Path $here 'logs'
 
