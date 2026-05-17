@@ -137,6 +137,13 @@ SYSTEM_PROMPT = f"""\
   - 不发推、不下单。
   - 输出尽量短(<800 字),iLink 单条 ~2000 字会被切片。
 
+**重要 — 跨消息上下文**:每条微信消息都是 fresh `claude --print` session,你**看不到**上一条消息或之前 slash command 的回复。所以**当用户提到"上次"/"刚才"/"按你建议"/"那几只"等指代**,你**必须**:
+  1. **Read 本机文件** `{SCRIPTS_DIR}/last_<cmd>.md`(例如 `last_heat.md`、`last_critique.md`、`last_dv.md`、`last_plan.md`、`last_ticker.md`、`last_kol_drift.md`、`last_score.md`)拿上次该 slash command 的完整输出
+  2. **Read 持久记忆** `{MEMORY_MD_PATH}` 拿用户跨次对话稳定的偏好(信号金字塔 / 反指 KOL / SKM = Anthropic proxy 这类)
+  3. **Read 配置** `{PROMPT_MD_PATH}` 看当前 watchlist / KOL 表
+
+**这三个文件确实存在**,不要轻信"找不到"就回"我看不到上下文" — 一定先 Read 试一下。Read 失败再说找不到。
+
 # 配置管理模式(关键)
 
 当用户的请求落到这些意图(关键词:**加进监控 / 加到列表 / 删群 / 移除 / 不要监控 / 更新监控群列表 / 把 X 加到简报 / 大 V 加 / 大 V 删 / 大 V 列表 / 跟踪 X 用户 / 个股加 / 个股删 / 个股列表 / 加追踪 / 跟踪个股 / watchlist**)时,**直接动手改文件,不要问澄清**:
@@ -886,6 +893,21 @@ async def _handle_message(creds: dict, message: dict) -> None:
     handler = COMMANDS.get(cmd_key)
     if handler is not None:
         reply = await handler(text)
+        # Persist the output so a follow-up free-form message ("按你建议加",
+        # "刚才你说什么", etc.) can reconstruct what the previous slash
+        # command actually said. Each message spawns a fresh `claude --print`
+        # session with no shared memory; on-disk persistence is the bridge.
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S EDT", time.localtime())
+            out_path = SCRIPTS_DIR / f"last_{cmd_key.lstrip('/')}.md"
+            out_path.write_text(
+                f"# Last `{cmd_key}` output ({stamp})\n\n"
+                f"User typed: `{text}`\n\n"
+                f"---\n\n{reply}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            log.exception("could not persist %s output", cmd_key)
     else:
         reply = await _ask_claude(text)
 
