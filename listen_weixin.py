@@ -176,10 +176,25 @@ async def _handle_ping(text: str = "") -> str:
 
 
 async def _handle_brief(text: str = "") -> str:
-    try:
-        proc = await asyncio.create_subprocess_exec(
+    # Pick the right scheduler kick command per platform.
+    # Windows: Task Scheduler  -> powershell Start-ScheduledTask MarketBrief
+    # macOS:   launchd         -> launchctl kickstart -k gui/<uid>/com.ouyadi.market-brief
+    if sys.platform == "win32":
+        cmd = (
             "powershell.exe", "-NoProfile", "-Command",
             "Start-ScheduledTask -TaskName MarketBrief",
+        )
+    elif sys.platform == "darwin":
+        cmd = (
+            "launchctl", "kickstart", "-k",
+            f"gui/{os.getuid()}/com.ouyadi.market-brief",
+        )
+    else:
+        return f"✗ /brief 不支持当前平台: {sys.platform}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
