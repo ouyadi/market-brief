@@ -1,0 +1,10 @@
+# Per-user filled-in credentials -- NEVER commit
+host/macos/chatlog/chatlog.json
+host/macos/discord-selfbot/.env
+host/macos/discord-selfbot/dot-discord-selfbot.env
+host/macos/mcp-gateway/token
+client/token
+
+# Per-user log dirs (created by daemons at runtime)
+host/macos/*/logs/
+host/windows/*/logs/

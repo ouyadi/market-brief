@@ -11,7 +11,8 @@
 # secrets fill, group customization). Skip phases by passing -SkipPhase N.
 #
 # Required separately (because they live in another repo with private creds):
-#   - ouyadi/mcp-chat-skills chat-mcp-setup skill (chatlog + discord-selfbot MCPs)
+#   - chat-mcp-setup/ in this repo (chatlog + discord-selfbot MCPs)
+#     see chat-mcp-setup/SKILL.md + chat-mcp-setup/host/windows/scripts/install-mcp-services.ps1
 #     must already be installed before this script can fully succeed.
 
 [CmdletBinding()]
@@ -98,7 +99,7 @@ function Phase1-Prereqs {
         if ($r.Content -match 'ok') { Ok "chatlog daemon up on :5030" }
     } catch {
         Warn "chatlog daemon NOT responding on 127.0.0.1:5030"
-        Info "  fix:  run chat-mcp-setup skill from ouyadi/mcp-chat-skills"
+        Info "  fix:  run chat-mcp-setup/host/windows/scripts/install-mcp-services.ps1 from this repo"
         Info "        (this script doesn't install chatlog; chatlog needs WeChat-specific binary)"
     }
 
@@ -111,7 +112,7 @@ function Phase1-Prereqs {
             Ok "discord-selfbot daemon up on :6280 (MCP endpoint responding)"
         } else {
             Warn "discord-selfbot daemon NOT responding on 127.0.0.1:6280"
-            Info "  fix:  run chat-mcp-setup skill from ouyadi/mcp-chat-skills"
+            Info "  fix:  run chat-mcp-setup/host/windows/scripts/install-mcp-services.ps1 from this repo"
         }
     }
 

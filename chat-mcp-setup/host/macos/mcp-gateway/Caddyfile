@@ -1,0 +1,42 @@
+# LAN gateway for the two local MCP servers.
+# Listens on 0.0.0.0:7777, requires `Authorization: Bearer <LAN_MCP_TOKEN>`,
+# and reverse-proxies to the loopback-only MCP servers.
+#
+# Routes:
+#   /discord/*  ->  127.0.0.1:6280  (discord-selfbot MCP)
+#   /chatlog/*  ->  127.0.0.1:5030  (chatlog MCP)
+#
+# LAN_MCP_TOKEN is injected via launchd plist EnvironmentVariables.
+
+{
+    auto_https off
+    admin off
+}
+
+:7777 {
+    log {
+        output file $HOME/Library/Logs/mcp-gateway/access.log
+        format console
+    }
+
+    @noauth not header Authorization "Bearer {env.LAN_MCP_TOKEN}"
+    handle @noauth {
+        respond "unauthorized" 401
+    }
+
+    handle_path /discord/* {
+        reverse_proxy 127.0.0.1:6280 {
+            header_up Host {upstream_hostport}
+        }
+    }
+
+    handle_path /chatlog/* {
+        reverse_proxy 127.0.0.1:5030 {
+            header_up Host {upstream_hostport}
+        }
+    }
+
+    handle {
+        respond "not found — use /discord/mcp or /chatlog/mcp" 404
+    }
+}

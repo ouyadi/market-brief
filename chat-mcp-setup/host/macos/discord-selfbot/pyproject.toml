@@ -1,0 +1,12 @@
+[project]
+name = "discord-selfbot-mcp"
+version = "0.1.0"
+description = "Read-only Discord self-bot exposed via MCP. Use a burner account."
+requires-python = ">=3.10"
+dependencies = [
+    "discord.py-self>=2.1.0",
+    "mcp[cli]>=1.2.0",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+    "python-dotenv>=1.0",
+]

@@ -155,8 +155,9 @@ chatlog 没 headless 模式,TUI 进程就是 server。用 Task Scheduler "At Log
 $dst = "C:\Users\$env:USERNAME\discord-selfbot-mcp"
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 
-# 从 chat-mcp-setup skill 复制 server.py + pyproject.toml
-# (具体参看 mcp-chat-skills 仓库)
+# 从本仓 chat-mcp-setup/ 复制 server.py + pyproject.toml
+# (本仓 chat-mcp-setup/host/macos/discord-selfbot/ 有 source;
+#  Windows 跑 chat-mcp-setup/host/windows/scripts/install-mcp-services.ps1)
 
 # token 放在 $env:USERPROFILE\.discord-selfbot.env
 # 内容:
@@ -510,4 +511,4 @@ Task Scheduler 里应该有这些任务:
 
 ## 想 share 这份指南
 
-这份 SETUP-GUIDE.md 本身是 self-contained 的(除了引用 chat-mcp-setup skill 的几个外部脚本)。直接把它复制给别人即可。如果对方要从零开始,也参考 [mcp-chat-skills 仓库](https://github.com/teest114514/mcp-chat-skills)(chatlog + discord-selfbot 的安装 skill 在那里)。
+这份 SETUP-GUIDE.md 是 self-contained 的。chatlog + discord-selfbot 的安装脚本在本仓的 [`chat-mcp-setup/`](chat-mcp-setup/) 子目录(以前在私有 repo `ouyadi/mcp-chat-skills`,2026-05 已迁入本仓 + scrubbed personal info)。
