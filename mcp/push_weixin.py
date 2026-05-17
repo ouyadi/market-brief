@@ -194,6 +194,15 @@ async def _push(message: str) -> int:
     chunks = smart_chunks(message)
     any_failed = False
     for i, chunk in enumerate(chunks, 1):
+        # iLink rate-limits rapid-fire sends. Hermes has its own per-chunk
+        # delay (send_chunk_delay_seconds=1.0) but that only applies WITHIN
+        # a single send_weixin_direct call's internal chunking, not BETWEEN
+        # multiple top-level calls. When we push 3 sections (⚡/🎯/🎙) as
+        # 3 separate send_weixin_direct invocations, we need to insert our
+        # own gap or iLink ret=-2 rate-limits us starting on chunk 2.
+        # 4s between sends keeps us under the limit empirically.
+        if i > 1:
+            await asyncio.sleep(4)
         result = await send_weixin_direct(
             extra=extra,
             token=creds["token"],
@@ -260,7 +269,13 @@ def main() -> int:
     # ⚡/🎯 pushes that DO have content.
     any_pushed = False
     any_failed = False
-    for needle in args.section:
+    # iLink rate-limits rapid-fire outbound. Each _push() call goes through
+    # send_weixin_direct which has its own intra-message chunk delay, but
+    # between separate _push() calls (= separate sections) we need our own
+    # gap or iLink ret=-2 fires on section 2/3. 5s empirically clears it.
+    import time as _time
+    INTER_SECTION_DELAY_S = 5.0
+    for idx, needle in enumerate(args.section):
         extracted = extract_section(text, needle)
         if extracted is None:
             print(
@@ -271,6 +286,10 @@ def main() -> int:
         if not extracted.strip():
             print(f"[WARN] section {needle!r} is empty -- skipping", file=sys.stderr)
             continue
+        if any_pushed:  # not the first section we're actually sending
+            print(f"[INFO] sleeping {INTER_SECTION_DELAY_S}s before next section "
+                  f"(iLink rate-limit avoidance)", file=sys.stderr)
+            _time.sleep(INTER_SECTION_DELAY_S)
         rc = asyncio.run(_push(extracted))
         if rc == 0:
             any_pushed = True
