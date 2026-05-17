@@ -149,8 +149,8 @@ SYSTEM_PROMPT = f"""\
   1. **找 ID** (微信/Discord):
      - 微信群: 调 `mcp__chatlog__wx_sessions` 拉全表,然后按用户给的关键词做 substring 匹配。匹配到唯一群 → 直接用它的 chatroom_id。匹配到多个 → 把候选列出让用户选(只这种情况才问澄清)。
      - Discord: 调 `mcp__discord-selfbot__list_channels` 同理。
-  2. **找 handle** (大 V): 用户给的就是 X handle(可能带或不带 `@`,strip 掉)。可选用 `mcp__twitter__fetch_user_tweets(username=...)` 试一下确认 handle 存在 + 顺便记录"主战场"一句话描述。
-     **找 ticker** (个股): 大写 1-5 字母 ASCII (strip 掉前导 `$`)。用户加 ticker 时也带一句话理由 (财报临近 / 长持 / 卖空候选 / 等);若用户没给理由,自己根据 `mcp__stock-price__get_info(ticker)` 抓 sector + market cap 写一句简短的。
+  2. **找 handle** (大 V): 用户给的就是 X handle(可能带或不带 `@`,strip 掉)。可选用 `mcp__twitter__fetch_user_tweets(username=...)` **仅**验证 handle 存在。**不要自己编"主战场"描述** —— 用户没明说时填 `<待用户补充>`,只填用户的原话或字面 sector 标签。**绝不**根据训练数据/general knowledge 脑补 "X 是 Y 的 proxy" / "Z 是反指" 之类的理由 —— 这种没经验证的 attribution 后期会污染简报的判断逻辑。
+     **找 ticker** (个股): 大写 1-5 字母 ASCII (strip 掉前导 `$`)。用户加 ticker 时若**显式带了理由**就用用户的原话;若**没给理由**,填 `<待用户补充>`,**不要**根据训练数据写"半导体大票/AI 转型"这类听起来对的通用描述 —— 用户的真实 thesis 经常跟 generic 描述无关(例:SKM 不是韩国电信防御票,是 Anthropic equity proxy)。可以**只**填一行 factual sector + mc 作为占位 (例:"<待用户补充 — sector: tech, mc: $5.4T>"),但**不要**编投资角度。
   3. **改文件**: Read `prompt.md` 找到对应表格末尾,Edit 插入新行(保持表格对齐)。
   4. **删行**: Edit 把整行替换成空字符串(精确匹配 group/handle 关键字)。
   5. **报告**: 改完一句话总结,例如 "已加 3 群..." 或 "已加 2 个大 V: cathiedwood, jimcramer"。**不要打印 prompt.md 全文**。
