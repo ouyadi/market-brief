@@ -1,11 +1,23 @@
 """
 stock_price_mcp.py -- yfinance-backed HTTP MCP for stock price + fundamentals.
 
-Tools (all read-only):
+Price / fundamentals (read-only):
   get_quote(ticker)                              current snapshot
   get_history(ticker, period, interval)          OHLCV time series
   get_info(ticker)                               sector / market cap / next earnings / dividend
   check_post_hoc(ticker, at_time, horizon)       event-study micro for KOL/call accuracy eval
+
+Options (read-only, with computed Greeks):
+  list_expirations(ticker)                       all tradeable expiry dates
+  get_option_chain(ticker, expiration, ...)      chain rows + Δ/Γ/Θ/Vega/Rho
+  implied_move(ticker, expiration)               ATM straddle / spot = % move priced in
+  unusual_activity(ticker, expiration, ...)      strikes where volume >> open interest
+  compute_greeks(ticker, expiration, strike, ...) single-strike Greeks lookup
+
+Greeks computed via Black-Scholes from yfinance's `impliedVolatility` field
+plus a configurable risk-free rate (default 4.5%; override per-call). Yahoo's
+IV can be stale at quiet strikes -- treat Greeks at zero-volume strikes as
+approximate.
 
 Runs on 127.0.0.1:3032/mcp as a daemon (At-Log-On scheduled task `StockPriceMCP`).
 
@@ -18,12 +30,19 @@ likely cause -- wait a few minutes and retry.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
+
+# Risk-free rate used for Black-Scholes Greeks. Override per-call via the
+# tool's risk_free_rate param or globally via the STOCK_MCP_RISK_FREE_RATE
+# env var (decimal: 0.045 = 4.5%). Approximates the 3-month T-bill yield;
+# changing it ~50bp shifts theta/rho marginally but barely touches delta.
+DEFAULT_RFR = float(os.environ.get("STOCK_MCP_RISK_FREE_RATE", "0.045"))
 
 LOG_DIR = Path(os.environ.get("STOCK_MCP_DIR") or (Path.home() / "stock-mcp")) / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -263,6 +282,402 @@ async def check_post_hoc(
         }
     except Exception as e:
         return _err(ticker, e, "check_post_hoc")
+
+
+# ───────────────────────────── Options + Greeks ────────────────────────────
+
+
+def _norm_cdf(x: float) -> float:
+    """N(x): standard-normal CDF via erf. Stdlib only (no scipy)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_pdf(x: float) -> float:
+    """N'(x): standard-normal PDF."""
+    return math.exp(-x * x / 2.0) / math.sqrt(2.0 * math.pi)
+
+
+def _bs_greeks(
+    S: float, K: float, T: float, r: float, sigma: float, opt_type: str
+) -> dict:
+    """Black-Scholes Greeks for a European call/put on a non-dividend stock.
+
+    Returns delta/gamma/theta(per day)/vega(per 1% IV)/rho(per 1% rate).
+    None values if any input is degenerate (T<=0, sigma<=0, S<=0, K<=0).
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return {"delta": None, "gamma": None, "theta": None, "vega": None, "rho": None}
+
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    pdf_d1 = _norm_pdf(d1)
+
+    if opt_type == "call":
+        delta = _norm_cdf(d1)
+        theta = (
+            -S * pdf_d1 * sigma / (2.0 * sqrtT)
+            - r * K * math.exp(-r * T) * _norm_cdf(d2)
+        ) / 365.0
+        rho = K * T * math.exp(-r * T) * _norm_cdf(d2) / 100.0
+    else:  # put
+        delta = _norm_cdf(d1) - 1.0
+        theta = (
+            -S * pdf_d1 * sigma / (2.0 * sqrtT)
+            + r * K * math.exp(-r * T) * _norm_cdf(-d2)
+        ) / 365.0
+        rho = -K * T * math.exp(-r * T) * _norm_cdf(-d2) / 100.0
+
+    gamma = pdf_d1 / (S * sigma * sqrtT)
+    vega = S * pdf_d1 * sqrtT / 100.0  # per 1% IV change (sigma unit = decimal)
+
+    return {
+        "delta": round(delta, 4),
+        "gamma": round(gamma, 5),
+        "theta": round(theta, 4),
+        "vega": round(vega, 4),
+        "rho": round(rho, 4),
+    }
+
+
+def _years_to_expiry(expiration: str) -> float:
+    """ISO date 'YYYY-MM-DD' (UTC) -> fractional years from now."""
+    try:
+        exp_dt = datetime.strptime(expiration, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return -1.0
+    # Options resolve at end of trading day; tack on ~16:00 ET = ~20:00 UTC
+    exp_dt = exp_dt.replace(hour=20)
+    delta = exp_dt - datetime.now(timezone.utc)
+    return delta.total_seconds() / (365.0 * 86400.0)
+
+
+def _slim_row(row, spot: float, T: float, r: float, opt_type: str,
+              include_greeks: bool) -> dict:
+    """Reduce one yfinance options-chain row to a brief-friendly dict +
+    optional Greeks. Skip Greeks if IV is missing/zero."""
+    out = {
+        "strike": float(row.strike),
+        "lastPrice": float(row.lastPrice) if row.lastPrice else None,
+        "bid": float(row.bid) if row.bid else None,
+        "ask": float(row.ask) if row.ask else None,
+        "volume": int(row.volume) if row.volume else 0,
+        "openInterest": int(row.openInterest) if row.openInterest else 0,
+        "impliedVolatility": (
+            round(float(row.impliedVolatility), 4)
+            if row.impliedVolatility else None
+        ),
+        "inTheMoney": bool(row.inTheMoney) if hasattr(row, "inTheMoney") else None,
+    }
+    if include_greeks and out["impliedVolatility"]:
+        out["greeks"] = _bs_greeks(spot, out["strike"], T, r,
+                                   out["impliedVolatility"], opt_type)
+    return out
+
+
+def _resolve_expiration(t, expiration: str | None) -> str | None:
+    """If no expiration given, pick the nearest in the future. Returns None
+    if the ticker has no options at all."""
+    try:
+        opts = t.options
+    except Exception:
+        return None
+    if not opts:
+        return None
+    if expiration is None:
+        return opts[0]
+    return expiration if expiration in opts else None
+
+
+@mcp.tool()
+async def list_expirations(ticker: str) -> dict:
+    """Return all tradeable option expiration dates for a ticker.
+
+    Returns ISO dates sorted ascending. Use this before calling
+    get_option_chain or implied_move to know what expirations exist.
+    """
+    try:
+        t = yf.Ticker(ticker.upper())
+        opts = list(t.options)
+        log.info("list_expirations %s -> %d expirations", ticker, len(opts))
+        return {"ticker": ticker.upper(), "count": len(opts), "expirations": opts}
+    except Exception as e:
+        return _err(ticker, e, "list_expirations")
+
+
+@mcp.tool()
+async def get_option_chain(
+    ticker: str,
+    expiration: str = "",
+    contract_type: str = "both",
+    near_strike_pct: float = 10.0,
+    limit: int = 20,
+    with_greeks: bool = True,
+    risk_free_rate: float = 0.0,
+) -> dict:
+    """Option chain for ticker @ expiration, filtered to strikes near spot.
+
+    expiration: ISO date 'YYYY-MM-DD'. If "", uses the nearest in the future.
+    contract_type: 'calls' | 'puts' | 'both'.
+    near_strike_pct: keep strikes within ±this% of spot. Pass 100 for full chain.
+    limit: max rows per type after filtering (sorted by closeness to spot).
+    with_greeks: when True (default) each row gets a `greeks` subobject
+                 (Δ/Γ/Θ/Vega/Rho). Set False if you only need raw data.
+    risk_free_rate: decimal (0.045 = 4.5%). Use 0 to take the module default.
+
+    Returns calls/puts arrays, sorted by strike ascending.
+    """
+    try:
+        t = yf.Ticker(ticker.upper())
+        exp = _resolve_expiration(t, expiration or None)
+        if exp is None:
+            return _err(ticker, ValueError(f"no options or unknown expiration {expiration!r}"),
+                        "get_option_chain")
+
+        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        if spot <= 0:
+            return _err(ticker, ValueError("could not determine spot price"),
+                        "get_option_chain")
+        T = _years_to_expiry(exp)
+        if T <= 0:
+            return _err(ticker, ValueError(f"expiration {exp} is in the past"),
+                        "get_option_chain")
+        r = risk_free_rate if risk_free_rate > 0 else DEFAULT_RFR
+
+        chain = t.option_chain(exp)
+        lo = spot * (1 - near_strike_pct / 100.0)
+        hi = spot * (1 + near_strike_pct / 100.0)
+
+        result = {
+            "ticker": ticker.upper(),
+            "expiration": exp,
+            "spot": round(spot, 4),
+            "days_to_expiry": round(T * 365, 2),
+            "risk_free_rate": r,
+        }
+        if contract_type in ("calls", "both"):
+            calls = chain.calls[(chain.calls.strike >= lo) & (chain.calls.strike <= hi)]
+            calls = calls.iloc[(calls.strike - spot).abs().argsort()[:limit]].sort_values("strike")
+            result["calls"] = [_slim_row(r_, spot, T, r, "call", with_greeks)
+                               for r_ in calls.itertuples()]
+        if contract_type in ("puts", "both"):
+            puts = chain.puts[(chain.puts.strike >= lo) & (chain.puts.strike <= hi)]
+            puts = puts.iloc[(puts.strike - spot).abs().argsort()[:limit]].sort_values("strike")
+            result["puts"] = [_slim_row(r_, spot, T, r, "put", with_greeks)
+                              for r_ in puts.itertuples()]
+        log.info("get_option_chain %s %s near=%g%% -> %d calls / %d puts",
+                 ticker, exp, near_strike_pct,
+                 len(result.get("calls", [])), len(result.get("puts", [])))
+        return result
+    except Exception as e:
+        return _err(ticker, e, "get_option_chain")
+
+
+@mcp.tool()
+async def implied_move(ticker: str, expiration: str = "") -> dict:
+    """ATM straddle price / spot = implied % move by expiration.
+
+    This is the single most useful options-derived number for catalyst prep
+    (earnings, FOMC, etc.). Says "the options market is pricing in a ±X.X%
+    move by <date>".
+
+    expiration: ISO 'YYYY-MM-DD'. If "", uses the nearest in the future.
+
+    Computed: pick the strike closest to spot, average its call + put
+    mid-prices (bid/ask average), divide by spot.
+    """
+    try:
+        t = yf.Ticker(ticker.upper())
+        exp = _resolve_expiration(t, expiration or None)
+        if exp is None:
+            return _err(ticker, ValueError("no options available"), "implied_move")
+        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        if spot <= 0:
+            return _err(ticker, ValueError("could not determine spot"), "implied_move")
+        chain = t.option_chain(exp)
+
+        def _atm(df):
+            return df.iloc[(df.strike - spot).abs().argsort()[:1]].iloc[0]
+
+        c = _atm(chain.calls)
+        p = _atm(chain.puts)
+
+        def _mid(bid, ask, last):
+            if bid and ask: return (float(bid) + float(ask)) / 2.0
+            return float(last) if last else 0.0
+
+        call_mid = _mid(c.bid, c.ask, c.lastPrice)
+        put_mid = _mid(p.bid, p.ask, p.lastPrice)
+        straddle = call_mid + put_mid
+        move_pct = straddle / spot * 100.0
+        T = _years_to_expiry(exp)
+
+        log.info("implied_move %s %s -> ±%.2f%%", ticker, exp, move_pct)
+        return {
+            "ticker": ticker.upper(),
+            "expiration": exp,
+            "days_to_expiry": round(T * 365, 2),
+            "spot": round(spot, 4),
+            "atm_call_strike": float(c.strike),
+            "atm_put_strike": float(p.strike),
+            "call_mid": round(call_mid, 4),
+            "put_mid": round(put_mid, 4),
+            "straddle": round(straddle, 4),
+            "implied_move_pct": round(move_pct, 3),
+            "implied_move_abs": round(straddle, 4),
+            "upper_breakeven": round(spot + straddle, 4),
+            "lower_breakeven": round(spot - straddle, 4),
+            "atm_iv_call": (
+                round(float(c.impliedVolatility), 4) if c.impliedVolatility else None
+            ),
+            "atm_iv_put": (
+                round(float(p.impliedVolatility), 4) if p.impliedVolatility else None
+            ),
+        }
+    except Exception as e:
+        return _err(ticker, e, "implied_move")
+
+
+@mcp.tool()
+async def unusual_activity(
+    ticker: str,
+    expiration: str = "",
+    min_vol_oi_ratio: float = 3.0,
+    min_volume: int = 100,
+    limit: int = 20,
+) -> dict:
+    """Strikes with volume substantially above open interest.
+
+    Use case: cross-check group/KOL bullish or bearish calls -- if "$240
+    NVDA call is exploding" is real, this tool surfaces it. Filters for
+    volume/OI >= min_vol_oi_ratio AND volume >= min_volume so we don't
+    flag low-liquidity strikes that just happened to print once.
+
+    expiration: ISO 'YYYY-MM-DD'. If "", uses the nearest in the future.
+
+    Returns calls + puts, each sorted by vol/OI ratio descending.
+    """
+    try:
+        t = yf.Ticker(ticker.upper())
+        exp = _resolve_expiration(t, expiration or None)
+        if exp is None:
+            return _err(ticker, ValueError("no options available"), "unusual_activity")
+        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        chain = t.option_chain(exp)
+
+        def _filter_unusual(df):
+            df = df.copy()
+            df["volume_filled"] = df["volume"].fillna(0).astype(int)
+            df["oi_filled"] = df["openInterest"].fillna(0).astype(int)
+            # Treat OI=0 as 1 to avoid div-by-zero; that's still "unusual"
+            # if volume is high.
+            df["vol_oi_ratio"] = df["volume_filled"] / df["oi_filled"].clip(lower=1)
+            df = df[(df["volume_filled"] >= min_volume) &
+                    (df["vol_oi_ratio"] >= min_vol_oi_ratio)]
+            df = df.sort_values("vol_oi_ratio", ascending=False).head(limit)
+            return df
+
+        def _row_to_dict(row, opt_type):
+            return {
+                "strike": float(row.strike),
+                "contract_type": opt_type,
+                "volume": int(row.volume_filled),
+                "openInterest": int(row.oi_filled),
+                "vol_oi_ratio": round(float(row.vol_oi_ratio), 2),
+                "lastPrice": float(row.lastPrice) if row.lastPrice else None,
+                "bid": float(row.bid) if row.bid else None,
+                "ask": float(row.ask) if row.ask else None,
+                "impliedVolatility": (
+                    round(float(row.impliedVolatility), 4)
+                    if row.impliedVolatility else None
+                ),
+                "moneyness_pct": (
+                    round((float(row.strike) / spot - 1) * 100, 2) if spot else None
+                ),
+            }
+
+        unusual_calls = [_row_to_dict(r_, "call")
+                         for r_ in _filter_unusual(chain.calls).itertuples()]
+        unusual_puts = [_row_to_dict(r_, "put")
+                        for r_ in _filter_unusual(chain.puts).itertuples()]
+        log.info("unusual_activity %s %s -> %d calls / %d puts",
+                 ticker, exp, len(unusual_calls), len(unusual_puts))
+        return {
+            "ticker": ticker.upper(),
+            "expiration": exp,
+            "spot": round(spot, 4),
+            "filter": f"vol/OI >= {min_vol_oi_ratio} AND vol >= {min_volume}",
+            "unusual_calls": unusual_calls,
+            "unusual_puts": unusual_puts,
+        }
+    except Exception as e:
+        return _err(ticker, e, "unusual_activity")
+
+
+@mcp.tool()
+async def compute_greeks(
+    ticker: str,
+    expiration: str,
+    strike: float,
+    contract_type: str = "call",
+    risk_free_rate: float = 0.0,
+) -> dict:
+    """Single-strike Greeks lookup. Returns Δ/Γ/Θ/Vega/Rho + the inputs
+    they were computed from.
+
+    expiration: ISO 'YYYY-MM-DD'.
+    strike: exact strike (must exist in the chain).
+    contract_type: 'call' or 'put'.
+    risk_free_rate: decimal, 0 takes the module default (4.5%).
+    """
+    if contract_type not in ("call", "put"):
+        return _err(ticker, ValueError("contract_type must be 'call' or 'put'"),
+                    "compute_greeks")
+    try:
+        t = yf.Ticker(ticker.upper())
+        if expiration not in (t.options or []):
+            return _err(ticker, ValueError(f"unknown expiration {expiration!r}"),
+                        "compute_greeks")
+        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        if spot <= 0:
+            return _err(ticker, ValueError("could not determine spot"), "compute_greeks")
+        T = _years_to_expiry(expiration)
+        if T <= 0:
+            return _err(ticker, ValueError("expiration is in the past"), "compute_greeks")
+        r = risk_free_rate if risk_free_rate > 0 else DEFAULT_RFR
+
+        chain = t.option_chain(expiration)
+        df = chain.calls if contract_type == "call" else chain.puts
+        row = df[df.strike == strike]
+        if row.empty:
+            available = sorted(df.strike.tolist())
+            nearest = min(available, key=lambda s: abs(s - strike))
+            return _err(ticker,
+                        ValueError(f"strike {strike} not in chain. Nearest: {nearest}"),
+                        "compute_greeks")
+        row = row.iloc[0]
+        iv = float(row.impliedVolatility) if row.impliedVolatility else 0.0
+        greeks = _bs_greeks(spot, strike, T, r, iv, contract_type)
+        log.info("compute_greeks %s %s %s %s -> Δ=%s", ticker, expiration, strike,
+                 contract_type, greeks.get("delta"))
+        return {
+            "ticker": ticker.upper(),
+            "expiration": expiration,
+            "strike": strike,
+            "contract_type": contract_type,
+            "spot": round(spot, 4),
+            "days_to_expiry": round(T * 365, 2),
+            "risk_free_rate": r,
+            "impliedVolatility": round(iv, 4) if iv else None,
+            "bid": float(row.bid) if row.bid else None,
+            "ask": float(row.ask) if row.ask else None,
+            "lastPrice": float(row.lastPrice) if row.lastPrice else None,
+            "volume": int(row.volume) if row.volume else 0,
+            "openInterest": int(row.openInterest) if row.openInterest else 0,
+            "greeks": greeks,
+        }
+    except Exception as e:
+        return _err(ticker, e, "compute_greeks")
 
 
 if __name__ == "__main__":

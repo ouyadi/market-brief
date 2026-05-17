@@ -104,6 +104,11 @@ SYSTEM_PROMPT = f"""\
   - mcp__stock-price__get_history(ticker, period, interval)  OHLCV 时序(period 1d/5d/1mo/3mo/1y; interval 1m/5m/1h/1d)
   - mcp__stock-price__get_info(ticker)                   sector / forward_pe / next_earnings_date / dividend / 业务概览
   - mcp__stock-price__check_post_hoc(ticker, at_time, horizon)  事后验证:某 ISO 时间点(如 tweet 发布时)+ horizon (1h/1d/3d/1w/2w/1mo),返回 price_at_time / max_gain / max_drawdown / net_move 用于评 KOL/群主 call 命中率
+  - mcp__stock-price__list_expirations(ticker)           所有可交易期权到期日(用于找下一个最近 expiry)
+  - mcp__stock-price__get_option_chain(ticker, expiration, contract_type, near_strike_pct, limit, with_greeks)  期权链。默认 ±10% near spot 范围 + 自动算 Δ/Γ/Θ/Vega/Rho。contract_type 可选 calls/puts/both
+  - mcp__stock-price__implied_move(ticker, expiration)   ATM straddle / spot = 期权市场定的 ±X% 波动范围 + 上下 breakeven。**财报 setup 核心指标**
+  - mcp__stock-price__unusual_activity(ticker, expiration, min_vol_oi_ratio, min_volume)  volume >> open interest 的 strikes,用于交叉验证群里说的"$XXX call 大单"
+  - mcp__stock-price__compute_greeks(ticker, expiration, strike, contract_type)  单 strike 希腊字母(ad-hoc 查询)
   - mcp__polymarket__list_markets(query, limit, active_only, sort_by)  预测市场列表(Polymarket Gamma API)。每条返回 outcomePrices = 市场隐含概率(0.0-1.0)。query 模糊匹配 question;sort_by 可选 volume24hr/volume1wk/volume1mo/liquidity/endDate
   - mcp__polymarket__get_market(id_or_slug)              单个市场详情
   - mcp__polymarket__list_events(query, limit, active_only)  事件列表。事件 = 一组相关市场(比如 "Fed June 会议" 下挂 25bp/50bp/hold 三个子市场)

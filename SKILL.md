@@ -519,15 +519,28 @@ Smoke test:
 # expected: NVDA price + 52w range + market cap
 ```
 
-Tools exposed:
+Tools exposed (price / fundamentals):
 - `get_quote(ticker)` — current snapshot
 - `get_history(ticker, period, interval)` — OHLCV bars (caps 50 most recent)
 - `get_info(ticker)` — sector / forward_pe / next_earnings_date / dividend / MAs
 - `check_post_hoc(ticker, at_time, horizon)` — event-study micro: at a tweet/message timestamp + N-period horizon, returns price-at-time, max gain/drawdown, net move. **Use to grade KOL/group call accuracy**.
 
+Tools exposed (options + Black-Scholes Greeks, all read-only):
+- `list_expirations(ticker)` — every expiration date the ticker has
+- `get_option_chain(ticker, expiration, contract_type, near_strike_pct, with_greeks)` — chain rows filtered to ±N% of spot; each row gets Δ/Γ/Θ(/day)/Vega(/1% IV)/Rho(/1% rate) by default
+- `implied_move(ticker, expiration)` — ATM straddle / spot, gives the "market is pricing in ±X% by date" number; the headline catalyst-prep statistic
+- `unusual_activity(ticker, expiration, min_vol_oi_ratio, min_volume)` — strikes where volume >> open interest, sorted by ratio. Use to cross-check group/KOL chatter about big call/put bets.
+- `compute_greeks(ticker, expiration, strike, contract_type)` — single-strike lookup with all 5 Greeks
+
+Greeks math is pure stdlib Black-Scholes (`math.erf` for the normal CDF, no scipy dep). Risk-free rate defaults to 4.5% — override via `STOCK_MCP_RISK_FREE_RATE` env var or per-call parameter. Theta is in $/day, Vega per 1% IV change, Rho per 1% rate change.
+
 Caveats:
 - yfinance scrapes Yahoo Finance, so high-freq calls (>10/min sustained)
   may hit transient rate limits. Hourly market-brief usage is fine.
+- Yahoo's `impliedVolatility` field can be stale on illiquid strikes
+  (no trades since open). The Greeks at zero-volume strikes are
+  computed from that stale IV — interpret as directionally correct
+  but not precise.
 - Does NOT hit the Defender file-visibility issue that Playwright did —
   pure HTTP, no browser binary.
 
