@@ -5,18 +5,27 @@
 $taskName = "MarketBrief"
 $here     = Split-Path -Parent $MyInvocation.MyCommand.Path
 $runner   = Join-Path $here "run.ps1"
+$vbs      = Join-Path $here "run-hidden.vbs"
 
 if (-not (Test-Path $runner)) {
     Write-Error "Cannot find $runner"
+    exit 1
+}
+if (-not (Test-Path $vbs)) {
+    Write-Error "Cannot find $vbs (the no-flash wrapper) -- copy run-hidden.vbs into this dir from the repo"
     exit 1
 }
 
 # Remove existing task with same name (idempotent re-install)
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
+# Launch via wscript.exe + run-hidden.vbs so the user doesn't see a console
+# window flash every hour. The VBS rebuilds the command line internally and
+# spawns it with windowStyle=Hidden via WshShell.Run, which (unlike
+# `powershell -WindowStyle Hidden` alone) never creates a visible console.
 $action  = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runner`""
+    -Execute "wscript.exe" `
+    -Argument "`"$vbs`" `"powershell.exe`" `"-NoProfile`" `"-ExecutionPolicy`" `"Bypass`" `"-File`" `"$runner`""
 
 # One daily trigger at 08:00 that then repeats every hour for 14 hours
 # => fires at 08, 09, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 (15 total)

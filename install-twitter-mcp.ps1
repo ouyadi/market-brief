@@ -13,10 +13,12 @@ $here    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPy  = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
            else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $script  = Join-Path $here 'twitter_playwright_mcp.py'
+$vbs     = Join-Path $here 'run-hidden.vbs'
 $logDir  = Join-Path $here 'logs'
 
 if (-not (Test-Path $venvPy)) { Write-Error "venv python missing: $venvPy"; exit 2 }
 if (-not (Test-Path $script)) { Write-Error "wrapper missing: $script"; exit 2 }
+if (-not (Test-Path $vbs))    { Write-Error "no-flash wrapper missing: $vbs"; exit 2 }
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 
 $taskName = "TwitterMCP"
@@ -34,9 +36,10 @@ $wrapper = "Start-Process -FilePath '$venvPy' " +
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
+# wscript+VBS for no-flash launch; see run-hidden.vbs for rationale.
 $action = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$wrapper`""
+    -Execute "wscript.exe" `
+    -Argument "`"$vbs`" `"powershell.exe`" `"-NoProfile`" `"-ExecutionPolicy`" `"Bypass`" `"-Command`" `"$wrapper`""
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 

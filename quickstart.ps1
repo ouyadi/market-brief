@@ -158,7 +158,8 @@ function Phase3-CopyFiles {
         'run.ps1', 'schedule-install.ps1',
         'push_weixin.py', 'qr_login_bootstrap.py',
         'listen_weixin.py', 'run-listener.ps1', 'install-listener.ps1',
-        'secrets.example.json', 'hermes-py.ps1'
+        'secrets.example.json', 'hermes-py.ps1',
+        'run-hidden.vbs'  # no-flash launcher used by schedule-install.ps1 + install-listener.ps1
     )
     foreach ($f in $marketFiles) {
         $src = Join-Path $REPO_DIR $f
@@ -194,6 +195,7 @@ function Phase3-CopyFiles {
     Run { New-Item -ItemType Directory -Force -Path $TWITTER_DIR | Out-Null } "mkdir twitter-mcp"
     Run { Copy-Item (Join-Path $REPO_DIR 'twitter_playwright_mcp.py') $TWITTER_DIR -Force } "cp twitter_playwright_mcp.py"
     Run { Copy-Item (Join-Path $REPO_DIR 'install-twitter-mcp.ps1') $TWITTER_DIR -Force } "cp install-twitter-mcp.ps1"
+    Run { Copy-Item (Join-Path $REPO_DIR 'run-hidden.vbs') $TWITTER_DIR -Force } "cp run-hidden.vbs"
     # twitter-mcp .env left for user to create (cookies)
     $twEnv = Join-Path $TWITTER_DIR '.env'
     if (-not (Test-Path $twEnv)) {
@@ -204,6 +206,7 @@ function Phase3-CopyFiles {
     Run { New-Item -ItemType Directory -Force -Path $STOCK_DIR | Out-Null } "mkdir stock-mcp"
     Run { Copy-Item (Join-Path $REPO_DIR 'stock_price_mcp.py') $STOCK_DIR -Force } "cp stock_price_mcp.py"
     Run { Copy-Item (Join-Path $REPO_DIR 'install-stock-mcp.ps1') $STOCK_DIR -Force } "cp install-stock-mcp.ps1"
+    Run { Copy-Item (Join-Path $REPO_DIR 'run-hidden.vbs') $STOCK_DIR -Force } "cp run-hidden.vbs"
 
     Ok "all runtime files placed"
 }
