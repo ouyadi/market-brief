@@ -57,6 +57,22 @@ send_weixin_direct → reply back into the same WeChat chat
 The listener filters strictly to the bot owner (your own `WEIXIN_HOME_CHANNEL`)
 so even if a stranger DMs the bot, it stays silent.
 
+### Optional: Stock price MCP via yfinance
+
+A second HTTP MCP server (`stock_price_mcp.py`, port 3032) backed by
+`yfinance`. Four tools:
+
+- **`get_quote(ticker)`** — current price, change%, volume, market cap, 52w range
+- **`get_history(ticker, period, interval)`** — OHLCV time series (caps last 50 bars)
+- **`get_info(ticker)`** — sector, forward P/E, next earnings date, dividend, summary
+- **`check_post_hoc(ticker, at_time, horizon)`** — event-study micro: at a given timestamp (e.g. a tweet's `posted_at`) and N period later, returns price-at-time, max gain, max drawdown, net move. **Designed for evaluating KOL/group-host call accuracy** — feed Claude tweet/group-message timestamps + tickers and let it grade hit rate.
+
+Free, no API key, no Defender quarantine path. yfinance scrapes Yahoo
+Finance so high-freq calls can hit rate limits, but hourly market-brief
+usage is well within tolerable levels.
+
+Daemonized as scheduled task `StockPriceMCP` (At log on, hidden window).
+
 ### Optional: Twitter/X MCP via Playwright
 
 Self-hosted Twitter/X scraper libs (`twscrape`, `agent-twitter-client`) are
@@ -135,6 +151,8 @@ written linearly for a human operator.
 | Scheduled Task `WeixinListener` *(if inbound enabled)* | At-log-on hidden listener that bridges WeChat ↔ Claude |
 | Scheduled Task `TwitterMCP` *(if Twitter MCP enabled)* | At-log-on hidden Playwright-based X scraper on `127.0.0.1:3031` |
 | `C:\Users\<u>\twitter-mcp\` *(if Twitter MCP enabled)* | Wrapper script + cookies `.env` + logs |
+| Scheduled Task `StockPriceMCP` *(if stock MCP enabled)* | At-log-on hidden yfinance-based price server on `127.0.0.1:3032` |
+| `C:\Users\<u>\stock-mcp\` *(if stock MCP enabled)* | Wrapper script + logs |
 
 ## Repo contents
 
@@ -152,6 +170,8 @@ written linearly for a human operator.
 | [`install-listener.ps1`](install-listener.ps1) | Registers `WeixinListener` Task Scheduler entry (At log on) |
 | [`twitter_playwright_mcp.py`](twitter_playwright_mcp.py) | HTTP MCP server: Playwright headless Chrome + cookies → X DOM scrape (read-only) |
 | [`install-twitter-mcp.ps1`](install-twitter-mcp.ps1) | Registers `TwitterMCP` task |
+| [`stock_price_mcp.py`](stock_price_mcp.py) | HTTP MCP server: yfinance → quote / history / info / check_post_hoc |
+| [`install-stock-mcp.ps1`](install-stock-mcp.ps1) | Registers `StockPriceMCP` task |
 | [`secrets.example.json`](secrets.example.json) | Template for `secrets.json` (OAuth + Gmail) |
 | [`hermes-py.ps1`](hermes-py.ps1) | Legacy wrapper kept for emergency fallback |
 
