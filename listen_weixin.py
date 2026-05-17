@@ -191,6 +191,8 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/dv 6h` / `/dv cathiedwood` / `/dv cathiedwood 24h`\n"
         "  /xfeed [tab] [N]   X 个人时间线简报 (默认: For You + Following, 各 15 条)\n"
         "                     例: `/xfeed` / `/xfeed for_you` / `/xfeed following 25`\n"
+        "  /plan [tickers]    可执行方案(stock-price + X live news 富化)\n"
+        "                     例: `/plan` (从最新 brief 选 top 3) / `/plan TSLA NVDA INTC`\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -302,11 +304,64 @@ async def _handle_xfeed(text: str = "") -> str:
     return await _ask_claude(prompt)
 
 
+async def _handle_plan(text: str = "") -> str:
+    """
+    Ad-hoc enriched execution plan.
+      /plan                    — Claude reads latest brief, picks top 3 tickers
+      /plan TSLA               — single ticker
+      /plan TSLA NVDA INTC     — up to 5 tickers
+    """
+    args = text.split()[1:]
+    tickers = []
+    for a in args:
+        clean = a.upper().lstrip("$").strip(",")
+        if re.match(r"^[A-Z]{1,5}$", clean):
+            tickers.append(clean)
+    tickers = tickers[:5]
+
+    if not tickers:
+        intro = (
+            "步骤 0:Read `C:\\Users\\ouyad\\Reports\\` 目录下**最新**一份 "
+            "`YYYY-MM-DD-HH-brief.md`(按文件名排序取最大)。从其 "
+            "'## ⚡ 高优先级关注' / '## 🎯 个股共识' 节里提取 **top 3** tickers "
+            "(信号强度 × 时效优先)。如无法判断,默认取 brief 头部"
+            "出现频次最高的 3 个。\n\n"
+        )
+    else:
+        intro = f"对以下 tickers 富化:**{', '.join(tickers)}**。\n\n"
+
+    body = (
+        "**对每个 ticker 并行调** 4 个工具:\n"
+        "  1. `mcp__stock-price__get_quote(ticker)`\n"
+        "  2. `mcp__stock-price__get_info(ticker)`\n"
+        "  3. `mcp__stock-price__get_history(ticker, period='5d', interval='1h')`\n"
+        "  4. `mcp__twitter__search_tweets(query='$'+ticker, limit=8, mode='live')`\n\n"
+        "**输出中文 markdown,每个 ticker 一节**:\n\n"
+        "### {TICKER} ─ {一句话定位 / 多空 ±conviction}\n"
+        "- **Snapshot**:`$price | day low-high | 52w low-high | mc | next earnings: date | fwd P/E | 50d/200d MA`\n"
+        "- **消息面** (X live × N):3-5 条 actionable,过滤段子/广告。每条 `HH:MM @user`: 主旨(<80 字)\n"
+        "- **技术位** (5d 1h):支撑 `$s1 / $s2`;压力 `$r1 / $r2`;最近趋势一句话\n"
+        "- **可执行**:\n"
+        "  - 立场:多/空/观望\n"
+        "  - Entry:`$price` 或区间\n"
+        "  - Stop:`$price`(理由)\n"
+        "  - Target:`$price`(R/R)\n"
+        "  - 触发:catalyst / break level / 时间窗口\n"
+        "  - 失效:stop hit / 反向 catalyst\n"
+        "  - 时效:几天 / 本周 / 财报前 / 等政策\n"
+        "- **风险/红旗**:一句话\n\n"
+        "**约束**:整体输出 < 1800 字(iLink 单条上限)。如某 ticker 的工具失败,标"
+        "'数据源缺失:{ticker} - {工具}'但不要 abort 整轮。"
+    )
+    return await _ask_claude(intro + body)
+
+
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
     "/dv": _handle_dv,
     "/xfeed": _handle_xfeed,
+    "/plan": _handle_plan,
     "/help": _handle_help,
 }
 

@@ -73,6 +73,13 @@
    - 盘中/盘后模式: limit=8,然后**过滤掉**早于当前扫描窗口 `since` 的推(多数大 V 该窗口内没新推就忽略,不输出他)
    失败的 handle 在简报标"数据源缺失:大 V @xxx"。
 
+5c. **可执行方案富化**(仅**盘前模式**,且 `mcp__stock-price__*` 和 `mcp__twitter__*` 工具都可用时):从前面收集的群讨论 / 机构研报 / 大 V 推 里挑出 **Top 3 setup**,对每个 ticker 并行调:
+   - `mcp__stock-price__get_quote(ticker)` — 当前价 + day high/low + 52w range + market cap
+   - `mcp__stock-price__get_info(ticker)` — sector / forward_pe / **next_earnings_date** / 50d/200d MA
+   - `mcp__stock-price__get_history(ticker, period='5d', interval='1h')` — 找支撑/压力
+   - `mcp__twitter__search_tweets(query='$TICKER', limit=8, mode='live')` — 消息面 / 舆论
+   把结果综合写进输出模板的 `## ⚡ 高优先级关注` enriched 格式里。**盘中/盘后跳过这步**,keep ⚡ 短 bullet 格式。失败的 ticker 标"数据源缺失"但不影响其他。
+
 5. **抓 X 内容**：top 5 高频 X 链接。如果你装了可选的 `twitter` MCP(headless Chromium + 用户 cookies,绕登录墙),**优先**用 `mcp__twitter__fetch_tweet_by_url`。不可用时 fallback `WebFetch`(命中登录墙标 "[X 登录墙,看不到原文]")。也可用 `mcp__twitter__search_tweets(query, limit, mode='live')` 主动搜含 specific ticker 的推。**只读约束**:不调用 send/like/retweet/follow 等写操作(用户主账号 cookies,X 反爬抓到 write 易封号)。
 
 5b. **机构研报频道**（可选）：如果你的某个 Discord 频道是机构研报自动推送 bot（消息内容在 `message.embeds` 而非 `message.content`），把那个 channel_id 也加进上面表格,并在这一节注明:从 embeds 的 `title` / `description` / `fields` 提取投行/标的/评级/目标价。同一标的多家方向一致标"共识"。如果你没有这类频道,删掉这一节即可。
@@ -98,6 +105,34 @@
    按转发频次降序，每条：
    - **{URL}**（{N} 人转：{user1}, {user2}, ...）
      - 主旨摘要（来自 WebFetch 内容，或群里转发时的注解）
+
+   ## ⚡ 高优先级关注
+
+   <!-- 盘前模式(Step 5c 富化过): 用 enriched 格式,3 个 setup;
+        盘中/盘后模式: 用 shallow 短 bullet,3-5 条 -->
+
+   **盘前 enriched 版**(每个 setup 完整一段,共 3):
+
+   ### {TICKER} ─ {一句话定位 / 多空 ±conviction}
+   - **Snapshot**: $@price | day {low}–{high} | 52w {low}–{high} | mc $@mc | next earnings: {date} | fwd P/E {pe} | 50d/200d MA $@m50/$@m200
+   - **消息面/基本面** (X live × N):
+     - `HH:MM` @user: 主旨 (<80 字)
+     - 3 条 actionable,过滤段子/广告
+   - **技术位** (5d 1h 图):
+     - 支撑 $@s1 / $@s2;压力 $@r1 / $@r2
+     - 最近趋势一句话(缺口/突破/被吃位等)
+   - **可执行**:
+     - 立场: 多 / 空 / 观望(±高 conviction)
+     - Entry: $@price 或区间
+     - Stop: $@price(理由)
+     - Target: $@price(R/R)
+     - 触发: catalyst / 价格 break / 时间窗口
+     - 失效: stop hit / 反向 catalyst
+     - 时效: 几天 / 本周 / 财报前
+   - **风险/红旗**: 一句话
+
+   **盘中/盘后 shallow 版**(3-5 条):
+   - **{标的或主题}** — {为什么现在重要} — {可能的触发/失效条件}
 
    ## 🎙️ 大 V 速读
    <!-- 来自 4b 步骤拉到的内容。盘中/盘后窗口内 0 新推的大 V 直接省略,
