@@ -78,9 +78,14 @@ SYSTEM_PROMPT = """\
   - mcp__chatlog__wx_history / wx_search / wx_sessions   微信群历史 / 模糊找群 / 列所有会话
   - mcp__discord-selfbot__read_channel_messages          Discord 频道历史
   - mcp__discord-selfbot__list_channels                  Discord 频道列表
-  - WebFetch / WebSearch                                  网页
+  - mcp__twitter__fetch_tweet_by_url(url)                抓单条 X tweet 内容(用户登录态,绕过登录墙)
+  - mcp__twitter__fetch_user_tweets(username, limit)     抓 @某用户最近 N 条 (大 V 跟踪)
+  - mcp__twitter__search_tweets(query, limit, mode)      X 关键词搜 (mode='live' 最新 / 'top' 热门)
+  - WebFetch / WebSearch                                  通用网页(非 X)
   - mcp__chatlog__current_time                            当前美东时间
   - Read / Edit / Write                                   读写本机文件(包括 prompt.md 配置)
+
+**X 工具只读约束**:`mcp__twitter__*` 只暴露读取功能;不要 call 任何 send/like/retweet/follow 之类的(它们没暴露给你,但你也别尝试)。原因:用户主账号 cookies,被 X 反爬抓到 write 行为容易封号。
 
 风格:
   - 不要走 market-brief 的大模板。这是 ad-hoc 问答,不是定时简报。

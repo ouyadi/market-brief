@@ -57,6 +57,27 @@ send_weixin_direct → reply back into the same WeChat chat
 The listener filters strictly to the bot owner (your own `WEIXIN_HOME_CHANNEL`)
 so even if a stranger DMs the bot, it stays silent.
 
+### Optional: Twitter/X MCP via Playwright
+
+Self-hosted Twitter/X scraper libs (`twscrape`, `agent-twitter-client`) are
+broken by X's 2026-05 reverse-eng pace, even the actively-maintained ones.
+**Solution shipped in this repo**: a Playwright-based HTTP MCP server
+(`twitter_playwright_mcp.py`) that launches **user-installed Chrome** with
+your own X cookies injected, scrapes the DOM, and exposes:
+
+- `fetch_tweet_by_url(url)` — pull text/author/time of a single tweet
+- `fetch_user_tweets(username, limit)` — recent N tweets from a handle
+- `search_tweets(query, limit, mode='live'|'top')` — keyword search
+
+Runs on `127.0.0.1:3031/mcp` as a daemon (At-log-on scheduled task
+`TwitterMCP`). Read-only by design — no `send`/`like`/`follow` tools
+exposed even though cookies could authorize them (minimizes ban risk on
+the user's main account).
+
+Optional because: (a) requires a user-installed Chrome and a one-time
+cookie export, (b) uses your main X account — cookies live in
+`~/twitter-mcp/.env` which is gitignored. See SKILL.md Step 10.
+
 ## Install
 
 ### As a Claude Code skill (Claude drives the install)
@@ -112,6 +133,8 @@ written linearly for a human operator.
 | `C:\Users\<u>\Reports\YYYY-MM-DD-HH-brief.md` | Hourly report output |
 | Scheduled Task `MarketBrief` | Fires hourly 08:00–22:00 local time |
 | Scheduled Task `WeixinListener` *(if inbound enabled)* | At-log-on hidden listener that bridges WeChat ↔ Claude |
+| Scheduled Task `TwitterMCP` *(if Twitter MCP enabled)* | At-log-on hidden Playwright-based X scraper on `127.0.0.1:3031` |
+| `C:\Users\<u>\twitter-mcp\` *(if Twitter MCP enabled)* | Wrapper script + cookies `.env` + logs |
 
 ## Repo contents
 
@@ -127,6 +150,8 @@ written linearly for a human operator.
 | [`listen_weixin.py`](listen_weixin.py) | Long-poll inbound listener (WeChat → `claude --print` → reply) |
 | [`run-listener.ps1`](run-listener.ps1) | Wrapper that loads secrets + scrubs env, then launches `listen_weixin.py` |
 | [`install-listener.ps1`](install-listener.ps1) | Registers `WeixinListener` Task Scheduler entry (At log on) |
+| [`twitter_playwright_mcp.py`](twitter_playwright_mcp.py) | HTTP MCP server: Playwright headless Chrome + cookies → X DOM scrape (read-only) |
+| [`install-twitter-mcp.ps1`](install-twitter-mcp.ps1) | Registers `TwitterMCP` task |
 | [`secrets.example.json`](secrets.example.json) | Template for `secrets.json` (OAuth + Gmail) |
 | [`hermes-py.ps1`](hermes-py.ps1) | Legacy wrapper kept for emergency fallback |
 

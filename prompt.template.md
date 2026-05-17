@@ -57,7 +57,7 @@
 
 4. **抽取 X 链接**：从所有 text content 里 regex `(https?://(x\.com|twitter\.com)/[^\s]+)`，按 URL 计数（去掉 query string 后归一），统计**至少 2 个不同 author/sender 发过**的链接。
 
-5. **抓 X 内容**：top 5 高频 X 链接，用 `WebFetch` 抓页面（如果 X 反爬登录墙就在简报里标 "[X 登录墙，看不到原文]"）。
+5. **抓 X 内容**：top 5 高频 X 链接。如果你装了可选的 `twitter` MCP(headless Chromium + 用户 cookies,绕登录墙),**优先**用 `mcp__twitter__fetch_tweet_by_url`。不可用时 fallback `WebFetch`(命中登录墙标 "[X 登录墙,看不到原文]")。也可用 `mcp__twitter__search_tweets(query, limit, mode='live')` 主动搜含 specific ticker 的推。**只读约束**:不调用 send/like/retweet/follow 等写操作(用户主账号 cookies,X 反爬抓到 write 易封号)。
 
 5b. **机构研报频道**（可选）：如果你的某个 Discord 频道是机构研报自动推送 bot（消息内容在 `message.embeds` 而非 `message.content`），把那个 channel_id 也加进上面表格,并在这一节注明:从 embeds 的 `title` / `description` / `fields` 提取投行/标的/评级/目标价。同一标的多家方向一致标"共识"。如果你没有这类频道,删掉这一节即可。
 

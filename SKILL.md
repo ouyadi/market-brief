@@ -1,6 +1,6 @@
 ---
 name: market-brief-setup
-description: Install or maintain "market-brief" — a Windows scheduled task that runs Claude Code hourly to scan Discord + WeChat investing chat groups and push the resulting report to the user's WeChat (primary channel) with email as fallback. Optionally also install an inbound listener so the user can chat with Claude directly from WeChat (long-poll iLink → claude --print → reply, with /ping /brief /help slash commands). Use when the user wants to set up hourly chat-intel automation, asks how to push AI-generated reports to WeChat, asks how to chat with Claude via WeChat, asks about combining chatlog + discord-selfbot + Hermes Agent + Claude Code into one pipeline, or wants to migrate an existing install to a new machine. Requires the chat-mcp-setup skill to have already been run (chatlog + discord-selfbot MCP servers must be reachable on localhost). Windows host only — macOS variant noted at the end.
+description: Install or maintain "market-brief" — a Windows scheduled task that runs Claude Code hourly to scan Discord + WeChat investing chat groups and push the resulting report to the user's WeChat (primary channel) with email as fallback. Optionally also install an inbound listener so the user can chat with Claude directly from WeChat (long-poll iLink → claude --print → reply, with /ping /brief /help slash commands). Optionally also install a Playwright-based Twitter/X MCP server so Claude can fetch tweets the user's browser would see (cookies-injected headless Chrome; read-only; works around all currently-broken X scraper libs). Use when the user wants to set up hourly chat-intel automation, asks how to push AI-generated reports to WeChat, asks how to chat with Claude via WeChat, asks how to add Twitter/X intel to the pipeline, asks about combining chatlog + discord-selfbot + Hermes Agent + Claude Code into one pipeline, or wants to migrate an existing install to a new machine. Requires the chat-mcp-setup skill to have already been run (chatlog + discord-selfbot MCP servers must be reachable on localhost). Windows host only — macOS variant noted at the end.
 ---
 
 # Market-brief setup
@@ -361,6 +361,97 @@ for the long-poll exclusive lock unless you spin up a *second* listener
 process. If you ever see the listener replying twice or messages disappearing,
 check for stale `listen_weixin.py` processes with the CIM query above and
 kill them before restarting the task.
+
+### Step 10 — Optional: Twitter/X MCP via Playwright
+
+Skip unless the user wants Claude to fetch X content for them (either
+during market-brief runs or via WeChat ad-hoc questions). Otherwise the
+pipeline falls back to bare `WebFetch` which hits the X login wall ~40%
+of the time.
+
+**Important caveats — make sure user understands before installing:**
+
+- **Uses the user's main X account cookies.** All `mcp__twitter__*` tools
+  are read-only by design, but the cookies could in principle authorize
+  writes; if X's anti-bot ever flags this server, the user's main account
+  is at risk. Acceptable for low-frequency hourly reads; not acceptable
+  if the user is paranoid about that account.
+- **Requires user-installed Google Chrome** at `C:\Program Files\Google\Chrome\Application\chrome.exe`.
+  Playwright's bundled Chromium does NOT work from scheduled-task spawn
+  context on Windows (same Defender-quarantine-like symptom as uv-managed
+  Python; same fix — use Chrome instead).
+- **All major Twitter scraper libs are currently broken.** I tested
+  `agent-twitter-client` (deprecated, dead) and `twscrape` (active,
+  also dead with systemic IndexError as of 2026-05). Don't waste hours
+  there — go straight to Playwright.
+
+Install sequence (assumes hermes-agent venv from Step 4 is already up):
+
+```powershell
+# 1. Install Playwright + Chromium binary (full chromium needed at
+#    install-time even though daemon uses user-installed Chrome)
+$venvPy = 'C:\Users\$env:USERNAME\hermes-agent\.venv\Scripts\python.exe'
+& $venvPy -m pip install playwright mcp
+& $venvPy -m playwright install chromium
+
+# 2. Create ~/twitter-mcp with .env (cookies extracted from Chrome DevTools)
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\twitter-mcp"
+# .env shape (cookie values are from Chrome F12 → Application → Cookies → x.com,
+# but use Domain=.twitter.com because some libs key on that):
+# AUTH_METHOD=cookies
+# TWITTER_COOKIES=["auth_token=...; Domain=.twitter.com","ct0=...; Domain=.twitter.com","twid=...; Domain=.twitter.com"]
+# PORT=3030
+icacls "$env:USERPROFILE\twitter-mcp\.env" /inheritance:r /grant:r "$env:USERNAME:(R,W)"
+
+# 3. Copy twitter_playwright_mcp.py + install-twitter-mcp.ps1 into ~/twitter-mcp
+# (these are in this repo)
+
+# 4. Register the daemon
+& "$env:USERPROFILE\twitter-mcp\install-twitter-mcp.ps1"
+
+# 5. Start immediately
+Start-ScheduledTask -TaskName TwitterMCP
+
+# 6. Register the MCP with claude
+claude mcp add --transport http --scope user twitter http://127.0.0.1:3031/mcp
+
+# 7. Verify (after ~5s for Chrome warm-up)
+claude mcp list   # twitter should be ✓ Connected
+```
+
+Smoke test through claude (this will spawn headless Chrome ~5s + load
+CNBC page ~3s on first call):
+
+```powershell
+# In a shell with CLAUDE_CODE_OAUTH_TOKEN loaded from secrets.json
+"用 mcp__twitter__fetch_user_tweets cnbc limit=2" | claude --print --dangerously-skip-permissions
+# Expected: 2 tweet text/time/author dicts from @CNBC
+```
+
+#### Why `channel='chrome'` (not bundled Chromium)
+
+Inside `twitter_playwright_mcp.py` the launch call is:
+```python
+await _playwright.chromium.launch(headless=True, channel="chrome", ...)
+```
+Even though we ran `playwright install chromium`, the daemon **cannot see**
+files under `%LOCALAPPDATA%\ms-playwright\` from the scheduled-task spawn
+context — `os.path.exists()` returns False on a file `bash find` confirms
+exists. Exact same symptom as the uv-managed Python issue. Workaround:
+use user-installed Chrome (in `C:\Program Files\Google\Chrome\...`) which
+is in a Defender-trusted path.
+
+#### Read-only enforcement
+
+The wrapper deliberately exposes only `fetch_*` and `search_*` tools.
+The listener's SYSTEM_PROMPT also includes an explicit read-only warning.
+Two independent layers. Do NOT add `post_tweet` / `like` / `follow`
+without explicit user re-consent — main-account ban risk.
+
+#### What gets logged where
+
+- `~/twitter-mcp/logs/twitter_mcp.log` — structured wrapper log (tool calls)
+- `~/twitter-mcp/logs/twitter-mcp.YYYY-MM-DD.{out,err}.log` — daemon wrapper PowerShell stdout/stderr
 
 ---
 
