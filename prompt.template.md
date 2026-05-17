@@ -45,6 +45,17 @@
 | <群名> | <number>@chatroom |
 | ... | ... |
 
+### 大 V X 账号(可选,需要 `mcp__twitter__*` MCP)
+
+如果你装了 [twitter_playwright_mcp.py](twitter_playwright_mcp.py),Claude 会用 `mcp__twitter__fetch_user_tweets` 抓下表里每个 handle。盘前模式拉过去 12 小时(limit=20),盘中/盘后模式拉过去 90 分钟(limit=8,多数大 V 没新就 skip)。
+
+| 大 V 显示名 | X handle (no @) | 主战场 |
+|---|---|---|
+| <大 V 显示名> | <handle> | <一句话方向描述> |
+| ... | ... | ... |
+
+需要增删:在微信(若启用 listener)发"大 V 加 cathiedwood, jimcramer"等,listener 会按配置管理流程改本表。删除这一节(连同表头)即可禁用大 V 追踪。
+
 ## 流程
 
 1. **拿时间 + 确定模式**：调 `mcp__chatlog__current_time`。提取 EDT 小时 HH，按上面"时段感知"规则确定模式与 since（24h 或 90min）。
@@ -56,6 +67,11 @@
 3. **如果某个 `wx_history` 返回超出 token 上限**：会落地到磁盘文件，按提示用 jq / PowerShell 解析（参考之前的解析逻辑：YAML 文本里 `- timestamp: / time: / sender: / type: / content:`）。
 
 4. **抽取 X 链接**：从所有 text content 里 regex `(https?://(x\.com|twitter\.com)/[^\s]+)`，按 URL 计数（去掉 query string 后归一），统计**至少 2 个不同 author/sender 发过**的链接。
+
+4b. **拉大 V tweets**(如果 `mcp__twitter__fetch_user_tweets` 工具存在且"### 大 V X 账号"表里有条目):对每个 handle 并行调,limit 按时段:
+   - 盘前模式: limit=20(过去 12 小时大多有新内容)
+   - 盘中/盘后模式: limit=8,然后**过滤掉**早于当前扫描窗口 `since` 的推(多数大 V 该窗口内没新推就忽略,不输出他)
+   失败的 handle 在简报标"数据源缺失:大 V @xxx"。
 
 5. **抓 X 内容**：top 5 高频 X 链接。如果你装了可选的 `twitter` MCP(headless Chromium + 用户 cookies,绕登录墙),**优先**用 `mcp__twitter__fetch_tweet_by_url`。不可用时 fallback `WebFetch`(命中登录墙标 "[X 登录墙,看不到原文]")。也可用 `mcp__twitter__search_tweets(query, limit, mode='live')` 主动搜含 specific ticker 的推。**只读约束**:不调用 send/like/retweet/follow 等写操作(用户主账号 cookies,X 反爬抓到 write 易封号)。
 
@@ -82,6 +98,19 @@
    按转发频次降序，每条：
    - **{URL}**（{N} 人转：{user1}, {user2}, ...）
      - 主旨摘要（来自 WebFetch 内容，或群里转发时的注解）
+
+   ## 🎙️ 大 V 速读
+   <!-- 来自 4b 步骤拉到的内容。盘中/盘后窗口内 0 新推的大 V 直接省略,
+        如果整节零内容就连 section 标题一起删 -->
+   按"信息量×独家性"排序,每个大 V 一小段:
+   - **@handle**({N} 条新推):
+     - "原文 1"(时间) — 一句话解读 / 提及 ticker
+     - "原文 2"(时间) — ...
+   段末若有跨大 V 共识/分歧/新 ticker 在底下补一段:
+   > **跨大 V 信号**:
+   > - 📈 共识看多: @A、@B 都提到 NVDA 算力故事(2 票)
+   > - 📉 共识看空: ...
+   > - ⚡ 新出现 ticker(过去 N 小时首次被任一跟踪的大 V 提及): TSLA、OXY
 
    ## 🏦 机构研报（如果你启用了 5b 节）
    按机构 + 标的整理，每条 1-2 行：
