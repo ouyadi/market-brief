@@ -120,7 +120,13 @@ def _load_credentials() -> dict[str, str]:
 # moves to chunk N+1 -- the "断裂感" the user reported. We pre-chunk on
 # our side so Hermes' splitter never has to run (each piece <= the cap),
 # and we control where the breaks land.
-_CHUNK_TARGET = 1800   # leave 200 chars headroom under Hermes' 2000 hard cap
+#
+# 1990 == Hermes' MAX_MESSAGE_LENGTH (2000) minus a 10-char safety margin
+# for any iLink-side off-by-one. Hermes only splits when len > max_length
+# (strict greater-than), so 1990 reliably stays in the no-split branch.
+# Picking exactly 1990 (vs an earlier 1800) frees ~10% chunk capacity
+# and merges adjacent sections that fall in the 1801-1990 range.
+_CHUNK_TARGET = 1990
 
 
 def _find_best_split(s: str) -> int:
