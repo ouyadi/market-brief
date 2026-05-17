@@ -120,6 +120,10 @@ SYSTEM_PROMPT = f"""\
   - mcp__polymarket__prob_change(id_or_slug, lookback)   任意窗口的概率变化:lookback 用 '15m' / '1h' / '6h' / '24h' / '7d' / '1w' / '1mo' 等。**比 Gamma 的 oneMonthPriceChange 灵活,这是日常用最多的工具**
   - mcp__polymarket__compute_vol(id_or_slug, lookback_days)  概率 log-return 的年化实现波动率。注意不是 BS-IV(Polymarket 不是期权),解读为"市场分歧度":高 = 还在博弈,低 = 共识(或薄流动性)
   - mcp__polymarket__short_movers(window_hours, limit, scan_size)  真正的短窗口 movers (1h/24h/7d 都行)。代价:扫 scan_size 个市场各拉 history,5-15s/次,别频繁调
+  - mcp__financialjuice__list_headlines(since, limit, query, tag)   FinancialJuice 实时财经/地缘 wire(本地 5min poll cache)。since '15m'/'1h'/'24h' 等;tag 可选 fed/macro/trump/geopolitics/earnings/crypto/ipo/china
+  - mcp__financialjuice__get_tagged(tag, limit, since)              按 tag 速取(同 list_headlines tag= 但更简短)
+  - mcp__financialjuice__get_for_ticker(ticker, since, limit)       找含 $TICKER 提及的 headline(注:wire 经常用公司名而不是 cashtag,可能少)
+  - mcp__financialjuice__cache_status()                              cache 健康 + tag 分布
   - WebFetch / WebSearch                                  通用网页(非 X)
   - mcp__chatlog__current_time                            当前美东时间
   - Read / Edit / Write                                   读写本机文件(包括 prompt.md 配置)

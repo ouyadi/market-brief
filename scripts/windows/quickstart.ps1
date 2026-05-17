@@ -40,6 +40,7 @@ $VENV_PY     = Join-Path $HERMES_DIR '.venv\Scripts\python.exe'
 $TWITTER_DIR    = Join-Path $env:USERPROFILE 'twitter-mcp'
 $STOCK_DIR      = Join-Path $env:USERPROFILE 'stock-mcp'
 $POLYMARKET_DIR = Join-Path $env:USERPROFILE 'polymarket-mcp'
+$FINJUICE_DIR   = Join-Path $env:USERPROFILE 'financialjuice-mcp'
 $HERMES_HOME    = Join-Path $env:USERPROFILE '.hermes'
 
 function Info($msg)  { Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
@@ -240,6 +241,12 @@ function Phase3-CopyFiles {
     Run { Copy-Item (Join-Path $WIN_SCRIPTS 'install-polymarket-mcp.ps1') $POLYMARKET_DIR -Force } "cp install-polymarket-mcp.ps1"
     Run { Copy-Item (Join-Path $WIN_SCRIPTS 'run-hidden.vbs')             $POLYMARKET_DIR -Force } "cp run-hidden.vbs"
 
+    # financialjuice-mcp dir
+    Run { New-Item -ItemType Directory -Force -Path $FINJUICE_DIR | Out-Null } "mkdir financialjuice-mcp"
+    Run { Copy-Item (Join-Path $MCP_DIR     'financialjuice_mcp.py')         $FINJUICE_DIR -Force } "cp financialjuice_mcp.py"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'install-financialjuice-mcp.ps1') $FINJUICE_DIR -Force } "cp install-financialjuice-mcp.ps1"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'run-hidden.vbs')                 $FINJUICE_DIR -Force } "cp run-hidden.vbs"
+
     Ok "all runtime files placed"
 }
 
@@ -343,6 +350,11 @@ function Phase5-Tasks {
     Info "registering PolymarketMCP task (At log on)"
     Run { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $POLYMARKET_DIR 'install-polymarket-mcp.ps1') | Out-Null } "install-polymarket-mcp.ps1"
     Ok "PolymarketMCP registered"
+
+    # FinancialJuiceMCP
+    Info "registering FinancialJuiceMCP task (At log on)"
+    Run { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $FINJUICE_DIR 'install-financialjuice-mcp.ps1') | Out-Null } "install-financialjuice-mcp.ps1"
+    Ok "FinancialJuiceMCP registered"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -351,7 +363,7 @@ function Phase5-Tasks {
 function Phase6-Activate {
     Phase 6 "Start daemons + register claude MCPs"
 
-    foreach ($t in @('WeixinListener', 'TwitterMCP', 'StockPriceMCP', 'PolymarketMCP')) {
+    foreach ($t in @('WeixinListener', 'TwitterMCP', 'StockPriceMCP', 'PolymarketMCP', 'FinancialJuiceMCP')) {
         $exists = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
         if ($exists) {
             Info "starting $t..."
@@ -363,9 +375,10 @@ function Phase6-Activate {
     # Register MCPs (idempotent: remove+add)
     Info "registering MCPs with claude..."
     foreach ($pair in @(
-        @{ name = 'twitter';     url = 'http://127.0.0.1:3031/mcp' },
-        @{ name = 'stock-price'; url = 'http://127.0.0.1:3032/mcp' },
-        @{ name = 'polymarket';  url = 'http://127.0.0.1:3033/mcp' }
+        @{ name = 'twitter';        url = 'http://127.0.0.1:3031/mcp' },
+        @{ name = 'stock-price';    url = 'http://127.0.0.1:3032/mcp' },
+        @{ name = 'polymarket';     url = 'http://127.0.0.1:3033/mcp' },
+        @{ name = 'financialjuice'; url = 'http://127.0.0.1:3034/mcp' }
     )) {
         # only if port is listening
         $port = ($pair.url -replace '.*:(\d+)/mcp','$1')

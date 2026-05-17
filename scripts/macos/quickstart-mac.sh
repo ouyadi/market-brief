@@ -40,6 +40,7 @@ VENV_PY="$HERMES_DIR/.venv/bin/python"
 TWITTER_DIR="$HOME/twitter-mcp"
 STOCK_DIR="$HOME/stock-mcp"
 POLYMARKET_DIR="$HOME/polymarket-mcp"
+FINJUICE_DIR="$HOME/financialjuice-mcp"
 HERMES_HOME="$HOME/.hermes"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 
@@ -164,7 +165,7 @@ phase2_pyenv() {
 phase3_copy() {
     phase 3 "Copy runtime files to user dirs"
 
-    mkdir -p "$SCRIPTS_DIR" "$TWITTER_DIR" "$STOCK_DIR" "$POLYMARKET_DIR"
+    mkdir -p "$SCRIPTS_DIR" "$TWITTER_DIR" "$STOCK_DIR" "$POLYMARKET_DIR" "$FINJUICE_DIR"
 
     # market-brief runtime -- each entry: "<source-dir>:<filename>"
     for entry in \
@@ -208,6 +209,7 @@ phase3_copy() {
     cp "$MCP_DIR/twitter_playwright_mcp.py"  "$TWITTER_DIR/"
     cp "$MCP_DIR/stock_price_mcp.py"         "$STOCK_DIR/"
     cp "$MCP_DIR/polymarket_mcp.py"          "$POLYMARKET_DIR/"
+    cp "$MCP_DIR/financialjuice_mcp.py"      "$FINJUICE_DIR/"
 
     ok "all runtime files placed"
 }
@@ -277,13 +279,14 @@ phase5_launchd() {
 
     mkdir -p "$LAUNCH_AGENTS"
 
-    # Always load: market-brief, weixin-listener, stock-mcp, polymarket-mcp
-    # Conditionally: twitter-mcp (only if .env exists)
+    # Always load: market-brief, weixin-listener, stock-mcp, polymarket-mcp,
+    # financialjuice-mcp. Conditionally: twitter-mcp (only if .env exists).
     local plists=(
         com.ouyadi.market-brief.plist
         com.ouyadi.weixin-listener.plist
         com.ouyadi.stock-mcp.plist
         com.ouyadi.polymarket-mcp.plist
+        com.ouyadi.financialjuice-mcp.plist
     )
     [ -f "$TWITTER_DIR/.env" ] && plists+=(com.ouyadi.twitter-mcp.plist)
 
@@ -318,9 +321,10 @@ phase6_activate() {
         fi
     }
 
-    register_if_up twitter     3031 http://127.0.0.1:3031/mcp
-    register_if_up stock-price 3032 http://127.0.0.1:3032/mcp
-    register_if_up polymarket  3033 http://127.0.0.1:3033/mcp
+    register_if_up twitter        3031 http://127.0.0.1:3031/mcp
+    register_if_up stock-price    3032 http://127.0.0.1:3032/mcp
+    register_if_up polymarket     3033 http://127.0.0.1:3033/mcp
+    register_if_up financialjuice 3034 http://127.0.0.1:3034/mcp
 
     info "current MCP list:"
     claude mcp list 2>&1 | grep -E 'twitter|chatlog|discord|stock' || true
