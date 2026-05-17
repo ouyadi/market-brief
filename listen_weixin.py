@@ -189,6 +189,8 @@ async def _handle_help(text: str = "") -> str:
         "  /brief             立刻触发一次 market-brief\n"
         "  /dv [handle] [Xh]  大 V 速读 (默认: 全部大 V × 过去 2h)\n"
         "                     例: `/dv 6h` / `/dv cathiedwood` / `/dv cathiedwood 24h`\n"
+        "  /xfeed [tab] [N]   X 个人时间线简报 (默认: For You + Following, 各 15 条)\n"
+        "                     例: `/xfeed` / `/xfeed for_you` / `/xfeed following 25`\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -250,10 +252,61 @@ async def _handle_dv(text: str = "") -> str:
     return await _ask_claude(prompt)
 
 
+async def _handle_xfeed(text: str = "") -> str:
+    """
+    Ad-hoc brief over the user's X home timeline. Args after '/xfeed':
+      no args              both For You + Following, 15 tweets each
+      for_you / fy         only For You
+      following / fl       only Following
+      <N>                  both with N tweets each (capped 30)
+    """
+    args = text.split()[1:]
+    tab_filter: str | None = None
+    limit = 15
+    for a in args:
+        a_low = a.lower()
+        if a_low in ("for_you", "foryou", "fy"):
+            tab_filter = "for_you"
+        elif a_low in ("following", "fl", "follow"):
+            tab_filter = "following"
+        elif a_low.isdigit():
+            limit = max(1, min(30, int(a_low)))
+
+    if tab_filter:
+        title = "🌐 For You" if tab_filter == "for_you" else "👥 Following"
+        prompt = (
+            f"调 `mcp__twitter__fetch_home_timeline tab='{tab_filter}' limit={limit}`。\n"
+            f"输出中文 markdown 简报:\n"
+            f"## 📡 {title} 简报(最新 {limit} 条)\n\n"
+            f"按信息量排序,**过滤掉**段子/广告/纯个人生活。每条:\n"
+            f"- **@handle** `HH:MM`: 原文(<150 字)— 一句话解读(ticker / 方向 / 事件)\n\n"
+            f"末尾:**🎯 关键词/Ticker 频次** 3-5 个出现 ≥2 次的 ticker 或主题。\n"
+            f"输出 < 1800 字。"
+        )
+    else:
+        prompt = (
+            f"并行调用两个工具:\n"
+            f"  1. mcp__twitter__fetch_home_timeline tab='for_you' limit={limit}\n"
+            f"  2. mcp__twitter__fetch_home_timeline tab='following' limit={limit}\n\n"
+            f"输出中文 markdown:\n"
+            f"## 📡 X 个人时间线简报\n\n"
+            f"### 🌐 For You (X 算法推)\n"
+            f"5-10 条最有信息量,过滤段子/广告。每条:\n"
+            f"- **@handle** `HH:MM`: 原文 — 一句话解读\n\n"
+            f"### 👥 Following (我关注的人)\n"
+            f"同上格式。\n\n"
+            f"### 🎯 共同信号\n"
+            f"两个 tab 都出现 ≥2 次的 ticker / 主题 / 关键词。如果零交集,标'无明显共同信号'。\n\n"
+            f"全报告 < 1900 字(iLink 单条上限)。**严格过滤**:段子、广告、纯个人生活全 skip,只留:股票/宏观/科技产品/政策。"
+        )
+    return await _ask_claude(prompt)
+
+
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
     "/dv": _handle_dv,
+    "/xfeed": _handle_xfeed,
     "/help": _handle_help,
 }
 

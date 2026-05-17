@@ -252,6 +252,82 @@ async def search_tweets(query: str, limit: int = 10, mode: str = "live") -> dict
         await page.close()
 
 
+@mcp.tool()
+async def fetch_home_timeline(tab: str = "for_you", limit: int = 15) -> dict:
+    """
+    Fetch the user's personalized X home timeline. Requires cookies in
+    ~/twitter-mcp/.env from a logged-in account (which is what we have).
+
+    tab: 'for_you' (X algo) or 'following' (chrono, only from accounts the user follows).
+    limit: 1-30 (capped).
+
+    Returns each tweet with text/posted_at/author_handle/tweet_url just
+    like the other fetch_* tools, plus the requested tab in the response.
+    """
+    limit = max(1, min(30, limit))
+    tab = (tab or "for_you").lower().strip()
+    if tab not in ("for_you", "following"):
+        return {"success": False, "error": f"tab must be 'for_you' or 'following', got {tab!r}"}
+
+    ctx = await _ensure_ctx()
+    page = await ctx.new_page()
+    try:
+        await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_selector("article[data-testid='tweet']", timeout=20000)
+        except Exception:
+            return {"success": False, "tab": tab,
+                    "error": "home timeline didn't load -- cookies may have expired"}
+
+        if tab == "following":
+            # X exposes two role=tab anchors on /home: 'For you' and 'Following'.
+            # Try a few selector strategies because the DOM occasionally shifts.
+            clicked = False
+            for selector in [
+                "div[role='tablist'] a[role='tab']",  # 2nd one is Following
+                "div[data-testid='ScrollSnap-List'] a[role='tab']",
+                "a[role='tab']",
+            ]:
+                tabs = page.locator(selector)
+                count = await tabs.count()
+                if count >= 2:
+                    try:
+                        await tabs.nth(1).click(timeout=4000)
+                        clicked = True
+                        break
+                    except Exception:
+                        continue
+            if not clicked:
+                # Last resort: try get_by_role text-match
+                try:
+                    await page.get_by_role("tab", name="Following").click(timeout=4000)
+                    clicked = True
+                except Exception:
+                    pass
+            if not clicked:
+                log.warning("fetch_home_timeline: could not click Following tab")
+                return {"success": False, "tab": "following",
+                        "error": "could not locate Following tab; X DOM may have changed"}
+            await asyncio.sleep(2.5)  # wait for tab switch + content rerender
+            # After clicking, the previous articles get replaced; wait for new ones
+            try:
+                await page.wait_for_selector("article[data-testid='tweet']", timeout=10000)
+            except Exception:
+                return {"success": False, "tab": "following",
+                        "error": "Following tab loaded no tweets"}
+
+        await _scroll_for(page, limit)
+        articles = await page.locator("article[data-testid='tweet']").all()
+        tweets = [await _extract_one(a) for a in articles[:limit]]
+        log.info("fetch_home_timeline tab=%s -> %d tweets", tab, len(tweets))
+        return {"success": True, "tab": tab, "count": len(tweets), "tweets": tweets}
+    except Exception as e:
+        log.exception("fetch_home_timeline failed: tab=%s", tab)
+        return {"success": False, "tab": tab, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        await page.close()
+
+
 if __name__ == "__main__":
     log.info("twitter-playwright MCP starting on http://127.0.0.1:%s/mcp", mcp.settings.port)
     log.info("env: USERNAME=%s USERPROFILE=%s LOCALAPPDATA=%s",
