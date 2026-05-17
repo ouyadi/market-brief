@@ -39,6 +39,7 @@ HERMES_DIR="$HOME/hermes-agent"
 VENV_PY="$HERMES_DIR/.venv/bin/python"
 TWITTER_DIR="$HOME/twitter-mcp"
 STOCK_DIR="$HOME/stock-mcp"
+POLYMARKET_DIR="$HOME/polymarket-mcp"
 HERMES_HOME="$HOME/.hermes"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 
@@ -163,7 +164,7 @@ phase2_pyenv() {
 phase3_copy() {
     phase 3 "Copy runtime files to user dirs"
 
-    mkdir -p "$SCRIPTS_DIR" "$TWITTER_DIR" "$STOCK_DIR"
+    mkdir -p "$SCRIPTS_DIR" "$TWITTER_DIR" "$STOCK_DIR" "$POLYMARKET_DIR"
 
     # market-brief runtime -- each entry: "<source-dir>:<filename>"
     for entry in \
@@ -199,6 +200,7 @@ phase3_copy() {
     # MCP dirs
     cp "$MCP_DIR/twitter_playwright_mcp.py"  "$TWITTER_DIR/"
     cp "$MCP_DIR/stock_price_mcp.py"         "$STOCK_DIR/"
+    cp "$MCP_DIR/polymarket_mcp.py"          "$POLYMARKET_DIR/"
 
     ok "all runtime files placed"
 }
@@ -268,12 +270,13 @@ phase5_launchd() {
 
     mkdir -p "$LAUNCH_AGENTS"
 
-    # Always load: market-brief, weixin-listener, stock-mcp
+    # Always load: market-brief, weixin-listener, stock-mcp, polymarket-mcp
     # Conditionally: twitter-mcp (only if .env exists)
     local plists=(
         com.ouyadi.market-brief.plist
         com.ouyadi.weixin-listener.plist
         com.ouyadi.stock-mcp.plist
+        com.ouyadi.polymarket-mcp.plist
     )
     [ -f "$TWITTER_DIR/.env" ] && plists+=(com.ouyadi.twitter-mcp.plist)
 
@@ -310,6 +313,7 @@ phase6_activate() {
 
     register_if_up twitter     3031 http://127.0.0.1:3031/mcp
     register_if_up stock-price 3032 http://127.0.0.1:3032/mcp
+    register_if_up polymarket  3033 http://127.0.0.1:3033/mcp
 
     info "current MCP list:"
     claude mcp list 2>&1 | grep -E 'twitter|chatlog|discord|stock' || true
@@ -333,8 +337,9 @@ echo "Repo:    $REPO_DIR"
 echo "Targets:"
 echo "  Scripts:      $SCRIPTS_DIR"
 echo "  Hermes venv:  $HERMES_DIR"
-echo "  Twitter MCP:  $TWITTER_DIR"
-echo "  Stock MCP:    $STOCK_DIR"
+echo "  Twitter MCP:   $TWITTER_DIR"
+echo "  Stock MCP:     $STOCK_DIR"
+echo "  Polymarket MCP: $POLYMARKET_DIR"
 echo "  iLink home:   $HERMES_HOME"
 echo "  LaunchAgents: $LAUNCH_AGENTS"
 [ -n "$SKIP_PHASES" ] && warn "SKIP_PHASES=$SKIP_PHASES"

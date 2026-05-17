@@ -37,9 +37,10 @@ $CONFIG_DIR  = Join-Path $REPO_DIR 'config'
 $SCRIPTS_DIR = Join-Path $env:USERPROFILE 'Scripts\market-brief'
 $HERMES_DIR  = Join-Path $env:USERPROFILE 'hermes-agent'
 $VENV_PY     = Join-Path $HERMES_DIR '.venv\Scripts\python.exe'
-$TWITTER_DIR = Join-Path $env:USERPROFILE 'twitter-mcp'
-$STOCK_DIR   = Join-Path $env:USERPROFILE 'stock-mcp'
-$HERMES_HOME = Join-Path $env:USERPROFILE '.hermes'
+$TWITTER_DIR    = Join-Path $env:USERPROFILE 'twitter-mcp'
+$STOCK_DIR      = Join-Path $env:USERPROFILE 'stock-mcp'
+$POLYMARKET_DIR = Join-Path $env:USERPROFILE 'polymarket-mcp'
+$HERMES_HOME    = Join-Path $env:USERPROFILE '.hermes'
 
 function Info($msg)  { Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
 function Ok($msg)    { Write-Host "[OK]    $msg" -ForegroundColor Green }
@@ -222,6 +223,12 @@ function Phase3-CopyFiles {
     Run { Copy-Item (Join-Path $WIN_SCRIPTS 'install-stock-mcp.ps1')  $STOCK_DIR -Force } "cp install-stock-mcp.ps1"
     Run { Copy-Item (Join-Path $WIN_SCRIPTS 'run-hidden.vbs')         $STOCK_DIR -Force } "cp run-hidden.vbs"
 
+    # polymarket-mcp dir
+    Run { New-Item -ItemType Directory -Force -Path $POLYMARKET_DIR | Out-Null } "mkdir polymarket-mcp"
+    Run { Copy-Item (Join-Path $MCP_DIR     'polymarket_mcp.py')         $POLYMARKET_DIR -Force } "cp polymarket_mcp.py"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'install-polymarket-mcp.ps1') $POLYMARKET_DIR -Force } "cp install-polymarket-mcp.ps1"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'run-hidden.vbs')             $POLYMARKET_DIR -Force } "cp run-hidden.vbs"
+
     Ok "all runtime files placed"
 }
 
@@ -320,6 +327,11 @@ function Phase5-Tasks {
     Info "registering StockPriceMCP task (At log on)"
     Run { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $STOCK_DIR 'install-stock-mcp.ps1') | Out-Null } "install-stock-mcp.ps1"
     Ok "StockPriceMCP registered"
+
+    # PolymarketMCP
+    Info "registering PolymarketMCP task (At log on)"
+    Run { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $POLYMARKET_DIR 'install-polymarket-mcp.ps1') | Out-Null } "install-polymarket-mcp.ps1"
+    Ok "PolymarketMCP registered"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -328,7 +340,7 @@ function Phase5-Tasks {
 function Phase6-Activate {
     Phase 6 "Start daemons + register claude MCPs"
 
-    foreach ($t in @('WeixinListener', 'TwitterMCP', 'StockPriceMCP')) {
+    foreach ($t in @('WeixinListener', 'TwitterMCP', 'StockPriceMCP', 'PolymarketMCP')) {
         $exists = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
         if ($exists) {
             Info "starting $t..."
@@ -341,7 +353,8 @@ function Phase6-Activate {
     Info "registering MCPs with claude..."
     foreach ($pair in @(
         @{ name = 'twitter';     url = 'http://127.0.0.1:3031/mcp' },
-        @{ name = 'stock-price'; url = 'http://127.0.0.1:3032/mcp' }
+        @{ name = 'stock-price'; url = 'http://127.0.0.1:3032/mcp' },
+        @{ name = 'polymarket';  url = 'http://127.0.0.1:3033/mcp' }
     )) {
         # only if port is listening
         $port = ($pair.url -replace '.*:(\d+)/mcp','$1')

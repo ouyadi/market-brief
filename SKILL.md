@@ -88,7 +88,8 @@ market-brief/                       <— repo root = skill bundle
 │   │   ├── install-listener.ps1    <— registers WeixinListener
 │   │   ├── install-twitter-mcp.ps1 <— registers TwitterMCP
 │   │   ├── install-stock-mcp.ps1   <— registers StockPriceMCP
-│   │   ├── run-hidden.vbs          <— no-flash wscript wrapper used by all 4 tasks
+│   │   ├── install-polymarket-mcp.ps1 <— registers PolymarketMCP
+│   │   ├── run-hidden.vbs          <— no-flash wscript wrapper used by all 5 tasks
 │   │   └── hermes-py.ps1           <— legacy fallback (rarely needed)
 │   └── macos/                      <— bash + launchd
 │       ├── quickstart-mac.sh       <— Mac one-command installer
@@ -97,14 +98,16 @@ market-brief/                       <— repo root = skill bundle
 │           ├── com.ouyadi.market-brief.plist
 │           ├── com.ouyadi.weixin-listener.plist
 │           ├── com.ouyadi.twitter-mcp.plist
-│           └── com.ouyadi.stock-mcp.plist
+│           ├── com.ouyadi.stock-mcp.plist
+│           └── com.ouyadi.polymarket-mcp.plist
 │
 ├── mcp/                            <— Python MCP servers + helpers (cross-platform)
 │   ├── push_weixin.py              <— WeChat push helper with smart H2/H3-aware chunking
 │   ├── qr_login_bootstrap.py       <— one-time iLink QR bind
 │   ├── listen_weixin.py            <— long-poll listener + typing keepalive
 │   ├── twitter_playwright_mcp.py   <— X scraper MCP (port 3031)
-│   └── stock_price_mcp.py          <— yfinance MCP (port 3032)
+│   ├── stock_price_mcp.py          <— yfinance MCP (port 3032)
+│   └── polymarket_mcp.py           <— Polymarket Gamma MCP (port 3033)
 │
 └── config/                         <— templates the user customizes per install
     ├── prompt.template.md          <— copy → prompt.md, fill in group tables
@@ -528,6 +531,55 @@ Caveats:
 - Does NOT hit the Defender file-visibility issue that Playwright did —
   pure HTTP, no browser binary.
 
+### Step 12 — Optional: Polymarket prediction-market MCP
+
+Skip if the user doesn't care about market-implied event probabilities.
+Otherwise this is even cheaper than the yfinance MCP (no auth, no API key,
+no Defender path, no rate limit at our usage) and unlocks **macro-catalyst
+implied odds** for the brief: Fed decisions, CPI, elections, geopolitical
+events, crypto milestones, etc. Polymarket prices = money-weighted crowd
+probability, often more reactive than news headlines.
+
+```powershell
+# 1. The hermes-agent venv already has aiohttp + mcp (from Step 4), no
+#    extra deps needed.
+
+# 2. Copy MCP wrapper + installer + VBS into ~/polymarket-mcp
+$dst = "$env:USERPROFILE\polymarket-mcp"
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+Copy-Item .\mcp\polymarket_mcp.py                     "$dst\"
+Copy-Item .\scripts\windows\install-polymarket-mcp.ps1 "$dst\"
+Copy-Item .\scripts\windows\run-hidden.vbs             "$dst\"
+
+# 3. Register as scheduled task (At log on, hidden window)
+& "$dst\install-polymarket-mcp.ps1"
+Start-ScheduledTask -TaskName PolymarketMCP
+
+# 4. Register with claude
+claude mcp add --transport http --scope user polymarket http://127.0.0.1:3033/mcp
+claude mcp list   # should show 'polymarket ✓ Connected'
+```
+
+Smoke test:
+
+```powershell
+"用 mcp__polymarket__list_markets query='Fed' limit=5" | claude --print --dangerously-skip-permissions
+# expected: 5 markets matching 'Fed' with implied probabilities
+```
+
+Tools exposed:
+- `list_markets(query, limit, active_only, sort_by)` — discovery; outcomePrices = implied probability (0.0-1.0)
+- `get_market(id_or_slug)` — single market full details
+- `list_events(query, limit, active_only)` — events group multi-leg bets (e.g., "Fed June meeting" → 25bp/50bp/hold)
+- `get_event(id_or_slug)` — event + child markets
+- `top_movers(window='1mo', limit)` — biggest absolute prob change last month (Gamma only exposes 1-month change; for shorter windows use `list_markets sort_by='volume24hr'` as a proxy for crowd attention)
+
+Caveats:
+- Gamma needs a browser-ish User-Agent header (without it returns 403). The MCP sets one automatically.
+- `outcomes` and `outcomePrices` in raw Gamma responses are JSON-encoded **strings** — the MCP parses them into actual lists/floats before returning.
+- No `oneDayPriceChange` / `oneWeekPriceChange` fields exist server-side. If you need sub-month probability drift, you'd have to poll periodically and store deltas yourself; out of scope here.
+- Pure read-only. Trading would need the CLOB API + a Polygon private key; we deliberately don't expose any write tools (no `place_order`, etc.).
+
 ---
 
 ## Operational cheat sheet (give to user)
@@ -588,6 +640,7 @@ chatlog           http://127.0.0.1:5030/mcp   WeChat chat history (from chat-mcp
 discord-selfbot   http://127.0.0.1:6280/mcp   Discord channel history (from chat-mcp-setup)
 twitter           http://127.0.0.1:3031/mcp   X/Twitter via Playwright + cookies (Step 10)
 stock-price       http://127.0.0.1:3032/mcp   yfinance: quote/history/info/check_post_hoc (Step 11)
+polymarket        http://127.0.0.1:3033/mcp   Polymarket Gamma: market-implied event probabilities (Step 12)
 ```
 
 ---
@@ -655,10 +708,11 @@ All paths below are relative to the repo root.
 | Listener daemon | `install-listener.ps1` | `launchd/com.ouyadi.weixin-listener.plist` |
 | Twitter MCP daemon | `install-twitter-mcp.ps1` | `launchd/com.ouyadi.twitter-mcp.plist` |
 | Stock-price MCP daemon | `install-stock-mcp.ps1` | `launchd/com.ouyadi.stock-mcp.plist` |
+| Polymarket MCP daemon | `install-polymarket-mcp.ps1` | `launchd/com.ouyadi.polymarket-mcp.plist` |
 | One-command installer | `quickstart.ps1` | `quickstart-mac.sh` |
 
 Python helpers (cross-platform, in `mcp/`): `push_weixin.py`, `qr_login_bootstrap.py`,
-`listen_weixin.py`, `twitter_playwright_mcp.py`, `stock_price_mcp.py`.
+`listen_weixin.py`, `twitter_playwright_mcp.py`, `stock_price_mcp.py`, `polymarket_mcp.py`.
 
 Config templates (in `config/`): `prompt.template.md`, `secrets.example.json`.
 
