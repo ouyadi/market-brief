@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -157,11 +158,11 @@ def _uptime() -> str:
     return f"{h}h{m:02d}m{s:02d}s"
 
 
-async def _handle_ping() -> str:
+async def _handle_ping(text: str = "") -> str:
     return f"pong (listener up {_uptime()})"
 
 
-async def _handle_brief() -> str:
+async def _handle_brief(text: str = "") -> str:
     try:
         proc = await asyncio.create_subprocess_exec(
             "powershell.exe", "-NoProfile", "-Command",
@@ -177,19 +178,78 @@ async def _handle_brief() -> str:
         return f"✗ 触发异常: {exc}"
 
 
-async def _handle_help() -> str:
+async def _handle_help(text: str = "") -> str:
     return (
         "可用命令:\n"
-        "  /ping   测试 listener 在线\n"
-        "  /brief  立刻触发一次 market-brief\n"
-        "  /help   显示此列表\n"
+        "  /ping              测试 listener 在线\n"
+        "  /brief             立刻触发一次 market-brief\n"
+        "  /dv [handle] [Xh]  大 V 速读 (默认: 全部大 V × 过去 2h)\n"
+        "                     例: `/dv 6h` / `/dv cathiedwood` / `/dv cathiedwood 24h`\n"
+        "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
+
+
+async def _handle_dv(text: str = "") -> str:
+    """
+    Ad-hoc 大 V 速读. Args parsed from text after '/dv':
+      no args             → all 大 V in prompt.md, past 2h
+      <handle>            → only that handle, past 24h
+      <Nh>                → all 大 V, past Nh
+      <handle> <Nh>       → combo
+    """
+    args = text.split()[1:]  # drop '/dv'
+    handle: str | None = None
+    window: str | None = None
+    for a in args:
+        if re.match(r"^\d+h$", a, re.I):
+            window = a.lower()
+        else:
+            handle = a.lstrip("@")
+
+    if handle and not window:
+        window = "24h"
+    if not handle and not window:
+        window = "2h"
+
+    if handle:
+        prompt = (
+            f"用 mcp__twitter__fetch_user_tweets username='{handle}' limit=20 抓最近 tweets。"
+            f"过滤出过去 {window} 内的(`posted_at` 跟当前 EDT 比对,用 mcp__chatlog__current_time 拿当前时间)。"
+            f"输出简洁中文 markdown:\n"
+            f"## @{handle} 最近 {window}\n"
+            f"- 每条:`时间(HH:MM)`原文(中文翻译括号补)— **一句话解读**(提到的 ticker / 立场)\n"
+            f"末尾一句话 overall 倾向(看多/看空/中性)+ 1-3 个最值得关注的 ticker。\n"
+            f"如果窗口内 0 条新推:回复'`@{handle}` 过去 {window} 无新推'。"
+        )
+    else:
+        prompt = (
+            f"步骤 1: Read 文件 `C:\\Users\\ouyad\\Scripts\\market-brief\\prompt.md`,定位 '### 大 V X 账号' 节,"
+            f"提取该表格里所有 X handle (列 'X handle (without @)')。"
+            f"步骤 2: 调 `mcp__chatlog__current_time` 拿当前 EDT,计算 since = now - {window}。"
+            f"步骤 3: 对每个 handle 并行调 `mcp__twitter__fetch_user_tweets(username=handle, limit=15)`。"
+            f"步骤 4: 过滤掉 posted_at < since 的推。**0 条新推的 handle 在最终输出里跳过**。"
+            f"步骤 5: 输出简洁中文 markdown:\n"
+            f"## 🎙️ 大 V 速读 — 过去 {window}\n"
+            f"按信息量 ×独家性排序,每个 handle 一小段:\n"
+            f"- **@handle** ({{N}} 条新推):\n"
+            f"  - `时间(HH:MM)` 原文(<200 字,长则截断) — 一句话解读(提到的 ticker / 立场)\n"
+            f"末尾跨大 V 信号(可选):\n"
+            f"> ⚡ 跨大 V:\n"
+            f"> - 共识看多/看空: 若 ≥2 大 V 提同 ticker 方向一致\n"
+            f"> - 新出现 ticker: 该窗口首次被任一大 V 提及的\n"
+            f"如果所有大 V 都 0 条:回复 '过去 {window} 跟踪的大 V 全员无新推'。\n"
+            f"如果 mcp__twitter__ 工具不可用:回复'X-MCP 暂不可用(检查 TwitterMCP scheduled task)'。\n"
+            f"**整体输出 <2000 字**(iLink 单条上限)。"
+        )
+
+    return await _ask_claude(prompt)
 
 
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
+    "/dv": _handle_dv,
     "/help": _handle_help,
 }
 
@@ -279,7 +339,7 @@ async def _handle_message(creds: dict, message: dict) -> None:
     cmd_key = text.split()[0].lower()
     handler = COMMANDS.get(cmd_key)
     if handler is not None:
-        reply = await handler()
+        reply = await handler(text)
     else:
         reply = await _ask_claude(text)
 
