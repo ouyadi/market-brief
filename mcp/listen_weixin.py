@@ -254,8 +254,8 @@ async def _handle_help(text: str = "") -> str:
         "  /critique [N]      meta-审查最近一份简报有没有漏窗口内的明显信号 + 改 prompt 建议\n"
         "                     例: `/critique` (最新) / `/critique 2` (n 份前)\n"
         "  /kol_drift         (A) 检测大 V 主战场漂移,>30% 偏离时建议更新描述\n"
-        "  /heat [Nh|Nd]      (B) 找过去 24h(或自定义)群里高频但不在 watchlist 的 ticker\n"
-        "                     例: `/heat` / `/heat 6h` / `/heat 3d`\n"
+        "  /heat [N]          (B) 从最近 N 份简报抽未在 watchlist 的高频 ticker(默认 4 份)\n"
+        "                     例: `/heat` / `/heat 8` / `/heat 24`\n"
         "  /score [Nd] [hzn]  (C) 过去 N 天盘前简报 ⚡ section 推荐的命中率\n"
         "                     例: `/score` (7d, horizon 3d) / `/score 14d 1w`\n"
         "  /help              显示此列表\n"
@@ -602,56 +602,59 @@ async def _handle_kol_drift(text: str = "") -> str:
 
 
 async def _handle_heat(text: str = "") -> str:
-    """B: Watchlist 热度推荐。扫过去 24h 群里被多次讨论但**不在 watchlist** 的
-    ticker,排序后建议加进 watchlist。
+    """B: Watchlist 热度推荐。读最近 N 份简报(已聚合好的 🎯 section),抽出
+    被多次提及但不在 watchlist 的 ticker。**不重新扫原始群消息** — 简报已经
+    做过这步聚合,直接消费 brief 结果秒级出结果(~30s vs 6+ min)。
 
-    用法:`/heat` (默认 24h) / `/heat 6h` (短窗口)
+    用法:`/heat` (最近 4 份简报,通常覆盖最近 4 小时盘中 / 1 份盘前 = 24h)
+         `/heat 8`  (最近 8 份)
+         `/heat 24` (最近 24 份,基本是 1.5 天)
     """
     args = text.split()[1:]
-    window_arg = args[0] if args else "24h"
-    m = re.match(r"^(\d+)([hd])$", window_arg.lower())
-    if not m:
-        return "用法:/heat [Nh|Nd]   例:/heat / /heat 6h / /heat 3d"
-    n, unit = int(m.group(1)), m.group(2)
-    secs = n * (3600 if unit == "h" else 86400)
+    n_briefs = 4
+    if args and args[0].isdigit():
+        n_briefs = max(1, min(24, int(args[0])))
 
     prompt = (
-        f"# Watchlist 热度审查 (过去 {window_arg})\n\n"
+        f"# Watchlist 热度审查\n\n"
+        f"**任务**:从最近 {n_briefs} 份简报里抽出**被多次提到但不在 watchlist** 的 ticker,作为加进 watchlist 的候选。"
+        f"\n\n**关键**:**不要**重新扫原始群/Discord 消息(那太慢,简报本身就是做这事的)。**只读已聚合的简报文件**。\n\n"
         f"**步骤 1**:Read `{PROMPT_MD_PATH}` 的'### 个股 watchlist'表,记下当前 watchlist 所有 ticker(大写)。\n\n"
-        f"**步骤 2**:调 `mcp__chatlog__current_time` 拿 EDT 当前时刻;算 since = now - {secs} 秒。\n\n"
-        f"**步骤 3**:并行从 prompt.md 列的**所有** Discord 频道 + 微信群拉窗口内消息:\n"
-        f"  - Discord:每个频道 `mcp__discord-selfbot__read_channel_messages(limit=100)`,过滤 timestamp ≥ since\n"
-        f"  - 微信:每个群 `mcp__chatlog__wx_history(since=since, limit=250)`\n\n"
-        f"**步骤 4**:从所有 text content regex `\\$([A-Z]{{1,5}})\\b` 抽 ticker。**对每个 ticker**统计:\n"
-        f"  - 总提及次数\n"
-        f"  - 不同 sender 数(跨群算)\n"
-        f"  - 不同群/频道数\n\n"
+        f"**步骤 2**:用 Glob `~/Reports/[0-9]*-[0-9]*-[0-9]*-[0-9]*-brief.md` 找全部简报,按文件名(= 时间)排序,取**最后 {n_briefs} 份**。\n\n"
+        f"**步骤 3**:Read 这 {n_briefs} 份简报。从每份的:\n"
+        f"  - `## 🎯 个股共识` section 提到的 ticker(典型格式 `**TICKER**(N/M):...`)\n"
+        f"  - `## ⚡ 高优先级关注` 里提到的 ticker(setup heading 通常是 `### {{TICKER}} ─ ...`)\n"
+        f"  - `## 🎙️ 大 V 速读` 里大 V 推 actionable 提到的 ticker\n"
+        f"  - 其他 section 引用的 ticker 顺便扫但权重低\n"
+        f"  抽出所有 ticker(大写 1-5 字母,排除 `$USD/$CAD/$EUR/$JPY/$GBP/$CNY` 等假阳性)。\n\n"
+        f"**步骤 4**:**对每个 ticker**累计统计:\n"
+        f"  - 出现的简报数(N briefs / {n_briefs})\n"
+        f"  - 简报里提到的总次数(同一份简报可能 🎯 + ⚡ 都出现 = 2 次)\n"
+        f"  - 简报里被引用的源头多样性(群名 / 大V handle)\n\n"
         f"**步骤 5**:过滤:\n"
         f"  - **排除** watchlist 里已有的 ticker\n"
-        f"  - **排除**单字母 ticker($A, $I, $K 这类极可能是 typo / 不真实)\n"
-        f"  - **排除**常见非 ticker 假阳性:$USD, $CAD, $EUR, $JPY, $GBP, $CNY 等\n"
-        f"  - **保留** ≥3 不同 sender **且** ≥2 个不同群 的 ticker\n\n"
-        f"**步骤 6**:按 `sender_count × group_count` 打分,降序排,取 top 5。\n\n"
+        f"  - **排除**单字母 ticker 和 currency-pseudo($USD/$EUR 等)\n"
+        f"  - **保留**至少出现在 **≥{max(2,n_briefs//2)} 份简报**(过半)的 ticker\n\n"
+        f"**步骤 6**:按 `brief_count × source_diversity` 降序排,取 top 5。\n\n"
         f"## 输出格式 (严格)\n\n"
         f"```\n"
-        f"## Watchlist 热度审查 (过去 {window_arg})\n\n"
+        f"## Watchlist 热度审查 (最近 {n_briefs} 份简报)\n\n"
         f"### 候选加进 watchlist (按热度):\n"
         f"\n"
-        f"1. **$XYZ** ─ N 人/M 群,共 K 次提及\n"
-        f"   - 出处样本:`HH:MM` @user1 (群名1):'群里说的一句'\n"
-        f"               `HH:MM` @user2 (群名2):'另一句'\n"
-        f"   - **建议 thesis**: `<待你 confirm 后补充>`\n"
+        f"1. **$XYZ** ─ 出现 N/{n_briefs} 份,共 M 次提及,跨 K 个源\n"
+        f"   - 简报里讨论焦点:<1 句话总结从简报里看到的讨论内容>\n"
+        f"   - 出处样本:简报 2026-05-17-08 🎯 / 简报 2026-05-16-14 ⚡ TSLA setup 里提及\n"
+        f"   - **建议 thesis**:`<待你 confirm 后补充>`\n"
         f"\n"
         f"2. ... (最多 5 个)\n"
         f"```\n\n"
-        f"**全部无 ≥3-sender 且 ≥2-群 的候选**时:\n"
-        f"`## Watchlist 热度审查: 过去 {window_arg} 无符合阈值的 non-watchlist ticker。`\n\n"
+        f"**全部无符合阈值**时:`## Watchlist 热度审查: 最近 {n_briefs} 份简报无 ≥{max(2,n_briefs//2)}-brief 的 non-watchlist ticker。`\n\n"
         f"**约束**:\n"
         f"- 总输出 < 1500 字\n"
         f"- 最多 5 个候选,严格按热度降序\n"
-        f"- 每个候选给 1-2 条原话引用 + 群名 + sender,便于你验证\n"
-        f"- **绝不**自己编 thesis 描述(generic 描述是历史 bug,memory.md 'KOL/Watchlist 角度填法'有规则)\n"
-        f"- 想加进 watchlist 你确认后,在微信回'个股加 XYZ:<你的真实角度>',listener 按配置管理流程处理"
+        f"- 必须 cite 简报文件名 + section,便于你验证\n"
+        f"- **绝不**编 thesis 描述(memory.md '行为约束'有规则:generic 描述是历史 bug)\n"
+        f"- 你确认要加 watchlist 时,在微信回'个股加 XYZ:<你的真实角度>',listener 走配置管理流程"
     )
     return await _ask_claude(prompt)
 
