@@ -123,8 +123,29 @@ async def _ensure_ctx() -> BrowserContext:
     return _ctx
 
 
+async def _expand_long_tweet(art) -> None:
+    """X Premium lets users post >280 char tweets, which X collapses in feeds
+    behind an inline 'Show more' link. We need to click it so inner_text
+    picks up the full body. Idempotent + best-effort: no-op if absent.
+
+    The inline expander uses data-testid='tweet-text-show-more-link';
+    that's distinct from the conversation-level 'Show more replies' button
+    so this won't accidentally pull in unrelated replies.
+    """
+    try:
+        more = art.locator("[data-testid='tweet-text-show-more-link']").first
+        if await more.count() == 0:
+            return
+        await more.click(timeout=2000)
+        # X usually swaps the tweetText subtree in ~100-300ms.
+        await asyncio.sleep(0.35)
+    except Exception:
+        pass  # if the click fails for any reason, fall through to truncated text
+
+
 async def _extract_one(art) -> dict:
     """Pull text + time + handle + tweet URL out of an <article> locator."""
+    await _expand_long_tweet(art)
     out: dict[str, Any] = {}
     try:
         out["text"] = await art.locator("div[data-testid='tweetText']").first.inner_text(timeout=2500)
