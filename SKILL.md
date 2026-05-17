@@ -77,18 +77,44 @@ market-brief/                       <— repo root = skill bundle
 ├── SETUP-GUIDE.md                  <— long-form human-facing setup doc
 ├── LICENSE                         <— MIT
 ├── .gitignore                      <— excludes secrets.json / prompt.md / logs
-├── prompt.template.md              <— copy → prompt.md, fill in group tables
-├── run.ps1                         <— the PowerShell launcher (no changes needed for most users)
-├── push_weixin.py                  <— WeChat push helper (no changes needed)
-├── qr_login_bootstrap.py           <— one-time iLink QR bind
-├── schedule-install.ps1            <— registers MarketBrief task
-├── secrets.example.json            <— template for secrets.json
-└── hermes-py.ps1                   <— legacy wrapper kept for emergency fallback
+├── .gitattributes                  <— LF line endings for *.sh / *.plist
+│
+├── scripts/                        <— launchers + scheduler glue (platform-specific)
+│   ├── windows/                    <— PowerShell + VBS
+│   │   ├── quickstart.ps1          <— one-command installer (7 phases)
+│   │   ├── run.ps1                 <— the hourly launcher
+│   │   ├── run-listener.ps1        <— starts the WeChat listener
+│   │   ├── schedule-install.ps1    <— registers MarketBrief Task Scheduler entry
+│   │   ├── install-listener.ps1    <— registers WeixinListener
+│   │   ├── install-twitter-mcp.ps1 <— registers TwitterMCP
+│   │   ├── install-stock-mcp.ps1   <— registers StockPriceMCP
+│   │   ├── run-hidden.vbs          <— no-flash wscript wrapper used by all 4 tasks
+│   │   └── hermes-py.ps1           <— legacy fallback (rarely needed)
+│   └── macos/                      <— bash + launchd
+│       ├── quickstart-mac.sh       <— Mac one-command installer
+│       ├── run.sh                  <— hourly launcher (bash equivalent of run.ps1)
+│       └── launchd/
+│           ├── com.ouyadi.market-brief.plist
+│           ├── com.ouyadi.weixin-listener.plist
+│           ├── com.ouyadi.twitter-mcp.plist
+│           └── com.ouyadi.stock-mcp.plist
+│
+├── mcp/                            <— Python MCP servers + helpers (cross-platform)
+│   ├── push_weixin.py              <— WeChat push helper with smart H2/H3-aware chunking
+│   ├── qr_login_bootstrap.py       <— one-time iLink QR bind
+│   ├── listen_weixin.py            <— long-poll listener + typing keepalive
+│   ├── twitter_playwright_mcp.py   <— X scraper MCP (port 3031)
+│   └── stock_price_mcp.py          <— yfinance MCP (port 3032)
+│
+└── config/                         <— templates the user customizes per install
+    ├── prompt.template.md          <— copy → prompt.md, fill in group tables
+    └── secrets.example.json        <— template for secrets.json
 ```
 
-You will copy the runtime files (everything except SKILL.md / README.md /
-LICENSE / .gitignore / .git) into the target user's
-`C:\Users\<them>\Scripts\market-brief\`, then customize a few files in place.
+You will copy the runtime files into a flat `C:\Users\<them>\Scripts\market-brief\`
+(or `~/Scripts/market-brief/` on macOS) — `quickstart.ps1` / `quickstart-mac.sh`
+handles this so the install dir ends up with all PS1 / Python / template files
+side-by-side, regardless of how they're organized in the repo.
 
 ---
 
@@ -620,22 +646,29 @@ Only the launchers and scheduler glue differ.
 
 ### File mapping (Windows ↔ macOS)
 
-| Purpose | Windows | macOS |
+All paths below are relative to the repo root.
+
+| Purpose | Windows (`scripts/windows/`) | macOS (`scripts/macos/`) |
 |---|---|---|
 | Hourly pipeline launcher | `run.ps1` | `run.sh` |
 | Scheduler registration | `schedule-install.ps1` (Task Scheduler) | `launchd/com.ouyadi.market-brief.plist` |
-| Listener daemon | `install-listener.ps1` (Task Scheduler) | `launchd/com.ouyadi.weixin-listener.plist` |
+| Listener daemon | `install-listener.ps1` | `launchd/com.ouyadi.weixin-listener.plist` |
 | Twitter MCP daemon | `install-twitter-mcp.ps1` | `launchd/com.ouyadi.twitter-mcp.plist` |
 | Stock-price MCP daemon | `install-stock-mcp.ps1` | `launchd/com.ouyadi.stock-mcp.plist` |
 | One-command installer | `quickstart.ps1` | `quickstart-mac.sh` |
+
+Python helpers (cross-platform, in `mcp/`): `push_weixin.py`, `qr_login_bootstrap.py`,
+`listen_weixin.py`, `twitter_playwright_mcp.py`, `stock_price_mcp.py`.
+
+Config templates (in `config/`): `prompt.template.md`, `secrets.example.json`.
 
 ### Mac one-command install
 
 ```bash
 # From the cloned repo root:
-bash quickstart-mac.sh
+bash scripts/macos/quickstart-mac.sh
 # or skip phases:
-SKIP_PHASES="4,5" bash quickstart-mac.sh
+SKIP_PHASES="4,5" bash scripts/macos/quickstart-mac.sh
 ```
 
 Same 7 idempotent phases as Windows (prereqs → copy → secrets → Hermes venv
@@ -649,19 +682,21 @@ launch from launchd's spawn context — using Chrome.app sidesteps it).
 ### Manual launchd install (if not using quickstart-mac.sh)
 
 ```bash
-# 1. Copy runtime files into ~/Scripts/market-brief (mirror of Windows layout)
+# 1. Copy runtime files into a flat ~/Scripts/market-brief (the install dir
+#    needs everything side-by-side -- the repo subdir layout is collapsed).
 mkdir -p ~/Scripts/market-brief
-rsync -a --exclude SKILL.md --exclude README.md --exclude LICENSE \
-      --exclude .git --exclude launchd ./ ~/Scripts/market-brief/
-cp prompt.template.md ~/Scripts/market-brief/prompt.md
-cp secrets.example.json ~/Scripts/market-brief/secrets.json
+cp scripts/macos/run.sh             ~/Scripts/market-brief/
+cp mcp/*.py                         ~/Scripts/market-brief/
+cp config/prompt.template.md        ~/Scripts/market-brief/prompt.md
+cp config/secrets.example.json      ~/Scripts/market-brief/secrets.json
 chmod 600 ~/Scripts/market-brief/secrets.json
+chmod +x  ~/Scripts/market-brief/run.sh
 
-# 2. Render plists with the user's $HOME baked in (launchd does not expand $HOME)
+# 2. Load the launchd plists (they use $HOME inside `bash -c '...'` so no
+#    sed substitution needed -- launchd doesn't expand $HOME in <string>
+#    tags but the shell wrapper inside the plist does).
 mkdir -p ~/Library/LaunchAgents
-for f in launchd/*.plist; do
-    sed "s|\$HOME|$HOME|g" "$f" > ~/Library/LaunchAgents/$(basename "$f")
-done
+cp scripts/macos/launchd/*.plist ~/Library/LaunchAgents/
 
 # 3. Load all four
 for label in market-brief weixin-listener twitter-mcp stock-mcp; do

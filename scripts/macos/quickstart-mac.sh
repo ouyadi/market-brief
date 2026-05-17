@@ -24,7 +24,16 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+# quickstart-mac.sh lives at scripts/macos/quickstart-mac.sh, so the repo
+# root is two levels up. Source files are organized into three subdirs:
+#   scripts/macos/        -- this dir + run.sh + launchd/*.plist
+#   mcp/                  -- Python MCP servers + helpers (cross-platform)
+#   config/               -- prompt + secrets templates
+MAC_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$MAC_SCRIPTS/../.." && pwd)"
+MCP_DIR="$REPO_DIR/mcp"
+CONFIG_DIR="$REPO_DIR/config"
+LAUNCHD_DIR="$MAC_SCRIPTS/launchd"
 SCRIPTS_DIR="$HOME/Scripts/market-brief"
 HERMES_DIR="$HOME/hermes-agent"
 VENV_PY="$HERMES_DIR/.venv/bin/python"
@@ -156,11 +165,17 @@ phase3_copy() {
 
     mkdir -p "$SCRIPTS_DIR" "$TWITTER_DIR" "$STOCK_DIR"
 
-    # market-brief runtime
-    for f in run.sh push_weixin.py qr_login_bootstrap.py \
-             listen_weixin.py secrets.example.json; do
-        if [ -f "$REPO_DIR/$f" ] && [ ! -f "$SCRIPTS_DIR/$f" ]; then
-            cp "$REPO_DIR/$f" "$SCRIPTS_DIR/$f"
+    # market-brief runtime -- each entry: "<source-dir>:<filename>"
+    for entry in \
+        "$MAC_SCRIPTS:run.sh" \
+        "$MCP_DIR:push_weixin.py" \
+        "$MCP_DIR:qr_login_bootstrap.py" \
+        "$MCP_DIR:listen_weixin.py" \
+        "$CONFIG_DIR:secrets.example.json"; do
+        srcdir="${entry%%:*}"
+        f="${entry##*:}"
+        if [ -f "$srcdir/$f" ] && [ ! -f "$SCRIPTS_DIR/$f" ]; then
+            cp "$srcdir/$f" "$SCRIPTS_DIR/$f"
             ok "  copied $f"
         elif [ -f "$SCRIPTS_DIR/$f" ]; then
             info "  $f exists (keeping user version)"
@@ -170,7 +185,7 @@ phase3_copy() {
 
     # prompt.md from template
     if [ ! -f "$SCRIPTS_DIR/prompt.md" ]; then
-        cp "$REPO_DIR/prompt.template.md" "$SCRIPTS_DIR/prompt.md"
+        cp "$CONFIG_DIR/prompt.template.md" "$SCRIPTS_DIR/prompt.md"
         warn "  created prompt.md from template -- YOU MUST edit it"
     fi
 
@@ -182,8 +197,8 @@ phase3_copy() {
     fi
 
     # MCP dirs
-    cp "$REPO_DIR/twitter_playwright_mcp.py"  "$TWITTER_DIR/"
-    cp "$REPO_DIR/stock_price_mcp.py"         "$STOCK_DIR/"
+    cp "$MCP_DIR/twitter_playwright_mcp.py"  "$TWITTER_DIR/"
+    cp "$MCP_DIR/stock_price_mcp.py"         "$STOCK_DIR/"
 
     ok "all runtime files placed"
 }
@@ -263,7 +278,7 @@ phase5_launchd() {
     [ -f "$TWITTER_DIR/.env" ] && plists+=(com.ouyadi.twitter-mcp.plist)
 
     for plist in "${plists[@]}"; do
-        local src="$REPO_DIR/launchd/$plist"
+        local src="$LAUNCHD_DIR/$plist"
         local dst="$LAUNCH_AGENTS/$plist"
         cp "$src" "$dst"
         # Unload (idempotent) then load

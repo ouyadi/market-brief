@@ -25,7 +25,15 @@ $ErrorActionPreference = "Stop"
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$REPO_DIR    = Split-Path -Parent $MyInvocation.MyCommand.Path
+# quickstart.ps1 lives at scripts/windows/quickstart.ps1, so the repo root
+# is two levels up. Source files are organized into three subdirs:
+#   scripts/windows/  -- PowerShell + VBS launchers
+#   mcp/              -- Python MCP servers + helpers (cross-platform)
+#   config/           -- prompt + secrets templates
+$WIN_SCRIPTS = Split-Path -Parent $MyInvocation.MyCommand.Path
+$REPO_DIR    = Split-Path -Parent (Split-Path -Parent $WIN_SCRIPTS)
+$MCP_DIR     = Join-Path $REPO_DIR 'mcp'
+$CONFIG_DIR  = Join-Path $REPO_DIR 'config'
 $SCRIPTS_DIR = Join-Path $env:USERPROFILE 'Scripts\market-brief'
 $HERMES_DIR  = Join-Path $env:USERPROFILE 'hermes-agent'
 $VENV_PY     = Join-Path $HERMES_DIR '.venv\Scripts\python.exe'
@@ -154,28 +162,34 @@ function Phase3-CopyFiles {
         Info "creating $SCRIPTS_DIR"
         Run { New-Item -ItemType Directory -Force -Path $SCRIPTS_DIR | Out-Null } "mkdir"
     }
+    # Each entry: source-dir, filename (gets copied into $SCRIPTS_DIR)
     $marketFiles = @(
-        'run.ps1', 'schedule-install.ps1',
-        'push_weixin.py', 'qr_login_bootstrap.py',
-        'listen_weixin.py', 'run-listener.ps1', 'install-listener.ps1',
-        'secrets.example.json', 'hermes-py.ps1',
-        'run-hidden.vbs'  # no-flash launcher used by schedule-install.ps1 + install-listener.ps1
+        @{Dir=$WIN_SCRIPTS; Name='run.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='schedule-install.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='run-listener.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='install-listener.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='hermes-py.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='run-hidden.vbs'},   # no-flash launcher used by schedule-install.ps1 + install-listener.ps1
+        @{Dir=$MCP_DIR;     Name='push_weixin.py'},
+        @{Dir=$MCP_DIR;     Name='qr_login_bootstrap.py'},
+        @{Dir=$MCP_DIR;     Name='listen_weixin.py'},
+        @{Dir=$CONFIG_DIR;  Name='secrets.example.json'}
     )
     foreach ($f in $marketFiles) {
-        $src = Join-Path $REPO_DIR $f
-        $dst = Join-Path $SCRIPTS_DIR $f
+        $src = Join-Path $f.Dir $f.Name
+        $dst = Join-Path $SCRIPTS_DIR $f.Name
         if ((Test-Path $src) -and -not (Test-Path $dst)) {
-            Run { Copy-Item $src $dst -Force } "cp $f -> Scripts/market-brief"
-            Ok "  copied $f"
+            Run { Copy-Item $src $dst -Force } "cp $($f.Name) -> Scripts/market-brief"
+            Ok "  copied $($f.Name)"
         } elseif (Test-Path $dst) {
-            Info "  $f exists in $SCRIPTS_DIR (keeping user's version)"
+            Info "  $($f.Name) exists in $SCRIPTS_DIR (keeping user's version)"
         }
     }
 
     # prompt.md from template if missing
     $promptDst = Join-Path $SCRIPTS_DIR 'prompt.md'
     if (-not (Test-Path $promptDst)) {
-        $tpl = Join-Path $REPO_DIR 'prompt.template.md'
+        $tpl = Join-Path $CONFIG_DIR 'prompt.template.md'
         Run { Copy-Item $tpl $promptDst -Force } "cp prompt.template.md -> prompt.md"
         Warn "  created prompt.md from template -- YOU MUST edit it to add your groups/handles/tickers"
     }
@@ -193,9 +207,9 @@ function Phase3-CopyFiles {
 
     # twitter-mcp dir
     Run { New-Item -ItemType Directory -Force -Path $TWITTER_DIR | Out-Null } "mkdir twitter-mcp"
-    Run { Copy-Item (Join-Path $REPO_DIR 'twitter_playwright_mcp.py') $TWITTER_DIR -Force } "cp twitter_playwright_mcp.py"
-    Run { Copy-Item (Join-Path $REPO_DIR 'install-twitter-mcp.ps1') $TWITTER_DIR -Force } "cp install-twitter-mcp.ps1"
-    Run { Copy-Item (Join-Path $REPO_DIR 'run-hidden.vbs') $TWITTER_DIR -Force } "cp run-hidden.vbs"
+    Run { Copy-Item (Join-Path $MCP_DIR     'twitter_playwright_mcp.py') $TWITTER_DIR -Force } "cp twitter_playwright_mcp.py"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'install-twitter-mcp.ps1')   $TWITTER_DIR -Force } "cp install-twitter-mcp.ps1"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'run-hidden.vbs')            $TWITTER_DIR -Force } "cp run-hidden.vbs"
     # twitter-mcp .env left for user to create (cookies)
     $twEnv = Join-Path $TWITTER_DIR '.env'
     if (-not (Test-Path $twEnv)) {
@@ -204,9 +218,9 @@ function Phase3-CopyFiles {
 
     # stock-mcp dir
     Run { New-Item -ItemType Directory -Force -Path $STOCK_DIR | Out-Null } "mkdir stock-mcp"
-    Run { Copy-Item (Join-Path $REPO_DIR 'stock_price_mcp.py') $STOCK_DIR -Force } "cp stock_price_mcp.py"
-    Run { Copy-Item (Join-Path $REPO_DIR 'install-stock-mcp.ps1') $STOCK_DIR -Force } "cp install-stock-mcp.ps1"
-    Run { Copy-Item (Join-Path $REPO_DIR 'run-hidden.vbs') $STOCK_DIR -Force } "cp run-hidden.vbs"
+    Run { Copy-Item (Join-Path $MCP_DIR     'stock_price_mcp.py')     $STOCK_DIR -Force } "cp stock_price_mcp.py"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'install-stock-mcp.ps1')  $STOCK_DIR -Force } "cp install-stock-mcp.ps1"
+    Run { Copy-Item (Join-Path $WIN_SCRIPTS 'run-hidden.vbs')         $STOCK_DIR -Force } "cp run-hidden.vbs"
 
     Ok "all runtime files placed"
 }
