@@ -113,6 +113,63 @@ def _load_credentials() -> dict[str, str]:
     }
 
 
+# iLink hard cap is ~2000 chars per outbound message. Hermes will split at
+# that limit using its own block-aware packer, but its packer treats each
+# markdown block (paragraph) as atomic and greedy-packs them, which lets
+# an H3 heading get packed at the end of chunk N while its content body
+# moves to chunk N+1 -- the "断裂感" the user reported. We pre-chunk on
+# our side so Hermes' splitter never has to run (each piece <= the cap),
+# and we control where the breaks land.
+_CHUNK_TARGET = 1800   # leave 200 chars headroom under Hermes' 2000 hard cap
+
+
+def _find_best_split(s: str) -> int:
+    """Return the position to split s at, preferring logical markdown
+    boundaries near the END (so each chunk fills up) over earlier ones.
+
+    Priority order (highest = best, picks LATEST match of best available):
+      1. Before an H1/H2/H3 heading (heading stays attached to its body
+         in the NEXT chunk -- the fix for the "孤儿标题" bug)
+      2. Between paragraphs (blank line)
+      3. End of a sentence at a line break (。.！？!? + \\n)
+      4. Any line break
+      5. End of a sentence anywhere (。！？)
+      6. Hard truncate at len(s) -- last resort
+    """
+    for pat in (
+        r"\n\n(?=#{1,3} )",                # before a heading
+        r"\n\n",                           # paragraph
+        r"(?<=[。\.！？!?])\n",             # sentence end + newline
+        r"\n",                             # any newline
+        r"(?<=[。！？])",                   # Chinese sentence end
+        r"(?<=\.)(?= )",                   # English sentence end
+    ):
+        matches = list(re.finditer(pat, s))
+        if matches:
+            return matches[-1].end()
+    return len(s)
+
+
+def smart_chunks(text: str, max_len: int = _CHUNK_TARGET) -> list[str]:
+    """Split text into chunks of <= max_len at the most logical boundary
+    available, greedy-filling each chunk. See _find_best_split for the
+    boundary preference order.
+    """
+    if len(text) <= max_len:
+        return [text]
+    out: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            out.append(remaining)
+            break
+        head = remaining[:max_len]
+        cut = _find_best_split(head)
+        out.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    return [c for c in out if c]
+
+
 async def _push(message: str) -> int:
     creds = _load_credentials()
     missing = [k for k in ("account_id", "token", "home_channel") if not creds[k]]
@@ -128,23 +185,29 @@ async def _push(message: str) -> int:
     if creds["cdn_base_url"]:
         extra["cdn_base_url"] = creds["cdn_base_url"]
 
-    result = await send_weixin_direct(
-        extra=extra,
-        token=creds["token"],
-        chat_id=creds["home_channel"],
-        message=message,
-    )
-    if result.get("success"):
-        print(
-            f"OK: pushed to chat_id={creds['home_channel']} "
-            f"(message_id={result.get('message_id')}, "
-            f"context_token_used={result.get('context_token_used')})"
+    chunks = smart_chunks(message)
+    any_failed = False
+    for i, chunk in enumerate(chunks, 1):
+        result = await send_weixin_direct(
+            extra=extra,
+            token=creds["token"],
+            chat_id=creds["home_channel"],
+            message=chunk,
         )
-        return 0
-
-    err = result.get("error", "unknown error")
-    print(f"[ERROR] weixin push failed: {err}", file=sys.stderr)
-    return 3
+        if result.get("success"):
+            tag = f" [{i}/{len(chunks)}]" if len(chunks) > 1 else ""
+            print(
+                f"OK{tag}: pushed to chat_id={creds['home_channel']} "
+                f"(message_id={result.get('message_id')}, "
+                f"context_token_used={result.get('context_token_used')}, "
+                f"chunk_chars={len(chunk)})"
+            )
+        else:
+            any_failed = True
+            err = result.get("error", "unknown error")
+            print(f"[ERROR] weixin push chunk {i}/{len(chunks)} failed: {err}",
+                  file=sys.stderr)
+    return 3 if any_failed else 0
 
 
 def main() -> int:
