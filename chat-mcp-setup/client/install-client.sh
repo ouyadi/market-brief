@@ -1,6 +1,7 @@
 #!/bin/bash
 # Register the two LAN-hosted MCP servers with this machine's Claude Code.
-# Reads the shared Bearer token from ./token (committed to this private repo).
+# Reads the shared Bearer token from ./token (NOT committed — file is gitignored;
+# populate it locally on each client, e.g. `echo "$TOKEN" > client/token`).
 # Idempotent — re-running just rewrites the same entries.
 
 set -euo pipefail

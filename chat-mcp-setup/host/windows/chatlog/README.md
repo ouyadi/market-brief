@@ -8,14 +8,15 @@ step-by-step.
 
 ## Why no pre-baked `chatlog.json` in this repo
 
-The `data_key` in `host/macos/chatlog/chatlog.json` is a SHA-256 derived from
-the macOS WeChat install on Weidis-MacBook-Pro and is **not portable** -- it
-won't decrypt Windows WeChat's database. Each Windows host has to extract its
-own `data_key` via the TUI.
+The `data_key` is a SHA-256 derived from the running WeChat install on a
+specific machine and is **not portable** -- a macOS data_key won't decrypt
+Windows WeChat's database, and vice versa. Each Windows host has to extract
+its own `data_key` via the TUI.
 
-After extraction, you can commit your `~/.chatlog/chatlog.json` here as a
-backup (private repo) -- but it only helps you recreate state on the *same*
-Windows machine.
+`chatlog.json` is gitignored (see [`../../../.gitignore`](../../../.gitignore))
+because this repo is public. Keep your real `~/.chatlog/chatlog.json` local
+only; if you want a backup, use a private location (encrypted vault, password
+manager, etc.) — not git.
 
 ## Source binary
 

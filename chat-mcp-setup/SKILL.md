@@ -41,10 +41,11 @@ Build/maintain in §B.windows. The Windows host setup is the lower-overhead
 option (no Bearer rotation, no LAN exposure) but only serves clients on the
 same machine.
 
-The repo must stay private either way — `host/macos/mcp-gateway/token`, the
-Discord burner token in `host/macos/discord-selfbot/dot-discord-selfbot.env`,
-and any committed `chatlog.json` (data_key) are all leaked-credential
-material.
+**No live credentials are tracked in git.** `host/macos/mcp-gateway/token`,
+`client/token`, `host/macos/discord-selfbot/dot-discord-selfbot.env`, and
+`host/macos/chatlog/chatlog.json` are all `.gitignore`'d (see
+[`.gitignore`](.gitignore)). The repo carries only `.example` placeholders;
+each host fills in real values locally and never commits them back.
 
 ---
 
@@ -58,17 +59,23 @@ material.
 On any new Mac/Linux on the same LAN:
 
 ```bash
-# 1. Clone this private repo (gh auth must already be set up)
+# 1. Clone market-brief (chat-mcp-setup lives at its top level)
 git clone https://github.com/ouyadi/market-brief.git ~/market-brief
 
-# 2. Make Claude Code discover this skill
+# 2. Drop the shared Bearer token into client/token (NOT committed — get it from
+#    the gateway host out-of-band, e.g. scp or a password manager).
+echo 'YOUR_BEARER_TOKEN_HERE' > ~/market-brief/chat-mcp-setup/client/token
+chmod 600 ~/market-brief/chat-mcp-setup/client/token
+
+# 3. Make Claude Code discover this skill
 mkdir -p ~/.claude/skills
 ln -s ~/market-brief/chat-mcp-setup ~/.claude/skills/chat-mcp-setup
 
-# 3. Register both MCP servers with the LAN gateway
-~/market-brief/chat-mcp-setup/client/install-client.sh
+# 4. Register both MCP servers with the LAN gateway
+#    (override GATEWAY_HOST since the placeholder in install-client.sh is <gateway-host>)
+GATEWAY_HOST=192.168.x.y ~/market-brief/chat-mcp-setup/client/install-client.sh
 
-# 4. Restart Claude Code, open any session, run /mcp
+# 5. Restart Claude Code, open any session, run /mcp
 #    Both 'discord-selfbot' and 'chatlog' should be 'connected'.
 ```
 
@@ -83,7 +90,7 @@ The `install-client.sh` script:
 Override host/port via env if the host's address changes:
 
 ```bash
-GATEWAY_HOST=192.168.50.5 GATEWAY_PORT=7777 ~/market-brief/.../install-client.sh
+GATEWAY_HOST=<gateway-lan-ip> GATEWAY_PORT=7777 ~/market-brief/.../install-client.sh
 ```
 
 What ends up in `~/.claude.json`:
@@ -256,13 +263,14 @@ sudo launchctl kickstart -k system/com.chatlog.daemon
 
 # 4. Verify
 curl -sS 'http://127.0.0.1:5030/api/v1/sessions?limit=1&format=json' | head -c 200
-
-# 5. Sync the new key back into this private repo so other host rebuilds get it
-cp ~/.chatlog/chatlog.json \
-   ~/market-brief/chat-mcp-setup/host/macos/chatlog/chatlog.json
-( cd ~/market-brief && \
-  git commit -am "rotate WeChat data_key" && git push )
 ```
+
+> ⚠️ **Do NOT commit `~/.chatlog/chatlog.json` back into this repo.**
+> `market-brief` is a public repo and `chatlog.example.json` (committed) is
+> the only chatlog config that lives in git. The real `data_key` / `img_key`
+> stay in `~/.chatlog/chatlog.json` on each host. For a second host that
+> needs the same WeChat data, drive the chatlog TUI on that host
+> independently — the key is derived per-machine and isn't portable anyway.
 
 If the WeChat account ID itself changed, also update `account` and
 `last_account` in `~/.chatlog/chatlog.json` (and the `data_dir` / `work_dir`
@@ -306,11 +314,12 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /opt/homebrew/
 openssl rand -hex 32 > ~/mcp-gateway/token
 chmod 600 ~/mcp-gateway/token
 ~/mcp-gateway/install-daemon.sh    # re-bakes the token into the plist + reloads
-# Also bump the copy in this repo and force-push:
-cp ~/mcp-gateway/token ~/market-brief/chat-mcp-setup/host/macos/mcp-gateway/token
-cp ~/mcp-gateway/token ~/market-brief/chat-mcp-setup/client/token
-( cd ~/market-brief && git commit -am "rotate token" && git push )
-# Every client must `git pull && ./install-client.sh` after a rotation.
+
+# Distribute the new token to each client out-of-band (scp, 1Password, etc.)
+# — DO NOT commit it. The repo is public; only .example templates are tracked.
+# On each client:
+#   echo 'NEW_TOKEN' > ~/market-brief/chat-mcp-setup/client/token
+#   ~/market-brief/chat-mcp-setup/client/install-client.sh
 ```
 
 ---
@@ -386,14 +395,21 @@ full setup, key-rotation notes, and the alpha-version caveats.
 
 ## C. Security boundaries
 
-- The Bearer token, Discord burner user token, and any committed
-  `chatlog.json` (`data_key` field) live in this repo. **Keep it private.**
-  If it leaks:
+- **No real credentials live in this (public) repo.** Only `.example`
+  templates are committed. The `.gitignore` at `chat-mcp-setup/.gitignore`
+  blocks the live files (`client/token`, `host/macos/mcp-gateway/token`,
+  `host/macos/discord-selfbot/.env`, `host/macos/chatlog/chatlog.json`).
+- Live credentials sit on each host outside git:
+  - Discord burner token → `host/macos/discord-selfbot/.env` (local)
+  - Gateway Bearer → `host/macos/mcp-gateway/token` + `client/token` (local)
+  - WeChat `data_key` / `img_key` → `~/.chatlog/chatlog.json` (per-machine,
+    extracted via the chatlog TUI; never copied between machines)
+- If any of them leaks anyway:
   1. Rotate the gateway token (macOS host §B.macOS.5) — invalidates LAN access
      immediately. Windows hosts don't have a gateway token to rotate.
   2. Log out everywhere on the Discord burner — invalidates that user token.
-  3. Change the WeChat account password to invalidate the data_key.
-  4. Rewrite git history (`git filter-repo`) before deleting the leaked copy.
+  3. Change the WeChat account password to invalidate the `data_key`, then
+     re-extract via the chatlog TUI.
 - **macOS host:** the Caddy gateway is plain HTTP. Token leaks if anyone on
   the LAN packet-captures. Acceptable for trusted home LAN; not acceptable on
   coffee-shop Wi-Fi. If you ever need that, run Tailscale instead of binding
