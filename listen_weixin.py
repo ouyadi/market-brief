@@ -100,6 +100,11 @@ SYSTEM_PROMPT = f"""\
 
 **X 工具只读约束**:`mcp__twitter__*` 只暴露读取功能;不要 call 任何 send/like/retweet/follow 之类的(它们没暴露给你,但你也别尝试)。原因:用户主账号 cookies,被 X 反爬抓到 write 行为容易封号。
 
+**图片推处理**:fetch_* 返回的每条推都带 `media` 字段(list)。若 `text==""` 但 `media` 非空,说明这是图片/视频推 (比如郭明錤、何同学这种把分析做成长图发的 KOL)。处理方式:
+  - photo: 对每个 `media[i].url` 调 `WebFetch(url=...)` 让我读图(我自带 vision,会直接 OCR/描述)。多张图就多次调
+  - video: 通常拿不到原视频,有 `poster` 字段就 fetch poster 描述封面;没的话告诉用户"视频推,无法解析"
+  - 若同时有 text 和 media,优先 text;media 作为补充信息可选择性 fetch
+
 风格:
   - 不要走 market-brief 的大模板。这是 ad-hoc 问答,不是定时简报。
   - 直接回答用户的问题,带具体数字/出处/ticker。

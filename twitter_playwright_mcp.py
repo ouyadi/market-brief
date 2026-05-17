@@ -123,6 +123,64 @@ async def _ensure_ctx() -> BrowserContext:
     return _ctx
 
 
+def _upsize_media_url(url: str) -> str:
+    """X serves feed images at small sizes (?name=small / 360x360 / etc.).
+    Upsize to 'large' so vision/OCR can actually read embedded text.
+    Leaves non-pbs.twimg.com URLs untouched.
+    """
+    if not url or "pbs.twimg.com/media" not in url:
+        return url
+    new = re.sub(r"([?&])name=[^&]+", r"\1name=large", url)
+    if "name=" not in new:
+        sep = "&" if "?" in new else "?"
+        new = f"{new}{sep}name=large"
+    return new
+
+
+async def _extract_media(art) -> list[dict]:
+    """Detect photos / videos / GIFs attached to a tweet article.
+
+    Returns a list (possibly empty) of {type, url, alt?, poster?} dicts.
+    Image URLs are upsized to ?name=large for OCR-readable resolution.
+    Use case: KOLs like Ming-Chi Kuo, He Tongxue, etc. who post their
+    analysis as long screenshots -- _extract_one would otherwise return
+    empty text and we'd silently miss the content.
+    """
+    media: list[dict] = []
+    # Photos: scoped to tweetPhoto so we don't accidentally grab the author
+    # avatar (which is inside User-Name, not tweetPhoto).
+    try:
+        for img in await art.locator("div[data-testid='tweetPhoto'] img").all():
+            try:
+                src = await img.get_attribute("src", timeout=1000)
+                alt = await img.get_attribute("alt", timeout=1000)
+                if src:
+                    media.append({"type": "photo", "url": _upsize_media_url(src),
+                                  "alt": alt or ""})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Videos & GIFs: <video> elements inside the article. Grab the poster
+    # frame too -- it's a viewable still that vision can at least describe.
+    try:
+        for v in await art.locator("video").all():
+            try:
+                src = await v.get_attribute("src", timeout=1000)
+                poster = await v.get_attribute("poster", timeout=1000)
+                if src or poster:
+                    media.append({
+                        "type": "video",
+                        "url": src,
+                        "poster": _upsize_media_url(poster) if poster else None,
+                    })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return media
+
+
 async def _expand_long_tweet(art) -> None:
     """X Premium lets users post >280 char tweets, which X collapses in feeds
     behind an inline 'Show more' link. We need to click it so inner_text
@@ -144,13 +202,14 @@ async def _expand_long_tweet(art) -> None:
 
 
 async def _extract_one(art) -> dict:
-    """Pull text + time + handle + tweet URL out of an <article> locator."""
+    """Pull text + time + handle + tweet URL + media out of an <article>."""
     await _expand_long_tweet(art)
     out: dict[str, Any] = {}
     try:
         out["text"] = await art.locator("div[data-testid='tweetText']").first.inner_text(timeout=2500)
     except Exception:
         out["text"] = ""
+    out["media"] = await _extract_media(art)
     try:
         out["posted_at"] = await art.locator("time").first.get_attribute("datetime", timeout=2000)
     except Exception:
