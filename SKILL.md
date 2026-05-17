@@ -1,6 +1,6 @@
 ---
 name: market-brief-setup
-description: Install or maintain "market-brief" — a Windows scheduled task that runs Claude Code hourly to scan Discord + WeChat investing chat groups and push the resulting report to the user's WeChat (primary channel) with email as fallback. Optionally also install an inbound listener so the user can chat with Claude directly from WeChat (long-poll iLink → claude --print → reply, with /ping /brief /help slash commands). Optionally also install a Playwright-based Twitter/X MCP server so Claude can fetch tweets the user's browser would see (cookies-injected headless Chrome; read-only; works around all currently-broken X scraper libs). Use when the user wants to set up hourly chat-intel automation, asks how to push AI-generated reports to WeChat, asks how to chat with Claude via WeChat, asks how to add Twitter/X intel to the pipeline, asks about combining chatlog + discord-selfbot + Hermes Agent + Claude Code into one pipeline, or wants to migrate an existing install to a new machine. Requires the chat-mcp-setup skill to have already been run (chatlog + discord-selfbot MCP servers must be reachable on localhost). Windows host only — macOS variant noted at the end.
+description: Install or maintain "market-brief" — a scheduled task (Windows Task Scheduler or macOS launchd) that runs Claude Code hourly to scan Discord + WeChat investing chat groups and push the resulting report to the user's WeChat (primary channel) with email as fallback. Optionally also install an inbound listener so the user can chat with Claude directly from WeChat (long-poll iLink → claude --print → reply, with /ping /brief /help slash commands). Optionally also install a Playwright-based Twitter/X MCP server so Claude can fetch tweets the user's browser would see (cookies-injected headless Chrome; read-only; works around all currently-broken X scraper libs). Use when the user wants to set up hourly chat-intel automation, asks how to push AI-generated reports to WeChat, asks how to chat with Claude via WeChat, asks how to add Twitter/X intel to the pipeline, asks about combining chatlog + discord-selfbot + Hermes Agent + Claude Code into one pipeline, or wants to migrate an existing install to a new machine. Requires the chat-mcp-setup skill to have already been run (chatlog + discord-selfbot MCP servers must be reachable on localhost). Windows is the primary host (Steps 1–11); macOS is supported via `quickstart-mac.sh` + `run.sh` + `launchd/*.plist` (see macOS variant section).
 ---
 
 # Market-brief setup
@@ -609,22 +609,116 @@ a fresh token.
 
 ---
 
-## macOS variant (brief)
+## macOS variant
 
-The architecture is identical on macOS:
+The Mac port is shipped as a parallel set of files in the same repo. The
+Python helpers (`push_weixin.py`, `qr_login_bootstrap.py`, `listen_weixin.py`,
+`twitter_playwright_mcp.py`, `stock_price_mcp.py`) are now cross-platform —
+they resolve paths from `Path.home()` instead of hardcoded `C:\Users\...`.
+Only the launchers and scheduler glue differ.
 
-- chatlog has a darwin binary (same ouyadi fork)
-- discord-selfbot is the same Python source
-- Hermes Agent installs the same way on Mac (better than Windows: official
-  support, Defender isn't an issue)
-- Replace `Task Scheduler` with `launchd` / `cron`
-- Replace `PowerShell` launcher with a shell script that does the same
-  env-strip + claude --print + push_weixin.py + Send-Mail logic
+### File mapping (Windows ↔ macOS)
 
-If a user asks for macOS, point them at the upstream chat-mcp-setup skill's
-`host/macos/` setup for chatlog/discord-selfbot, then translate `run.ps1`
-into bash. The Python helpers (`push_weixin.py`, `qr_login_bootstrap.py`)
-work as-is.
+| Purpose | Windows | macOS |
+|---|---|---|
+| Hourly pipeline launcher | `run.ps1` | `run.sh` |
+| Scheduler registration | `schedule-install.ps1` (Task Scheduler) | `launchd/com.ouyadi.market-brief.plist` |
+| Listener daemon | `install-listener.ps1` (Task Scheduler) | `launchd/com.ouyadi.weixin-listener.plist` |
+| Twitter MCP daemon | `install-twitter-mcp.ps1` | `launchd/com.ouyadi.twitter-mcp.plist` |
+| Stock-price MCP daemon | `install-stock-mcp.ps1` | `launchd/com.ouyadi.stock-mcp.plist` |
+| One-command installer | `quickstart.ps1` | `quickstart-mac.sh` |
+
+### Mac one-command install
+
+```bash
+# From the cloned repo root:
+bash quickstart-mac.sh
+# or skip phases:
+SKIP_PHASES="4,5" bash quickstart-mac.sh
+```
+
+Same 7 idempotent phases as Windows (prereqs → copy → secrets → Hermes venv
+→ QR bind → register launchd jobs → smoke test). Pauses for the same 4
+manual checkpoints (edit prompt.md, edit secrets.json, scan WeChat QR, paste
+X cookies). User-installed Chrome must exist at
+`/Applications/Google Chrome.app` for the Twitter MCP (same Defender-style
+reasoning as Windows: Playwright's bundled Chromium occasionally fails to
+launch from launchd's spawn context — using Chrome.app sidesteps it).
+
+### Manual launchd install (if not using quickstart-mac.sh)
+
+```bash
+# 1. Copy runtime files into ~/Scripts/market-brief (mirror of Windows layout)
+mkdir -p ~/Scripts/market-brief
+rsync -a --exclude SKILL.md --exclude README.md --exclude LICENSE \
+      --exclude .git --exclude launchd ./ ~/Scripts/market-brief/
+cp prompt.template.md ~/Scripts/market-brief/prompt.md
+cp secrets.example.json ~/Scripts/market-brief/secrets.json
+chmod 600 ~/Scripts/market-brief/secrets.json
+
+# 2. Render plists with the user's $HOME baked in (launchd does not expand $HOME)
+mkdir -p ~/Library/LaunchAgents
+for f in launchd/*.plist; do
+    sed "s|\$HOME|$HOME|g" "$f" > ~/Library/LaunchAgents/$(basename "$f")
+done
+
+# 3. Load all four
+for label in market-brief weixin-listener twitter-mcp stock-mcp; do
+    launchctl unload ~/Library/LaunchAgents/com.ouyadi.$label.plist 2>/dev/null
+    launchctl load ~/Library/LaunchAgents/com.ouyadi.$label.plist
+done
+
+# 4. Verify
+launchctl list | grep ouyadi
+# expect: com.ouyadi.market-brief, ...weixin-listener, ...twitter-mcp, ...stock-mcp
+```
+
+### Mac-specific paths & gotchas
+
+- **launchd does NOT expand `$HOME` inside `<string>` tags.** Either bake the
+  literal path in via `sed` (as above), or wrap the command in `bash -c` and
+  reference `$HOME` from inside the shell (which the shipped plists do).
+- **Hour scheduling is local-time per launchd.** The market-brief plist sets
+  `TZ=America/New_York` in `EnvironmentVariables` so that `run.sh`'s "8–22
+  EDT" check matches the system clock regardless of the user's actual tz.
+  If the user is in PT and wants local-time-based briefs, edit the plist to
+  remove the TZ var.
+- **WeChat 4.x on macOS is unverified by chatlog.** The chat-mcp-setup
+  skill's `host/macos/` covers WeChat 3.x decryption; WeChat 4.x on Mac has
+  not been tested against the chatlog fork yet. If the user is on WeChat
+  4.x macOS, expect to debug — chatlog DB key extraction may have shifted.
+  Discord-selfbot works identically.
+- **No Defender, but Gatekeeper.** First launch of `chatlog` binary may
+  prompt for "open from unidentified developer" — right-click → Open once
+  to approve.
+- **Email fallback works as-is.** `run.sh` uses the same `smtplib` Python
+  one-liner via the venv, no `Send-MailMessage` PowerShell equivalent needed.
+
+### Operational cheat sheet (macOS)
+
+```bash
+# Force a run now
+launchctl kickstart -k gui/$(id -u)/com.ouyadi.market-brief
+
+# Latest report
+ls -t ~/Reports/$(date +%Y-%m-%d)-*-brief.md | head -1 | xargs cat
+
+# Today's log
+tail -30 ~/Scripts/market-brief/logs/$(date +%Y-%m-%d).log
+
+# Tail daemon stdout/stderr
+tail -f /tmp/com.ouyadi.weixin-listener.{out,err}
+
+# Manual run, no fallback email
+~/Scripts/market-brief/run.sh --skip-email
+
+# Restart a daemon after editing the plist
+launchctl unload ~/Library/LaunchAgents/com.ouyadi.weixin-listener.plist
+launchctl load   ~/Library/LaunchAgents/com.ouyadi.weixin-listener.plist
+
+# Stop the schedule entirely
+launchctl unload ~/Library/LaunchAgents/com.ouyadi.market-brief.plist
+```
 
 ---
 

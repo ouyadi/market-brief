@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ouyadi.weixin-listener</string>
+
+    <!-- Loads secrets.json into CLAUDE_CODE_OAUTH_TOKEN + scrubs Claude Desktop
+         injected env, then runs listen_weixin.py in foreground.
+         KeepAlive=true so launchd auto-restarts if it crashes. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>mkdir -p "$HOME/Scripts/market-brief/logs"; cd "$HOME/Scripts/market-brief"; \
+for v in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_DISABLE_CRON CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES CLAUDECODE; do unset "$v"; done; \
+export CLAUDE_CODE_OAUTH_TOKEN="$(jq -r .claudeCodeOauthToken secrets.json 2&gt;/dev/null || "$HOME/hermes-agent/.venv/bin/python" -c "import json; print(json.load(open('secrets.json'))['claudeCodeOauthToken'])")"; \
+exec "$HOME/hermes-agent/.venv/bin/python" listen_weixin.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/com.ouyadi.weixin-listener.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.ouyadi.weixin-listener.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

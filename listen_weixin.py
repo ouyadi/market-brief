@@ -73,7 +73,14 @@ GET_UPDATES_TIMEOUT_MS = 30_000
 LONG_POLL_RETRY_BACKOFF_S = 5.0
 CLAUDE_TIMEOUT_S = 600  # 10 min; long enough for MCP-heavy answers
 
-SYSTEM_PROMPT = """\
+# Cross-platform: PROMPT_MD_PATH is the absolute path the configuration-
+# management mode will Read/Edit. Defaults to ~/Scripts/market-brief/prompt.md
+# on both Windows and macOS. Override with MARKET_BRIEF_DIR env var if
+# you install the runtime files elsewhere.
+SCRIPTS_DIR = Path(os.environ.get("MARKET_BRIEF_DIR") or (Path.home() / "Scripts" / "market-brief"))
+PROMPT_MD_PATH = SCRIPTS_DIR / "prompt.md"
+
+SYSTEM_PROMPT = f"""\
 你是一名美股情报员,通过微信跟用户对话。回答必须简洁、可操作、中文。
 你能调用这些工具:
   - mcp__chatlog__wx_history / wx_search / wx_sessions   微信群历史 / 模糊找群 / 列所有会话
@@ -102,7 +109,7 @@ SYSTEM_PROMPT = """\
 
 当用户的请求落到这些意图(关键词:**加进监控 / 加到列表 / 删群 / 移除 / 不要监控 / 更新监控群列表 / 把 X 加到简报 / 大 V 加 / 大 V 删 / 大 V 列表 / 跟踪 X 用户 / 个股加 / 个股删 / 个股列表 / 加追踪 / 跟踪个股 / watchlist**)时,**直接动手改文件,不要问澄清**:
 
-监控配置文件: `C:\\Users\\ouyad\\Scripts\\market-brief\\prompt.md`
+监控配置文件: `{PROMPT_MD_PATH}`
   - 微信群在 `### 微信群` 节,表格行格式: `| 群名 | chatroom_id |`
   - Discord 频道在 `### Discord 频道` 节,行格式: `| 服务器 | 频道 | channel_id |`
   - **大 V X 账号在 `### 大 V X 账号` 节**,行格式: `| 大 V 显示名 | X handle (without @) | 主战场 |`
@@ -236,7 +243,7 @@ async def _handle_dv(text: str = "") -> str:
         )
     else:
         prompt = (
-            f"步骤 1: Read 文件 `C:\\Users\\ouyad\\Scripts\\market-brief\\prompt.md`,定位 '### 大 V X 账号' 节,"
+            f"步骤 1: Read 文件 `{PROMPT_MD_PATH}`,定位 '### 大 V X 账号' 节,"
             f"提取该表格里所有 X handle (列 'X handle (without @)')。"
             f"步骤 2: 调 `mcp__chatlog__current_time` 拿当前 EDT,计算 since = now - {window}。"
             f"步骤 3: 对每个 handle 并行调 `mcp__twitter__fetch_user_tweets(username=handle, limit=15)`。"
@@ -325,7 +332,7 @@ async def _handle_plan(text: str = "") -> str:
 
     if not tickers:
         intro = (
-            "步骤 0:Read `C:\\Users\\ouyad\\Reports\\` 目录下**最新**一份 "
+            f"步骤 0:Read `{Path.home() / 'Reports'}` 目录下**最新**一份 "
             "`YYYY-MM-DD-HH-brief.md`(按文件名排序取最大)。从其 "
             "'## ⚡ 高优先级关注' / '## 🎯 个股共识' 节里提取 **top 3** tickers "
             "(信号强度 × 时效优先)。如无法判断,默认取 brief 头部"

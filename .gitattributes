@@ -1,0 +1,16 @@
+* text=auto
+
+# Force LF for files that are executed on macOS / Linux — CRLF would break them.
+*.sh        text eol=lf
+*.plist     text eol=lf
+run.sh      text eol=lf
+
+# PowerShell stays CRLF — Windows-native.
+*.ps1       text eol=crlf
+
+# Python is LF (PEP 8 / cross-platform tools handle it consistently).
+*.py        text eol=lf
+
+# Markdown / json / yaml stay platform-native.
+*.md        text
+*.json      text
