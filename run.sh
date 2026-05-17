@@ -90,8 +90,14 @@ PUSH_TOOL="$MARKET_BRIEF_DIR/push_weixin.py"
 VENV_PY="$HERMES_VENV/bin/python"
 
 if [ -x "$VENV_PY" ] && [ -f "$PUSH_TOOL" ]; then
-    log "pushing '⚡' section to WeChat..."
-    if "$VENV_PY" "$PUSH_TOOL" "$REPORT_FILE" --section "⚡" 2>&1 | while IFS= read -r line; do log "    [push] $line"; done; then
+    # Push three sections as separate iLink messages so 🎯 个股 and 🎙️ 大V
+    # signal don't get squeezed out of the single ⚡ chunk. push_weixin.py
+    # skips missing sections gracefully (e.g. 🎙️ may be omitted by the model
+    # if no KOL had new tweets in the window).
+    log "pushing ⚡ + 🎯 + 🎙️ sections to WeChat (3 messages)..."
+    if "$VENV_PY" "$PUSH_TOOL" "$REPORT_FILE" \
+            --section "⚡" --section "🎯" --section "🎙️" \
+            2>&1 | while IFS= read -r line; do log "    [push] $line"; done; then
         WX_OK=1
         log "WeChat push OK"
     else

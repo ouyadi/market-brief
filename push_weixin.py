@@ -155,39 +155,66 @@ def main() -> int:
     parser.add_argument(
         "--section",
         "-s",
+        action="append",
+        default=[],
         help=(
             "Only push the H2 section whose heading contains this substring "
-            "(plus the report's pre-H2 header). Ignored when --message is used. "
-            'Example: --section "⚡" picks "## ⚡ 高优先级关注".'
+            "(plus the report's pre-H2 header). May be repeated to push "
+            "multiple sections as separate iLink messages, in the order given. "
+            "Missing sections are skipped with a warning (not fatal). "
+            'Example: --section "⚡" --section "🎯" --section "🎙️"'
         ),
     )
     args = parser.parse_args()
 
     if args.message:
-        text = args.message
-    else:
-        p = Path(args.path)
-        if not p.exists():
-            print(f"[ERROR] file not found: {p}", file=sys.stderr)
-            return 2
-        text = p.read_text(encoding="utf-8")
+        # Single literal push -- still one message.
+        return asyncio.run(_push(args.message))
 
-        if args.section:
-            extracted = extract_section(text, args.section)
-            if extracted is None:
-                print(
-                    f"[ERROR] no H2 section contains substring {args.section!r}; "
-                    f"file: {p}",
-                    file=sys.stderr,
-                )
-                return 4
-            text = extracted
-
-    if not text.strip():
-        print("[ERROR] empty message", file=sys.stderr)
+    p = Path(args.path)
+    if not p.exists():
+        print(f"[ERROR] file not found: {p}", file=sys.stderr)
         return 2
+    text = p.read_text(encoding="utf-8")
 
-    return asyncio.run(_push(text))
+    # No --section -> push the entire file as one message (will be chunked by
+    # send_weixin_direct if it exceeds the iLink per-message limit).
+    if not args.section:
+        if not text.strip():
+            print("[ERROR] empty file", file=sys.stderr)
+            return 2
+        return asyncio.run(_push(text))
+
+    # One or more --section: push each as a separate message. Missing sections
+    # are skipped (warn, don't fail) so that e.g. 🎙️ 大 V being omitted
+    # because there were no fresh KOL tweets in the window doesn't kill the
+    # ⚡/🎯 pushes that DO have content.
+    any_pushed = False
+    any_failed = False
+    for needle in args.section:
+        extracted = extract_section(text, needle)
+        if extracted is None:
+            print(
+                f"[WARN] no H2 section contains substring {needle!r} -- skipping",
+                file=sys.stderr,
+            )
+            continue
+        if not extracted.strip():
+            print(f"[WARN] section {needle!r} is empty -- skipping", file=sys.stderr)
+            continue
+        rc = asyncio.run(_push(extracted))
+        if rc == 0:
+            any_pushed = True
+        else:
+            any_failed = True
+
+    if not any_pushed:
+        # Nothing went out -- treat as section-not-found for back-compat with
+        # the old single-section exit-code-4 contract.
+        return 4
+    # Partial failures still flag as non-zero so run.sh / run.ps1 can decide
+    # whether to fire the email fallback.
+    return 3 if any_failed else 0
 
 
 if __name__ == "__main__":
