@@ -184,6 +184,15 @@ if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
     $secTgt = [System.Text.Encoding]::UTF8.GetString([byte[]](0xF0,0x9F,0x8E,0xAF)) # 🎯
     $secMic = [System.Text.Encoding]::UTF8.GetString([byte[]](0xF0,0x9F,0x8E,0x99)) # 🎙
     Log "[$([DateTime]::Now)] pushing $secZap + $secTgt + $secMic sections to WeChat (3 messages)..."
+    # IMPORTANT: This script's top-level $ErrorActionPreference is "Stop",
+    # which makes PowerShell raise an exception whenever a native command
+    # writes ANY text to stderr. Hermes' Python logger emits stderr WARNINGs
+    # during its normal retry-on-rate-limit flow ("backing off 3.0s before
+    # retry"), and previously $EAP=Stop killed the push subprocess before
+    # Hermes finished its retry, every brief falling through to email.
+    # Locally relax $EAP for the push call -- only the exit code matters.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         $pushOut = & $venvPy $pushTool $reportFile --section $secZap --section $secTgt --section $secMic 2>&1
         foreach ($line in $pushOut) { Log "    [push] $line" }
@@ -195,6 +204,8 @@ if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
         }
     } catch {
         Log "[WARN] WeChat push threw: $($_.Exception.Message) -- will fall back to email"
+    } finally {
+        $ErrorActionPreference = $prevEAP
     }
 } else {
     Log "[WARN] WeChat push skipped (missing venv/pushTool) -- will fall back to email"
