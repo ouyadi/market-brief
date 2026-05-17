@@ -198,8 +198,9 @@ phase4_interactive() {
     echo "  4c. Bind WeChat via iLink QR (8-min window, your phone)"
     echo "  4d. Extract X cookies -> twitter-mcp/.env"
 
-    # 4a
-    if grep -qE 'paste-your-token-here|<your-' "$SCRIPTS_DIR/secrets.json" 2>/dev/null; then
+    # 4a -- check for the literal placeholder values from secrets.example.json
+    if grep -qE 'sk-ant-oat01-\.\.\.|you@gmail\.com|xxxx xxxx xxxx xxxx' \
+            "$SCRIPTS_DIR/secrets.json" 2>/dev/null; then
         pause_if "Opening secrets.json in default editor — fill in then save."
         ${EDITOR:-nano} "$SCRIPTS_DIR/secrets.json"
     else
@@ -232,10 +233,12 @@ phase4_interactive() {
       1. Open https://x.com (logged in)
       2. DevTools (Cmd+Opt+I) -> Application -> Cookies -> https://x.com
       3. Copy values of: auth_token, ct0, twid
-      4. Save the following to $TWITTER_DIR/.env (use Domain=.twitter.com !!):
+      4. Save the following to $TWITTER_DIR/.env (Domain= field is decorative,
+         the MCP injects cookies as .x.com regardless):
            AUTH_METHOD=cookies
-           TWITTER_COOKIES=["auth_token=...; Domain=.twitter.com","ct0=...; Domain=.twitter.com","twid=...; Domain=.twitter.com"]
-           PORT=3030
+           TWITTER_COOKIES=["auth_token=...; Domain=.x.com","ct0=...; Domain=.x.com","twid=...; Domain=.x.com"]
+           # PORT is optional; defaults to 3031 (see twitter_playwright_mcp.py).
+           # Only set TWITTER_MCP_PORT here if you need a non-default port.
 
 EOF
         pause_if "Press Enter once $TWITTER_DIR/.env is saved (or skip Twitter MCP entirely)"

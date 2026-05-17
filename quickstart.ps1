@@ -223,7 +223,7 @@ function Phase4-Interactive {
 
     # 4a secrets.json
     $secretsPath = Join-Path $SCRIPTS_DIR 'secrets.json'
-    if ((Get-Content -Raw $secretsPath) -match 'paste-your-token-here|<your-') {
+    if ((Get-Content -Raw $secretsPath) -match 'sk-ant-oat01-\.\.\.|you@gmail\.com|xxxx xxxx xxxx xxxx') {
         Pause-IfInteractive "Opening secrets.json in notepad now -- fill in the placeholders and save."
         Run { notepad $secretsPath } "notepad secrets.json"
         Pause-IfInteractive "Done editing secrets.json?"
@@ -265,8 +265,8 @@ function Phase4-Interactive {
         Write-Host "      Copy these 3 cookies' VALUE: auth_token, ct0, twid" -ForegroundColor Yellow
         Write-Host "      Write a file at $twEnv with:" -ForegroundColor Yellow
         Write-Host '        AUTH_METHOD=cookies' -ForegroundColor Gray
-        Write-Host '        TWITTER_COOKIES=["auth_token=...; Domain=.twitter.com","ct0=...; Domain=.twitter.com","twid=...; Domain=.twitter.com"]' -ForegroundColor Gray
-        Write-Host '        PORT=3030' -ForegroundColor Gray
+        Write-Host '        TWITTER_COOKIES=["auth_token=...; Domain=.x.com","ct0=...; Domain=.x.com","twid=...; Domain=.x.com"]' -ForegroundColor Gray
+        Write-Host '        # PORT/TWITTER_MCP_PORT optional; defaults to 3031' -ForegroundColor Gray
         Pause-IfInteractive "Press Enter once $twEnv is saved (or skip Twitter MCP entirely if you don't want X integration)"
     } else {
         Ok "  4d. twitter-mcp/.env exists -- skipping cookie prompt"

@@ -396,11 +396,12 @@ $venvPy = 'C:\Users\$env:USERNAME\hermes-agent\.venv\Scripts\python.exe'
 
 # 2. Create ~/twitter-mcp with .env (cookies extracted from Chrome DevTools)
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\twitter-mcp"
-# .env shape (cookie values are from Chrome F12 → Application → Cookies → x.com,
-# but use Domain=.twitter.com because some libs key on that):
+# .env shape (cookie values are from Chrome F12 → Application → Cookies → x.com.
+# The Domain= field is decorative — twitter_playwright_mcp.py only extracts
+# the cookie VALUE and injects with domain=.x.com regardless):
 # AUTH_METHOD=cookies
-# TWITTER_COOKIES=["auth_token=...; Domain=.twitter.com","ct0=...; Domain=.twitter.com","twid=...; Domain=.twitter.com"]
-# PORT=3030
+# TWITTER_COOKIES=["auth_token=...; Domain=.x.com","ct0=...; Domain=.x.com","twid=...; Domain=.x.com"]
+# # PORT/TWITTER_MCP_PORT optional; defaults to 3031.
 icacls "$env:USERPROFILE\twitter-mcp\.env" /inheritance:r /grant:r "$env:USERNAME:(R,W)"
 
 # 3. Copy twitter_playwright_mcp.py + install-twitter-mcp.ps1 into ~/twitter-mcp

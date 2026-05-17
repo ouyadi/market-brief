@@ -28,8 +28,11 @@ LOG_DIR="$MARKET_BRIEF_DIR/logs"
 mkdir -p "$LOG_DIR" "$REPORTS_DIR"
 
 # --- EDT-aware hour (assumes TZ=America/New_York) ---
-DATE="$(TZ=America/New_York date +%Y-%m-%d)"
-HOUR="$(TZ=America/New_York date +%H)"
+# Add 30s slop so a launchd fire that lands at HH:59:58 (a second or two
+# early due to drift) still resolves to the intended next-hour bucket.
+# Mirrors run.ps1's .AddSeconds(30) behavior.
+DATE="$(TZ=America/New_York date -v+30S +%Y-%m-%d 2>/dev/null || TZ=America/New_York date -d '+30 seconds' +%Y-%m-%d)"
+HOUR="$(TZ=America/New_York date -v+30S +%H 2>/dev/null || TZ=America/New_York date -d '+30 seconds' +%H)"
 REPORT_FILE="$REPORTS_DIR/${DATE}-${HOUR}-brief.md"
 LOG_FILE="$LOG_DIR/${DATE}.log"
 
@@ -121,8 +124,16 @@ report_path, secrets_path, date_s, hour_s, session = sys.argv[1:6]
 secrets = json.loads(Path(secrets_path).read_text(encoding="utf-8"))
 body = Path(report_path).read_text(encoding="utf-8")
 
+# Session-tag the subject so visually scanning the inbox tells you whether
+# the report is pre-market, intraday, or after-hours.
+session_label = {
+    "pre-market":  "美股盘前情报",
+    "market":      "美股盘中情报",
+    "after-hours": "美股盘后情报",
+}.get(session, "美股情报")
+
 msg = EmailMessage()
-msg["Subject"] = f"[Brief {date_s} {hour_s}:00 {session} fallback] 美股盘前情报"
+msg["Subject"] = f"[Brief {date_s} {hour_s}:00 {session} fallback] {session_label}"
 msg["From"]    = secrets["fromAddress"]
 msg["To"]      = secrets["toAddress"]
 msg.set_content(body, charset="utf-8")
