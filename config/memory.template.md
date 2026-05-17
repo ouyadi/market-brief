@@ -59,3 +59,20 @@ voice 等真实角度** 应该在这里 — 简明、便于 quick reference。
   就标 `<待验证>`,问用户而不是猜**
 - 反指 KOL 的方向要先 flip 再合并到 consensus
 - KOL 间 jargon 重叠不是身份标记,别用 jargon 重叠去 attribute 身份
+
+## 运行经验:正向(已沉淀,直接照做)
+
+历次 brief 跑后用 `/reflect` 自我检讨沉淀的好做法。每条**必须有 ≥2 次实际观察**才进这里。
+新条目由 `/reflect` 提议、用户 review 后手动追加。
+
+举例(删掉换成你自己的):
+
+- `<日期>`:`<具体规则,如:某类 channel 用 limit=N 起步>`,**多次观察**:`<simbol of evidence>`
+
+## 运行经验:负向(避坑,**绝不要这么做**)
+
+`/reflect` 沉淀的 anti-pattern。每条 ≥2 次失败观察才进这里。
+
+举例:
+
+- `<日期>`:`<什么动作会失败 + 应该用什么替代>`,**多次观察**:`<evidence>`

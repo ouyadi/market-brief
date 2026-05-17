@@ -267,6 +267,8 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/heat` / `/heat 8` / `/heat 24`\n"
         "  /score [Nd] [hzn]  (C) 过去 N 天盘前简报 ⚡ section 推荐的命中率\n"
         "                     例: `/score` (7d, horizon 3d) / `/score 14d 1w`\n"
+        "  /reflect [Nd]      自我检讨 ≥2 次重复出现的运行经验,提议沉淀到 memory.md (正向/负向)\n"
+        "                     例: `/reflect` (7d) / `/reflect 14d`\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -729,6 +731,80 @@ async def _handle_heat(text: str = "") -> str:
     return await _ask_claude(prompt)
 
 
+async def _handle_reflect(text: str = "") -> str:
+    """Self-reflection: scan recent briefs + logs for repeated patterns
+    worth promoting (positive) or avoiding (negative). Surfaces proposals;
+    user manually appends to memory.md after review.
+
+    用法: /reflect (默认 7 天) / /reflect 3d / /reflect 14d
+    """
+    args = text.split()[1:]
+    lookback_days = 7
+    if args:
+        m = re.match(r"^(\d+)d$", args[0].lower())
+        if m: lookback_days = max(1, min(30, int(m.group(1))))
+
+    prompt = (
+        f"# 自我检讨:近 {lookback_days} 天 brief 运行经验沉淀\n\n"
+        f"任务:回顾最近 {lookback_days} 天的 brief 运行,找出**可以沉淀到 memory.md 的运行经验** — "
+        f"正向(发现的好做法)+ 负向(踩过的坑)。**只列 ≥2 次重复出现**的模式,避免单次偶然。"
+        f"\n\n## 步骤\n\n"
+        f"**1.** Read 当前 `{MEMORY_MD_PATH}` 的'## 运行经验:正向'和'## 运行经验:负向'两节,**列出已有条目**避免重复沉淀。\n\n"
+        f"**2.** Glob `~/Reports/[0-9]*-[0-9]*-[0-9]*-[0-9]*-brief.md` 找最近 {lookback_days} 天的 brief 文件(每天约 15 份,共 ~{lookback_days*15} 份)。\n\n"
+        f"**3.** Glob `~/Scripts/market-brief/logs/[0-9]*-[0-9]*-[0-9]*.log` 找最近 {lookback_days} 天的日志(每天 1 份)。\n\n"
+        f"**4.** **抽样 Read**(全量太大):\n"
+        f"  - 简报:每天随机 1-2 份(覆盖盘前/盘中/盘后各类型),共 ~{lookback_days * 2} 份\n"
+        f"  - 日志:全部读完({lookback_days} 份小文件)\n\n"
+        f"**5.** **找模式**:\n\n"
+        f"  **正向候选(好做法值得沉淀)**:\n"
+        f"  - 某 prompt step 处理方式效果好(如 multi-wave pagination 减少 grep fallback)\n"
+        f"  - 某 MCP 调用搭配产生有用结果(如 implied_move + unusual_activity 一起看)\n"
+        f"  - Claude 在 brief 里展示的 emergent 自适应行为\n"
+        f"  - 某种数据源结合得出特别准的信号\n\n"
+        f"  **负向候选(避坑)**:\n"
+        f"  - 某种调用反复失败(token-cap / timeout / rate-limit)\n"
+        f"  - 某种 prompt 写法导致 Claude 困惑或污染输出\n"
+        f"  - 某数据源持续不稳定 / 噪音多\n"
+        f"  - 某种 sentiment 判断被反转后才对(没考虑到的反指)\n\n"
+        f"**6.** **过滤**:\n"
+        f"  - 必须 ≥2 次实际观察,引用具体 brief 文件名 / 日志行\n"
+        f"  - 必须**不在**memory.md 已有'运行经验'里(若类似但不同,合并改进而非新增)\n"
+        f"  - 置信度低 / 单次观察 / 推测性 — **一律不报**\n\n"
+        f"## 输出格式(严格)\n\n"
+        f"```\n"
+        f"## 自我检讨 ({{今日日期}}, 近 {lookback_days} 天)\n\n"
+        f"### 已有 memory 经验:正向 X 条 / 负向 Y 条\n\n"
+        f"### 新发现 — 正向候选\n\n"
+        f"1. **<简称>** [置信度: 高/中]\n"
+        f"   - **观察**:`<具体 brief / 日志 / 行号>` × **≥2 次**\n"
+        f"   - **建议沉淀**(追加到 memory.md '## 运行经验:正向'节末尾,一行):\n"
+        f"     ```\n"
+        f"     - **{{今日}}**:<具体规则,操作 + 适用条件>\n"
+        f"     ```\n\n"
+        f"### 新发现 — 负向候选\n\n"
+        f"1. **<简称>** [置信度: 高/中]\n"
+        f"   - **观察**:`<具体出处>` × **≥2 次失败**\n"
+        f"   - **建议沉淀**('## 运行经验:负向'节末尾):\n"
+        f"     ```\n"
+        f"     - **{{今日}}**:<什么动作会失败 + 应该用什么替代>\n"
+        f"     ```\n\n"
+        f"### 应该淘汰的已有经验(过期/被推翻,可选)\n\n"
+        f"- `<memory.md 现有的某条>` 不再适用 → 建议删除\n"
+        f"  - **理由**:<什么变了 / 新证据>\n\n"
+        f"### 综合建议\n"
+        f"一句话:新增 X 条正向 + Y 条负向 + Z 条淘汰。**人工 review 后**手动追加 / 删除到 memory.md\n"
+        f"```\n\n"
+        f"**无新发现**时:`## 自我检讨:近 {lookback_days} 天观察跟 memory.md 已有规则一致,无需更新。`\n\n"
+        f"**约束**:\n"
+        f"- 总输出 < 1800 字(可能切 2 条微信)\n"
+        f"- 每条候选 ≥2 个观察依据,**否则不报**(单次偶然不沉淀)\n"
+        f"- 已在 memory.md 的不要重复报\n"
+        f"- 不允许 fabrication,只基于实际看到的 brief / log 内容\n"
+        f"- 优先**操作级**经验(具体规则、limit 数字、文件路径),不要写抽象哲学"
+    )
+    return await _ask_claude(prompt)
+
+
 async def _handle_score(text: str = "") -> str:
     """C: 命中率记分。统计过去 N 天盘前简报里 ⚡ section 推荐的实际表现。
 
@@ -803,6 +879,7 @@ COMMANDS = {
     "/kol_drift": _handle_kol_drift,
     "/heat": _handle_heat,
     "/score": _handle_score,
+    "/reflect": _handle_reflect,
     "/help": _handle_help,
 }
 
