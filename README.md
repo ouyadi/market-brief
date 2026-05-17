@@ -1,241 +1,218 @@
 # market-brief
 
-> Windows scheduled task + Claude Code skill that, hourly during US trading
-> hours, scans your Discord and WeChat investing chat groups, summarizes them
-> into a tier-tagged markdown brief, and pushes it to your WeChat (primary)
-> with email as fallback. **Optionally** runs a long-poll listener so you can
-> chat with Claude (and trigger the same MCP tools) directly from WeChat.
+> 一个 Claude Code skill + Windows/macOS 定时任务,每小时(美东 08:00–22:00)
+> 扫描你的 Discord 和微信投资群,生成分级 markdown 简报,推送到你的微信
+> (主通道) + 邮箱兜底。**可选**开一个长轮询 listener,直接在微信里跟
+> Claude 对话(并用同一套 MCP 工具)。
 
-## What it does
+## 它做什么
 
-### Scheduled outbound (the core)
-
-```
-Task Scheduler (08:00–22:00 EDT, hourly)
-        ↓
-run.ps1
-        ↓
-claude --print  (prompt.md → uses mcp__chatlog + mcp__discord-selfbot tools)
-        ↓
-Reports\YYYY-MM-DD-HH-brief.md   (full report kept on disk)
-        ↓
-push_weixin.py --section "⚡"  → Hermes Agent → iLink → your WeChat
-        ↓ (if WeChat push fails)
-Send-MailMessage → Gmail SMTP → your inbox (full report)
-```
-
-- **Tier-aware**: pre-market (24h window) / market hours (90min) / after-hours
-  (90min) — same `prompt.md` switches structure based on EDT hour
-- **WeChat push is just the "⚡ 高优先级关注" section** (~1 iLink message, 15
-  msgs/day) so we stay under iLink's ~10/session quota; the full report still
-  lives on disk and shows up in the email fallback when push fails
-- **Fail-soft to email**: WeChat is the primary channel; email is only sent
-  when push fails. Operationally, if hourly fallback emails start arriving you
-  either need to send any message to the bot in WeChat (to refresh the iLink
-  session quota) or re-bind via `qr_login_bootstrap.py`
-
-### Optional inbound (chat with the bot)
+### 定时外推(主链路)
 
 ```
-You text the bot in WeChat
+Task Scheduler / launchd  (美东 08:00–22:00,每小时)
         ↓
-WeixinListener task (At log on, run-listener.ps1)
+run.ps1 / run.sh
         ↓
-listen_weixin.py long-polls iLink /getupdates
+claude --print  (prompt.md → 调用 mcp__chatlog + mcp__discord-selfbot + mcp__twitter + mcp__stock-price)
         ↓
-  Slash commands (cheap, no Claude spend):
-    /ping    health check
-    /brief   trigger MarketBrief now
-    /help    list commands
-  Anything else → claude --print --dangerously-skip-permissions
-                  (same MCP tools as the scheduled run; ad-hoc questions
-                   like "月哥下午说啥了" / "现在 TSLA 多少人在喊买")
+Reports/YYYY-MM-DD-HH-brief.md   (完整简报存盘)
         ↓
-send_weixin_direct → reply back into the same WeChat chat
+push_weixin.py --section ⚡ --section 🎯 --section 🎙️
+        ↓
+Hermes Agent → iLink → 你的微信 (3 条独立消息)
+        ↓ (推送失败时)
+SMTP → Gmail → 邮箱 (完整简报)
 ```
 
-The listener filters strictly to the bot owner (your own `WEIXIN_HOME_CHANNEL`)
-so even if a stranger DMs the bot, it stays silent.
+- **分时段感知**:盘前(扫过去 24h)/盘中(90min)/盘后(90min),`prompt.md` 按美东时间自动切结构
+- **推 3 个核心 section**:`⚡ 高优先级关注` + `🎯 个股新动向` + `🎙️ 大 V 速读`,各一条微信消息。完整报告还在盘上 + 邮箱兜底里
+- **智能切分**:超长 section 自动按 H2/H3 标题边界切,绝不把 `### TSLA` 标题孤立在上一条末尾(详见 [`push_weixin.py`](push_weixin.py) 的 `smart_chunks`)
+- **失败邮件兜底**:微信是主通道,只有 push 失败才发邮件。Hermes 已经做了 tokenless retry,实测 30 天 0 失败
 
-### Optional: Stock price MCP via yfinance
+### 可选:微信入站监听(跟 bot 对话)
 
-A second HTTP MCP server (`stock_price_mcp.py`, port 3032) backed by
-`yfinance`. Four tools:
+```
+你在微信发消息给 bot
+        ↓
+WeixinListener 任务(At log on,run-listener.ps1 / launchd)
+        ↓
+listen_weixin.py 长轮询 iLink /getupdates
+        ↓
+  斜杠命令(便宜,不耗 Claude):
+    /ping   健康检查
+    /brief  立刻触发 MarketBrief
+    /dv [handle] [Xh]   大 V 速读
+    /xfeed [tab] [N]    X 个人时间线
+    /plan [tickers]     可执行方案富化
+    /ticker TICKER [Nh] 单股 cashtag 搜
+    /help   命令列表
+  其他自由文本 → claude --print --dangerously-skip-permissions
+                  (跟定时任务同一套 MCP 工具,你可以问
+                   "月哥下午说啥了" / "现在 TSLA 多少人在喊买" 这种 ad-hoc)
+        ↓
+send_weixin_direct → 回到同一个微信对话
+```
 
-- **`get_quote(ticker)`** — current price, change%, volume, market cap, 52w range
-- **`get_history(ticker, period, interval)`** — OHLCV time series (caps last 50 bars)
-- **`get_info(ticker)`** — sector, forward P/E, next earnings date, dividend, summary
-- **`check_post_hoc(ticker, at_time, horizon)`** — event-study micro: at a given timestamp (e.g. a tweet's `posted_at`) and N period later, returns price-at-time, max gain, max drawdown, net move. **Designed for evaluating KOL/group-host call accuracy** — feed Claude tweet/group-message timestamps + tickers and let it grade hit rate.
+Listener 严格过滤:只响应 bot owner 自己(`WEIXIN_HOME_CHANNEL`),陌生人 DM 不会触发回复。
 
-Free, no API key, no Defender quarantine path. yfinance scrapes Yahoo
-Finance so high-freq calls can hit rate limits, but hourly market-brief
-usage is well within tolerable levels.
+后台还有一个 **typing-ping keepalive**(默认 30 分钟一次),用 iLink 的 typing 接口当 session 心跳,**不消耗 sendmessage quota**、用户看不到。可通过 `KEEPALIVE_INTERVAL_S=0` 关闭。
 
-Daemonized as scheduled task `StockPriceMCP` (At log on, hidden window).
+### 可选:股价 MCP(yfinance)
 
-### Optional: Twitter/X MCP via Playwright
+第二个 HTTP MCP server(`stock_price_mcp.py`,端口 3032),基于 `yfinance`。暴露 4 个工具:
 
-Self-hosted Twitter/X scraper libs (`twscrape`, `agent-twitter-client`) are
-broken by X's 2026-05 reverse-eng pace, even the actively-maintained ones.
-**Solution shipped in this repo**: a Playwright-based HTTP MCP server
-(`twitter_playwright_mcp.py`) that launches **user-installed Chrome** with
-your own X cookies injected, scrapes the DOM, and exposes:
+- **`get_quote(ticker)`** — 实时价/涨跌幅/成交量/市值/52w 高低
+- **`get_history(ticker, period, interval)`** — OHLCV 时序(最多 50 根)
+- **`get_info(ticker)`** — sector / forward_pe / next_earnings_date / dividend / 业务概览
+- **`check_post_hoc(ticker, at_time, horizon)`** — 事后微观回测:给一个 ISO 时间点(如 tweet 的 `posted_at`)+ horizon(1h/1d/3d/1w/2w/1mo),返回 price_at_time / max_gain / max_drawdown / net_move。**主要用于评 KOL/群主 call 命中率**,把 tweet/群里消息的时间戳+ ticker 喂给 Claude,让它打分。
 
-- `fetch_tweet_by_url(url)` — pull text/author/time of a single tweet
-- `fetch_user_tweets(username, limit)` — recent N tweets from a handle
-- `search_tweets(query, limit, mode='live'|'top')` — keyword search
+免费、无 API key、无 Defender 隔离问题(纯 HTTP 不走浏览器)。yfinance 抓 Yahoo Finance,>10 次/分钟可能触发短暂限速,每小时 brief 完全没问题。
 
-Runs on `127.0.0.1:3031/mcp` as a daemon (At-log-on scheduled task
-`TwitterMCP`). Read-only by design — no `send`/`like`/`follow` tools
-exposed even though cookies could authorize them (minimizes ban risk on
-the user's main account).
+后台守护:scheduled task `StockPriceMCP`(at log on,hidden)/ launchd `com.ouyadi.stock-mcp`。
 
-Optional because: (a) requires a user-installed Chrome and a one-time
-cookie export, (b) uses your main X account — cookies live in
-`~/twitter-mcp/.env` which is gitignored. See SKILL.md Step 10.
+### 可选:X (Twitter) MCP via Playwright
 
-## Install
+主流自部署 X 爬虫库(`twscrape`、`agent-twitter-client`等)都被 X 反爬打死了。**本仓附带**一个基于 Playwright 的 HTTP MCP server(`twitter_playwright_mcp.py`),启动 **用户本机装的 Chrome** 并注入你的 X cookies,直接抓 DOM。暴露:
 
-### Quickstart (`quickstart.ps1` — recommended)
+- `fetch_tweet_by_url(url, include_thread=True)` — 单条推 + **自动展开 thread**(如果是 thread head)
+- `fetch_thread(url, max_tweets=20)` — 显式抓 thread:从指定推开始,沿同作者 self-reply 链向下走
+- `fetch_user_tweets(username, limit)` — @某用户最近 N 条
+- `search_tweets(query, limit, mode)` — `live` (最新) 或 `top` (热门) 搜索
+- `fetch_home_timeline(tab='for_you'|'following', limit)` — 你自己 X 首页两个 tab
 
-After you've already run [chat-mcp-setup](https://github.com/ouyadi/mcp-chat-skills/tree/main/skills/chat-mcp-setup)
-(provides the `chatlog` + `discord-selfbot` MCP servers — see Prerequisites
-below):
+四种 X 推内容形态全覆盖:
+| 形态 | 处理 |
+|---|---|
+| 普通短推 (≤280) | 直接抓 |
+| Premium 长推 (≤25K) | 自动点 "Show more" 展开 |
+| Thread (连续 self-reply) | `_collect_self_replies` 串成链 |
+| 图片/视频推 | `media[]` 字段返 URL → Claude WebFetch + vision 读 |
+
+跑在 `127.0.0.1:3031/mcp`,scheduled task `TwitterMCP` / launchd `com.ouyadi.twitter-mcp`。**只读** — 仅 `fetch_*` / `search_*`,主账号封号风险最低。
+
+为什么"可选":需要你本机有 Chrome + 一次性导出 cookies。Cookies 存在 `~/twitter-mcp/.env`(gitignored)。详见 SKILL.md Step 10。
+
+## 安装
+
+### Windows:一键安装(推荐)
+
+前置:已经装了 [chat-mcp-setup](https://github.com/ouyadi/mcp-chat-skills/tree/main/skills/chat-mcp-setup) 提供的 `chatlog` + `discord-selfbot` MCP servers(见下面 *前置条件*)。
 
 ```powershell
-# 1. Clone this repo
+# 1. 克隆本仓
 git clone https://github.com/ouyadi/market-brief.git $env:USERPROFILE\market-brief
 
-# 2. One command — installer walks through 7 idempotent phases
+# 2. 一行命令 —— 安装器分 7 个幂等阶段
 cd $env:USERPROFILE\market-brief
 powershell -NoProfile -ExecutionPolicy Bypass -File .\quickstart.ps1
 ```
 
-Phases:
-1. Prereq checks (Python 3.11, Chrome, claude CLI, chatlog/discord daemons)
-2. Python venv at `~/hermes-agent` + install all MCP deps + Playwright Chromium
-3. Copy runtime files to `~/Scripts/market-brief`, `~/twitter-mcp`, `~/stock-mcp`
-4. **Pause** for manual steps: fill `secrets.json`, edit `prompt.md` groups, scan iLink QR, extract X cookies
-5. Register 4 scheduled tasks (`MarketBrief`, `WeixinListener`, `TwitterMCP`, `StockPriceMCP`)
-6. Start daemons + `claude mcp add` the HTTP MCPs
-7. Optional smoke test (one `run.ps1 -SkipEmail`)
+7 个阶段:
+1. **Prereq check**(Python 3.11、Chrome、claude CLI、chatlog/discord 守护)
+2. **Python venv** 在 `~/hermes-agent` 安所有 MCP 依赖 + Playwright Chromium
+3. **拷文件** 到 `~/Scripts/market-brief`、`~/twitter-mcp`、`~/stock-mcp`
+4. **暂停手动**:填 `secrets.json`、改 `prompt.md` 群列表、扫 iLink 微信 QR、导 X cookies
+5. **注册 4 个 scheduled task**(MarketBrief / WeixinListener / TwitterMCP / StockPriceMCP)—— 全部通过 `wscript.exe` + `run-hidden.vbs` 启动,**触发时不再闪 PowerShell 窗口**
+6. 起守护进程 + `claude mcp add` 注册 HTTP MCPs
+7. 可选 smoke test(跑一次 `run.ps1 -SkipEmail`)
 
-Re-run anytime to resume (each phase auto-detects "already done"). Skip
-phases with `-SkipPhase 1,7` etc. Dry-run with `-DryRun`.
+随时重跑:每个阶段都会检测"已完成"自动跳过。可用 `-SkipPhase 1,7` 跳指定阶段,`-DryRun` 干跑。
 
-### As a Claude Code skill (Claude drives the install)
+### macOS:一键安装
 
-On a Windows machine where you've already run [chat-mcp-setup](https://github.com/ouyadi/mcp-chat-skills/tree/main/skills/chat-mcp-setup)
-(provides the `chatlog` + `discord-selfbot` MCP servers):
+```bash
+git clone https://github.com/ouyadi/market-brief.git ~/market-brief
+cd ~/market-brief
+bash quickstart-mac.sh
+```
+
+7 阶段跟 Windows 对等,scheduler 改为 launchd。注意 `chat-mcp-setup` skill 的 Mac 路径要先装好(WeChat 4.x macOS 支持还未完全验证,见 SKILL.md macOS 章节)。
+
+### 作为 Claude Code skill(让 Claude 驱动安装)
 
 ```powershell
-# 1. Clone this repo
+# Windows
 git clone https://github.com/ouyadi/market-brief.git $env:USERPROFILE\market-brief
-
-# 2. Make Claude Code discover it as a skill
 New-Item -ItemType Junction `
     -Path $env:USERPROFILE\.claude\skills\market-brief-setup `
     -Target $env:USERPROFILE\market-brief
-
-# 3. Restart Claude Code, open a fresh session, say:
-#       "use the market-brief-setup skill to install the hourly chat-intel pipeline"
-#
-# Claude reads SKILL.md and walks through the 9 install steps.
-# A few will need you (filling in your groups, scanning a QR with your phone,
-# pasting an OAuth token + Gmail App Password). The rest is automated.
+# 重启 Claude Code,新会话说:
+# "use the market-brief-setup skill to install the hourly chat-intel pipeline"
 ```
 
-### Manually (no Claude in the driver's seat)
+Claude 读 SKILL.md 把 install 步骤一步步走完。手动环节(填群、扫 QR、贴 OAuth token + Gmail App Password)还是要你自己来,其余全自动。
 
-Read [SETUP-GUIDE.md](SETUP-GUIDE.md) — same content as the skill flow,
-written linearly for a human operator.
+### 完全手动
 
-## Prerequisites
+读 [SETUP-GUIDE.md](SETUP-GUIDE.md) —— 跟 skill 一样的内容,只是给人类操作员的线性版本。
 
-- **Windows 10/11** desktop that stays on during the target hours (Task
-  Scheduler can't fire while machine is off)
-- **chatlog + discord-selfbot MCP servers** running on `127.0.0.1:5030` /
-  `127.0.0.1:6280` — install via [ouyadi/mcp-chat-skills](https://github.com/ouyadi/mcp-chat-skills)
-  (the host-side scripts are in that repo's `chat-mcp-setup` skill;
-  the `chat-mcp-setup` skill itself is public on GitHub at that link)
-- **WeChat 4.x** signed into the account you want scanned on the same machine
-- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`) +
-  long-lived OAuth token from `claude setup-token`
-- **Gmail App Password** (Outlook/Hotmail won't work — Microsoft disabled
-  basic auth)
-- **(Optional, for WeChat push)** ability to scan a QR with your phone's
-  WeChat app
+## 前置条件
 
-## What gets installed on the target machine
+- **Windows 10/11 或 macOS** 桌面,在目标时段开机不关(scheduler 关机时不会触发)
+- **chatlog + discord-selfbot MCP servers** 跑在 `127.0.0.1:5030` / `127.0.0.1:6280` —— 来自 [ouyadi/mcp-chat-skills](https://github.com/ouyadi/mcp-chat-skills) 的 `chat-mcp-setup` skill
+- **微信 4.x** 登录在同一台机器上 chatlog 才能读 DB
+- **Claude Code CLI** (`npm install -g @anthropic-ai/claude-code`) + 长期 OAuth token (`claude setup-token`)
+- **Gmail 应用专用密码**(Outlook/Hotmail 不行,微软关了 basic auth)
+- *(可选,启用微信 push 时)* 用手机扫一次 iLink QR
 
-| Path | Purpose |
+## 装完后机器上会有什么
+
+| 路径 | 用途 |
 |---|---|
-| `C:\Users\<u>\Scripts\market-brief\` | The launcher dir (run.ps1, prompt.md, push_weixin.py, listen_weixin.py, etc.) |
-| `C:\Users\<u>\hermes-agent\.venv\` | Python 3.11 venv with Hermes Agent (only if WeChat push enabled) |
-| `C:\Users\<u>\.hermes\.env` | iLink credentials from QR scan |
-| `C:\Users\<u>\Reports\YYYY-MM-DD-HH-brief.md` | Hourly report output |
-| Scheduled Task `MarketBrief` | Fires hourly 08:00–22:00 local time |
-| Scheduled Task `WeixinListener` *(if inbound enabled)* | At-log-on hidden listener that bridges WeChat ↔ Claude |
-| Scheduled Task `TwitterMCP` *(if Twitter MCP enabled)* | At-log-on hidden Playwright-based X scraper on `127.0.0.1:3031` |
-| `C:\Users\<u>\twitter-mcp\` *(if Twitter MCP enabled)* | Wrapper script + cookies `.env` + logs |
-| Scheduled Task `StockPriceMCP` *(if stock MCP enabled)* | At-log-on hidden yfinance-based price server on `127.0.0.1:3032` |
-| `C:\Users\<u>\stock-mcp\` *(if stock MCP enabled)* | Wrapper script + logs |
+| `~/Scripts/market-brief/` | 主目录(run / prompt / push_weixin / listen_weixin) |
+| `~/hermes-agent/.venv/` | Python 3.11 venv(装 Hermes Agent,启用微信 push 时) |
+| `~/.hermes/.env` | iLink 凭证(QR 扫码后生成) |
+| `~/Reports/YYYY-MM-DD-HH-brief.md` | 每小时简报存盘 |
+| `~/twitter-mcp/` *(可选)* | Twitter MCP 主目录 + cookies `.env` + logs |
+| `~/stock-mcp/` *(可选)* | Stock MCP 主目录 + logs |
+| Scheduled Task `MarketBrief` / launchd `com.ouyadi.market-brief` | 每小时 08:00–22:00 美东触发 |
+| `WeixinListener` *(可选)* | 入站监听:微信 ↔ Claude |
+| `TwitterMCP` *(可选)* | X 抓取守护(127.0.0.1:3031) |
+| `StockPriceMCP` *(可选)* | yfinance 守护(127.0.0.1:3032) |
 
-## Repo contents
+## 仓库内容
 
-| File | Role |
+| 文件 | 角色 |
 |---|---|
-| [`SKILL.md`](SKILL.md) | Procedural instructions for Claude Code |
-| [`SETUP-GUIDE.md`](SETUP-GUIDE.md) | Long-form human-facing install doc |
-| [`prompt.template.md`](prompt.template.md) | Scanning prompt template — fill in your groups |
-| [`run.ps1`](run.ps1) | PowerShell launcher (claude → WeChat push → email fallback) |
-| [`push_weixin.py`](push_weixin.py) | One-shot WeChat sender via Hermes' `send_weixin_direct`; supports `--section "⚡"` to push only one H2 |
-| [`qr_login_bootstrap.py`](qr_login_bootstrap.py) | One-time iLink QR-scan binding |
-| [`schedule-install.ps1`](schedule-install.ps1) | Registers the `MarketBrief` Task Scheduler entry |
-| [`listen_weixin.py`](listen_weixin.py) | Long-poll inbound listener (WeChat → `claude --print` → reply) |
-| [`run-listener.ps1`](run-listener.ps1) | Wrapper that loads secrets + scrubs env, then launches `listen_weixin.py` |
-| [`install-listener.ps1`](install-listener.ps1) | Registers `WeixinListener` Task Scheduler entry (At log on) |
-| [`twitter_playwright_mcp.py`](twitter_playwright_mcp.py) | HTTP MCP server: Playwright headless Chrome + cookies → X DOM scrape (read-only) |
-| [`install-twitter-mcp.ps1`](install-twitter-mcp.ps1) | Registers `TwitterMCP` task |
-| [`stock_price_mcp.py`](stock_price_mcp.py) | HTTP MCP server: yfinance → quote / history / info / check_post_hoc |
-| [`install-stock-mcp.ps1`](install-stock-mcp.ps1) | Registers `StockPriceMCP` task |
-| [`secrets.example.json`](secrets.example.json) | Template for `secrets.json` (OAuth + Gmail) |
-| [`hermes-py.ps1`](hermes-py.ps1) | Legacy wrapper kept for emergency fallback |
-| [`quickstart.ps1`](quickstart.ps1) | **One-command installer** — 7 idempotent phases (prereqs, venv, copy files, interactive setup, scheduled tasks, daemons + MCP register, smoke test) |
+| [`SKILL.md`](SKILL.md) | 给 Claude Code 的 procedural 指令(双平台) |
+| [`SETUP-GUIDE.md`](SETUP-GUIDE.md) | 给人类操作员的线性安装文档 |
+| [`prompt.template.md`](prompt.template.md) | 扫描 prompt 模板 —— 填你的群 |
+| [`run.ps1`](run.ps1) / [`run.sh`](run.sh) | 主 launcher(claude → 微信 push → 邮件兜底) |
+| [`push_weixin.py`](push_weixin.py) | 微信发送器,支持 `--section` 多 H2 推 + smart 切分 |
+| [`qr_login_bootstrap.py`](qr_login_bootstrap.py) | 一次性 iLink QR 绑定 |
+| [`schedule-install.ps1`](schedule-install.ps1) | 注册 `MarketBrief` Task Scheduler 入口 |
+| [`launchd/*.plist`](launchd/) | 4 个 macOS 守护 plist |
+| [`listen_weixin.py`](listen_weixin.py) | 入站长轮询 listener(微信 → claude → 回复)+ typing keepalive |
+| [`run-listener.ps1`](run-listener.ps1) | 加载 secrets + scrub env 后启 listener |
+| [`install-listener.ps1`](install-listener.ps1) | 注册 `WeixinListener` (At log on) |
+| [`twitter_playwright_mcp.py`](twitter_playwright_mcp.py) | HTTP MCP:Playwright + Chrome + cookies → X DOM (只读,含 thread + 长推 + 图片探测) |
+| [`install-twitter-mcp.ps1`](install-twitter-mcp.ps1) | 注册 `TwitterMCP` |
+| [`stock_price_mcp.py`](stock_price_mcp.py) | HTTP MCP:yfinance → quote/history/info/check_post_hoc |
+| [`install-stock-mcp.ps1`](install-stock-mcp.ps1) | 注册 `StockPriceMCP` |
+| [`run-hidden.vbs`](run-hidden.vbs) | 无窗口启动 wrapper(Windows Task Scheduler 触发时不闪 PowerShell) |
+| [`secrets.example.json`](secrets.example.json) | `secrets.json` 模板(OAuth + Gmail) |
+| [`hermes-py.ps1`](hermes-py.ps1) | 早期遗留 wrapper(应急兜底) |
+| [`quickstart.ps1`](quickstart.ps1) / [`quickstart-mac.sh`](quickstart-mac.sh) | **一键安装器** —— 各 7 个幂等阶段 |
 
-After install on your machine, `secrets.json` and your personalized `prompt.md`
-(with your actual group IDs) will exist locally but are gitignored — never
-commit those.
+装完后,`secrets.json` 和你个性化过的 `prompt.md`(含真实群 ID)在本机存在但 gitignored —— **绝对不要 commit**。
 
-## Variants
+## 变体
 
-- **Email-only mode**: if you don't want WeChat push, the skill auto-skips
-  Steps 4–6 (Hermes Agent install + QR scan + push smoke test). The pipeline
-  degrades cleanly to `claude → email`.
-- **macOS**: architecture is identical. The Python helpers (`push_weixin.py`,
-  `qr_login_bootstrap.py`) work as-is. Replace `run.ps1` with a shell-script
-  equivalent and `Task Scheduler` with `launchd`/`cron`. The MCP server
-  setup for macOS is also in [ouyadi/mcp-chat-skills](https://github.com/ouyadi/mcp-chat-skills).
-- **Linux**: untested; Hermes Agent supports Linux first-class so should work
-  with a `systemd` timer in place of Task Scheduler.
+- **只邮箱模式**:不想 push 微信,quickstart 自动跳过 Step 4–6 (Hermes 安装 + QR + push smoke)。pipeline 自动降级成 `claude → 邮箱`。
+- **macOS**:跟 Windows 架构对等,完整支持。launchd 替代 Task Scheduler,bash 替代 PowerShell。详见 SKILL.md 末尾 macOS 章节。
+- **Linux**:未测,Hermes Agent 原生支持 Linux,把 launchd plist 改成 systemd timer 应该能跑。
 
 ## License
 
-[MIT](LICENSE) — fork, modify, redistribute. Attribution appreciated but not
-required.
+[MIT](LICENSE) —— 自由 fork / 改 / 分发。署名感谢但不强制。
 
-## Notes / known gotchas
+## 已知坑(避雷指南)
 
-A condensed troubleshooting table is at the bottom of [SKILL.md](SKILL.md#troubleshooting).
-The big ones:
+完整故障排查表在 [SKILL.md](SKILL.md#troubleshooting)。核心几条:
 
-- **Don't use uv-managed Python on Windows for Hermes Agent** — Defender has
-  been observed quarantining the astral-sh Python distribution. Use
-  `winget install Python.Python.3.11` instead. SKILL.md / SETUP-GUIDE.md
-  spell this out.
-- **Pillow is required but not pulled by `hermes-agent`** — add it explicitly
-  in the venv or the QR step crashes.
-- **iLink has a ~10 message per session quota** — if hourly fallback emails
-  start arriving where you previously got only WeChat messages, send any text
-  to the bot in WeChat to refresh, or re-run `qr_login_bootstrap.py` for a
-  fresh token. Details in SKILL.md.
+- **Windows 上别用 uv 管理的 Python 装 Hermes Agent** —— Defender 实测会隔离 astral-sh 的 Python 分发版,venv 一启动就报 `No Python at …`。改用 `winget install Python.Python.3.11`。SKILL.md / SETUP-GUIDE.md 详细写了。
+- **Pillow 必装,Hermes Agent 不会自动拉** —— 否则 QR 扫码步骤崩 `ModuleNotFoundError: PIL`。venv 里 `pip install Pillow`。
+- **iLink session quota**:历史上每 session ~10 条 outbound 后耗尽,需要人扫码或在微信回 bot 一句。**Hermes 已自动 tokenless retry**(`ret=-14` 触发后透明地降级 send,实测 30+ 天 0 失败),加上本仓 listener 的 typing-ping keepalive,日常 100% 通过率,你基本不用管。
+- **iLink token 长期过期**(几个月一次):重跑 `qr_login_bootstrap.py` 扫码,无法自动化。
+- **chatlog 是 TUI 应用**,只能 minimized 不能完全 hidden(没 console 它直接 crash)。其他所有任务都已通过 `wscript+VBS` 改成零窗口闪烁。
