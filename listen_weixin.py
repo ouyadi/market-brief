@@ -86,8 +86,9 @@ SYSTEM_PROMPT = f"""\
   - mcp__chatlog__wx_history / wx_search / wx_sessions   微信群历史 / 模糊找群 / 列所有会话
   - mcp__discord-selfbot__read_channel_messages          Discord 频道历史
   - mcp__discord-selfbot__list_channels                  Discord 频道列表
-  - mcp__twitter__fetch_tweet_by_url(url)                抓单条 X tweet 内容(用户登录态,绕过登录墙)
-  - mcp__twitter__fetch_user_tweets(username, limit)     抓 @某用户最近 N 条 (大 V 跟踪)
+  - mcp__twitter__fetch_tweet_by_url(url)                抓单条 X tweet 内容(用户登录态,绕过登录墙)。**默认 include_thread=True,自动展开同作者 self-reply 形成的 thread**;返回的 dict 里若有 `thread` 字段说明这条是 thread head
+  - mcp__twitter__fetch_thread(url, max_tweets=20)       专门抓 thread 的工具。当你看到 "Show this thread" / 推文以 `1/N`、`(续)`、编号列表 (一、二、三) 开头、或文末像被截断时,**主动**调这个。返回 focal + 后续 self-reply 的有序列表
+  - mcp__twitter__fetch_user_tweets(username, limit)     抓 @某用户最近 N 条 (大 V 跟踪)。**注意**:这个工具拿到的可能只是 thread head,如果有 thread 标志,follow up 调 fetch_thread
   - mcp__twitter__search_tweets(query, limit, mode)      X 关键词搜 (mode='live' 最新 / 'top' 热门)
   - mcp__stock-price__get_quote(ticker)                  实时价 / 涨跌 / 成交量 / 市值 / 52w high-low
   - mcp__stock-price__get_history(ticker, period, interval)  OHLCV 时序(period 1d/5d/1mo/3mo/1y; interval 1m/5m/1h/1d)

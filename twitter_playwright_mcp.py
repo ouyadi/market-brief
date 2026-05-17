@@ -163,11 +163,92 @@ async def _scroll_for(page: Page, target_count: int, max_scrolls: int = 10) -> N
         await asyncio.sleep(0.9)
 
 
+def _norm_handle(href: str | None) -> str | None:
+    """Normalize an author_handle href to lowercase '/username' for comparison.
+    _extract_one returns hrefs like '/elonmusk' or 'https://x.com/elonmusk'.
+    """
+    if not href:
+        return None
+    h = href.lower()
+    if h.startswith("http"):
+        # strip scheme + host
+        m = re.match(r"https?://[^/]+(/[^/?#]+)", h)
+        h = m.group(1) if m else h
+    # keep only '/username' (drop trailing path like '/status/...')
+    parts = h.split("/")
+    return ("/" + parts[1]) if len(parts) >= 2 and parts[1] else None
+
+
+async def _collect_self_replies(
+    page: Page, focal: dict, max_tweets: int = 20
+) -> list[dict]:
+    """Starting from the focal tweet on a conversation page, walk forward and
+    collect the contiguous run of articles whose author matches the focal's.
+    The first different-author article terminates the chain (those are replies
+    from other people, not the author's thread continuation).
+
+    Returns a list whose first element is the focal tweet itself.
+    """
+    focal_author = _norm_handle(focal.get("author_handle"))
+    focal_url = focal.get("tweet_url")
+    if not focal_author:
+        return [focal]
+
+    # Scroll enough to load any continuation (X lazy-loads as you scroll).
+    # Cap at ~max_tweets+5 to leave headroom for inline replies between.
+    await _scroll_for(page, max_tweets + 5, max_scrolls=12)
+
+    articles = await page.locator("article[data-testid='tweet']").all()
+    chain: list[dict] = []
+    seen_urls: set[str] = set()
+    found_focal = False
+    for art in articles:
+        data = await _extract_one(art)
+        author = _norm_handle(data.get("author_handle"))
+        url = data.get("tweet_url")
+
+        if not found_focal:
+            # Skip until we reach the focal tweet (X may render the parent or
+            # earlier thread context above when the URL points to a mid-thread tweet).
+            if url and focal_url and url == focal_url:
+                found_focal = True
+                chain.append(data)
+                if url:
+                    seen_urls.add(url)
+            continue
+
+        # Past focal: take contiguous same-author tweets.
+        if author == focal_author:
+            if url and url in seen_urls:
+                continue
+            chain.append(data)
+            if url:
+                seen_urls.add(url)
+            if len(chain) >= max_tweets:
+                break
+        else:
+            # First non-self reply -> end of thread continuation.
+            break
+
+    if not chain:
+        # Could not match focal by URL; fall back to focal only.
+        return [focal]
+    return chain
+
+
 @mcp.tool()
-async def fetch_tweet_by_url(url: str) -> dict:
+async def fetch_tweet_by_url(url: str, include_thread: bool = True) -> dict:
     """
     Fetch a single tweet by its X URL. Use this for X links the user is
     asking about, or to follow up on a URL spotted in market-brief input.
+
+    include_thread (default True): if the focal tweet is followed by self-
+    replies from the same author (= a thread), include them as a `thread`
+    field with the full contiguous chain (focal as item 0). When the focal
+    is not a thread head, `thread` is None.
+
+    Set include_thread=False if you only want the single tweet's text and
+    want to skip the extra scroll/parse cost (~1.5-3s).
 
     Example: fetch_tweet_by_url("https://x.com/cnbc/status/1929112233")
     """
@@ -184,10 +265,69 @@ async def fetch_tweet_by_url(url: str) -> dict:
         data = await _extract_one(art)
         data["success"] = True
         data["url"] = url
-        log.info("fetch_tweet_by_url: ok %s", url)
+
+        if include_thread:
+            chain = await _collect_self_replies(page, data, max_tweets=20)
+            # Only attach a 'thread' field when there's actually a continuation
+            # (chain longer than just the focal). Keeps flat-callers happy.
+            if len(chain) > 1:
+                data["thread"] = {"count": len(chain), "tweets": chain}
+            else:
+                data["thread"] = None
+
+        log.info("fetch_tweet_by_url: ok %s (thread=%s)",
+                 url, (data.get("thread") or {}).get("count"))
         return data
     except Exception as e:
         log.exception("fetch_tweet_by_url failed: %s", url)
+        return {"success": False, "url": url, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        await page.close()
+
+
+@mcp.tool()
+async def fetch_thread(url: str, max_tweets: int = 20) -> dict:
+    """
+    Fetch the full self-reply chain (X thread) starting at the given tweet URL.
+
+    The MCP opens the URL, then walks forward through the conversation,
+    collecting the contiguous run of articles whose author matches the
+    focal tweet's author. Stops at the first non-self reply.
+
+    url: any tweet URL belonging to the thread (ideally the head).
+    max_tweets: cap on chain length (default 20, max 50).
+
+    Use when:
+      - A tweet you see in /xfeed or fetch_user_tweets ends with "1/N",
+        "(continued)", or visually looks truncated.
+      - You see "Show this thread" hint on a profile tweet.
+      - The text references "次条" / "下条" / numbered points.
+
+    Returns: {success, focal_url, author, count, tweets: [...]} where tweets[0]
+    is the focal tweet and subsequent items are the author's self-replies in
+    posting order.
+    """
+    max_tweets = max(1, min(50, max_tweets))
+    ctx = await _ensure_ctx()
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_selector("article[data-testid='tweet']", timeout=20000)
+        except Exception:
+            return {"success": False, "url": url, "error": "thread page didn't load"}
+        focal = await _extract_one(page.locator("article[data-testid='tweet']").first)
+        chain = await _collect_self_replies(page, focal, max_tweets=max_tweets)
+        log.info("fetch_thread: %s -> %d tweets", url, len(chain))
+        return {
+            "success": True,
+            "focal_url": url,
+            "author": _norm_handle(focal.get("author_handle")),
+            "count": len(chain),
+            "tweets": chain,
+        }
+    except Exception as e:
+        log.exception("fetch_thread failed: %s", url)
         return {"success": False, "url": url, "error": f"{type(e).__name__}: {e}"}
     finally:
         await page.close()
