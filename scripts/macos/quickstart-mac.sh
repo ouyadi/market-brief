@@ -190,6 +190,13 @@ phase3_copy() {
         warn "  created prompt.md from template -- YOU MUST edit it"
     fi
 
+    # memory.md from template (cross-run persistent user angles; run.sh prepends
+    # it to prompt.md before each brief)
+    if [ ! -f "$SCRIPTS_DIR/memory.md" ] && [ -f "$CONFIG_DIR/memory.template.md" ]; then
+        cp "$CONFIG_DIR/memory.template.md" "$SCRIPTS_DIR/memory.md"
+        info "  created memory.md from template -- listener will append durable feedback over time"
+    fi
+
     # secrets.json starter
     if [ ! -f "$SCRIPTS_DIR/secrets.json" ]; then
         cp "$SCRIPTS_DIR/secrets.example.json" "$SCRIPTS_DIR/secrets.json"

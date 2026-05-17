@@ -76,9 +76,30 @@ fi
 [ -n "$OAUTH" ] && [ "$OAUTH" != "null" ] || { log "[ERROR] claudeCodeOauthToken missing"; exit 2; }
 export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH"
 
+# Build the prompt: memory.md (persistent cross-run user angles) prepended
+# to prompt.md. Listener writes durable user-confirmed feedback to memory.md
+# in addition to prompt.md so corrections survive across brief runs without
+# needing a manual prompt.md re-edit.
+MEMORY_FILE="$MARKET_BRIEF_DIR/memory.md"
+PROMPT_INPUT="$(mktemp)"
+trap 'rm -f "$PROMPT_INPUT"' EXIT
+if [ -f "$MEMORY_FILE" ]; then
+    {
+        echo "<!-- PERSISTENT MEMORY (from memory.md) -->"
+        cat "$MEMORY_FILE"
+        echo ""
+        echo "<!-- END PERSISTENT MEMORY -->"
+        echo ""
+        cat "$PROMPT_FILE"
+    } > "$PROMPT_INPUT"
+    log "prepended memory.md ($(wc -c < "$MEMORY_FILE" | tr -d ' ') bytes)"
+else
+    cp "$PROMPT_FILE" "$PROMPT_INPUT"
+fi
+
 # Run Claude
 log "launching claude --print (takes a few minutes)..."
-claude --print --dangerously-skip-permissions --output-format text < "$PROMPT_FILE" \
+claude --print --dangerously-skip-permissions --output-format text < "$PROMPT_INPUT" \
     2>&1 | while IFS= read -r line; do log "    [claude] $line"; done
 
 [ -f "$REPORT_FILE" ] || { log "[ERROR] report file missing: $REPORT_FILE"; exit 3; }

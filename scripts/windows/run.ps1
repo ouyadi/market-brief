@@ -127,7 +127,21 @@ if (-not $secrets.claudeCodeOauthToken) {
 $env:CLAUDE_CODE_OAUTH_TOKEN = $secrets.claudeCodeOauthToken
 
 # --- 3. Run Claude Code --------------------------------------------------
+# Prepend persistent memory (cross-run user angles, signal priorities,
+# corrections that should outlive any single prompt.md edit). If
+# memory.md exists, its content is wrapped in a clear separator block
+# and put BEFORE prompt.md content. The listener writes user-confirmed
+# durable feedback into this file in addition to prompt.md.
+$memoryFile = Join-Path $here "memory.md"
 $prompt = Get-Content -Raw -Encoding UTF8 $promptFile
+if (Test-Path $memoryFile) {
+    $memory = Get-Content -Raw -Encoding UTF8 $memoryFile
+    $prompt = "<!-- PERSISTENT MEMORY (from memory.md) -->`n" +
+              $memory + "`n" +
+              "<!-- END PERSISTENT MEMORY -->`n`n" +
+              $prompt
+    Log "[$([DateTime]::Now)] prepended memory.md ($($memory.Length) chars)"
+}
 Log "[$([DateTime]::Now)] launching claude (this may take a few minutes)..."
 
 # Pipe prompt via stdin to avoid quoting hell.

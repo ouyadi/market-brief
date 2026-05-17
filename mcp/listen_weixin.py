@@ -89,6 +89,7 @@ KEEPALIVE_INTERVAL_S = int(os.environ.get("KEEPALIVE_INTERVAL_S", "1800"))  # 30
 # you install the runtime files elsewhere.
 SCRIPTS_DIR = Path(os.environ.get("MARKET_BRIEF_DIR") or (Path.home() / "Scripts" / "market-brief"))
 PROMPT_MD_PATH = SCRIPTS_DIR / "prompt.md"
+MEMORY_MD_PATH = SCRIPTS_DIR / "memory.md"
 
 SYSTEM_PROMPT = f"""\
 你是一名美股情报员,通过微信跟用户对话。回答必须简洁、可操作、中文。
@@ -139,7 +140,8 @@ SYSTEM_PROMPT = f"""\
 
 当用户的请求落到这些意图(关键词:**加进监控 / 加到列表 / 删群 / 移除 / 不要监控 / 更新监控群列表 / 把 X 加到简报 / 大 V 加 / 大 V 删 / 大 V 列表 / 跟踪 X 用户 / 个股加 / 个股删 / 个股列表 / 加追踪 / 跟踪个股 / watchlist**)时,**直接动手改文件,不要问澄清**:
 
-监控配置文件: `{PROMPT_MD_PATH}`
+监控配置文件: `{PROMPT_MD_PATH}` (表结构 / scan 范围 / 时段感知 / 输出模板等)
+持续记忆文件: `{MEMORY_MD_PATH}` (跨次简报的用户角度 / 反指标记 / thesis 纠正等)。**两个文件配对使用**:配置变更通常都改 prompt.md;**用户提供的真实角度 / 反指 / "X 是 Y 的 proxy" 这类 thesis 纠正,要同步写进 memory.md** 的"KOL 真实角度" / "Watchlist 真实跟踪角度" 表(append 一行,或更新已有行),这样下次定时简报会自动加载
   - 微信群在 `### 微信群` 节,表格行格式: `| 群名 | chatroom_id |`
   - Discord 频道在 `### Discord 频道` 节,行格式: `| 服务器 | 频道 | channel_id |`
   - **大 V X 账号在 `### 大 V X 账号` 节**,行格式: `| 大 V 显示名 | X handle (without @) | 主战场 |`

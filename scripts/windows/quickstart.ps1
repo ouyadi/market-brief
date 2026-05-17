@@ -195,6 +195,17 @@ function Phase3-CopyFiles {
         Warn "  created prompt.md from template -- YOU MUST edit it to add your groups/handles/tickers"
     }
 
+    # memory.md from template if missing (cross-run persistent user angles;
+    # run.ps1 prepends it to prompt.md before each brief)
+    $memDst = Join-Path $SCRIPTS_DIR 'memory.md'
+    if (-not (Test-Path $memDst)) {
+        $tpl = Join-Path $CONFIG_DIR 'memory.template.md'
+        if (Test-Path $tpl) {
+            Run { Copy-Item $tpl $memDst -Force } "cp memory.template.md -> memory.md"
+            Info "  created memory.md from template -- listener will append durable user feedback here over time"
+        }
+    }
+
     # secrets.json starter
     $secretsDst = Join-Path $SCRIPTS_DIR 'secrets.json'
     if (-not (Test-Path $secretsDst)) {
