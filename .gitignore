@@ -1,6 +1,7 @@
 # End-user-filled files — never commit, even by accident
 secrets.json
 prompt.md
+memory.md
 logs/
 Reports/
 
