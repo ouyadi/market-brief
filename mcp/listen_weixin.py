@@ -251,6 +251,8 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/plan` (从最新 brief 选 top 3) / `/plan TSLA NVDA INTC`\n"
         "  /ticker TICKER     单 ticker 的 X 讨论速读 (cashtag search)\n"
         "                     例: `/ticker SKM` / `/ticker INTC 6h` / `/ticker NVDA 30 top`\n"
+        "  /critique [N]      meta-审查最近一份简报有没有漏窗口内的明显信号 + 改 prompt 建议\n"
+        "                     例: `/critique` (最新) / `/critique 2` (n 份前)\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -466,6 +468,91 @@ async def _handle_ticker(text: str = "") -> str:
     return await _ask_claude(prompt)
 
 
+async def _handle_critique(text: str = "") -> str:
+    """Audit the most recent brief for gaps -- signals visible in the raw
+    data window but missing from the brief. Reports each gap with a concrete
+    prompt.md / memory.md edit proposal. Manual-trigger MVP; weekly auto-run
+    may follow once output quality is observed.
+
+    Args after '/critique':
+      (none)               -- audit the latest brief in ~/Reports/
+      /critique 2          -- audit the brief 2 ago (n-th most recent)
+    """
+    args = text.split()[1:]
+    n_ago = 0
+    if args and args[0].isdigit():
+        n_ago = int(args[0])
+
+    reports_dir = Path.home() / "Reports"
+    briefs = sorted(reports_dir.glob("[0-9]*-[0-9]*-[0-9]*-[0-9]*-brief.md"))
+    if not briefs:
+        return f"✗ /critique: 在 {reports_dir} 没找到任何 YYYY-MM-DD-HH-brief.md"
+    if n_ago >= len(briefs):
+        return f"✗ /critique: 只有 {len(briefs)} 份简报存档,n_ago={n_ago} 越界"
+
+    target = briefs[-1 - n_ago]
+    # Decode mode/window from the filename hour
+    name = target.stem  # "2026-05-17-08-brief"
+    try:
+        hour = int(name.split("-")[3])
+    except (IndexError, ValueError):
+        hour = 12  # fallback
+    if 0 <= hour < 9:
+        window_s, mode = 86400, "盘前 (24h 窗口)"
+    elif 9 <= hour <= 16:
+        window_s, mode = 5400, "盘中 (90min 窗口)"
+    else:
+        window_s, mode = 5400, "盘后 (90min 窗口)"
+
+    prompt = (
+        f"# 简报质量审查任务\n\n"
+        f"审查最近一份简报有没有漏掉**窗口内可见的明显信号**,产出可应用的改进建议。"
+        f"这是 meta-review,不是新简报 — 你的输出会被发回用户做 review,**最后 1-2 周**人工审核多次后可能转成"
+        f"自动化的周度审查。\n\n"
+        f"## 步骤\n\n"
+        f"**步骤 1**:Read 待审简报 `{target}`(模式:{mode})。\n\n"
+        f"**步骤 2**:Read 当前的 `{PROMPT_MD_PATH}` 和 `{MEMORY_MD_PATH}`,知道目前哪些群/频道/大V/watchlist 在跟踪 + 用户的真实角度。\n\n"
+        f"**步骤 3**:重新拉**同一窗口**的原始数据。简报文件名隐含时间;用 `mcp__chatlog__current_time` 拿当前 EDT,**确认简报发布时刻**(`{name}` 时刻),计算 since = 那一刻 - {window_s} 秒。然后:\n"
+        f"  - prompt.md 里所有 Discord 频道并行调 `mcp__discord-selfbot__read_channel_messages` limit=80\n"
+        f"  - prompt.md 里所有微信群并行调 `mcp__chatlog__wx_history` with `since` and limit=250\n"
+        f"  - 跟踪的大 V 各调一次 `mcp__twitter__fetch_user_tweets`(limit=15 for 盘前/12 for 其他)\n"
+        f"  - 简报 ⚡/🎯 提到的每个 ticker 调一次 `mcp__twitter__search_tweets(query='$TICKER', limit=8, mode='live')`\n"
+        f"  - 若 prompt.md 启用 polymarket layer,调 `mcp__polymarket__short_movers(window_hours={window_s//3600 if window_s>=3600 else 1}, limit=8)`\n\n"
+        f"**步骤 4**:**对比**简报 vs 原始数据,找出**应该收进简报但漏了**的 actionable 信号。\n\n"
+        f"### 算 gap 的标准(必须满足客观可验证)\n"
+        f"- **个股漏**:某 ticker 被 **≥3 个不同 sender** (跨群算) 提及,但简报 🎯/⚡ 都没出现\n"
+        f"- **仓位漏**:实盘校场/某 KOL 发了**具体 entry/stop/target 或仓位调整数字**,但简报 ⚡ 没提\n"
+        f"- **大 V 漏**:prompt.md 跟踪的某大 V 在窗口内发了 actionable 推(具体 ticker / 具体 call / 具体数字),但简报 🎙️ 漏列\n"
+        f"  - 注:Cramer/Schiff 是反指,他们 'actionable' 的方向要 flip 后才算\n"
+        f"- **技术位漏**:**≥2 个群讨论同一大盘点位**(SPY/QQQ/VIX 整数关、长债 yield 等),但简报 📊 没提\n"
+        f"- **宏观漏**:Polymarket 24h 概率剧动 (≥5pp 绝对) + 群里也讨论同一事件,但简报 🏛️ 没体现\n\n"
+        f"### **绝不**算 gap 的\n"
+        f"- 闲聊 / 段子 / 营销内容\n"
+        f"- 单个人单次提到某 ticker\n"
+        f"- '简报已经提了但你觉得应该更详细' — 不是漏\n"
+        f"- 反指 KOL 喊买你觉得没纳入'共识看多' — 那是用户主动 flip 不是 gap\n\n"
+        f"## 输出格式 (严格)\n\n"
+        f"```\n"
+        f"## 审查 {name} ({mode})\n\n"
+        f"### 发现的 gap (N 个)\n"
+        f"\n"
+        f"- **<类型>**: <具体描述,带具体出处 — 群名 / sender / timestamp 或 X handle / 推文 ID>\n"
+        f"  - **建议**: <具体改 prompt.md 的哪一步 / memory.md 的哪一节;用 diff-like 形式描述,如'在 Step 6 的 watchlist 触发条件加: ...'>\n"
+        f"  - **置信度**: <高 / 中 / 低>\n"
+        f"\n"
+        f"### 综合判断\n"
+        f"一句话:这次审查发现的 gap 是 systemic (需要改 prompt) 还是 incidental (这一次的偶然)?\n"
+        f"```\n\n"
+        f"**若无 gap**:直接输出 `## 审查 {name}: 无可执行 gap,本次简报已充分覆盖窗口内信号。`\n\n"
+        f"**约束**:\n"
+        f"- 整体输出 < 1500 字(微信单条上限)\n"
+        f"- 不要写 explanatory 段落、不要寒暄、不要总结改造历史\n"
+        f"- 每个 gap 必须可验证(带具体出处),不允许'感觉漏了 XYZ'这种主观判断\n"
+        f"- gap 数 0-5 个之间;如果 5+ 表示简报真的漏太多,只列最重要的 5 个,在末尾加 `... 还有 N 个未列`"
+    )
+    return await _ask_claude(prompt)
+
+
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
@@ -473,6 +560,7 @@ COMMANDS = {
     "/xfeed": _handle_xfeed,
     "/plan": _handle_plan,
     "/ticker": _handle_ticker,
+    "/critique": _handle_critique,
     "/help": _handle_help,
 }
 
