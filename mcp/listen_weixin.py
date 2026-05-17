@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -251,7 +252,8 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/plan` (从最新 brief 选 top 3) / `/plan TSLA NVDA INTC`\n"
         "  /ticker TICKER     单 ticker 的 X 讨论速读 (cashtag search)\n"
         "                     例: `/ticker SKM` / `/ticker INTC 6h` / `/ticker NVDA 30 top`\n"
-        "  /critique [N]      meta-审查最近简报漏了哪些 gap(轻量版,采样 6 个高信号源,3-5 min)\n"
+        "  /critique [N]      meta-审查最近简报漏了哪些 gap(stratified-random 抽 3 Discord + 3 微信,3-5 min)\n"
+        "                     每次采样不同,多跑几次覆盖全集\n"
         "                     例: `/critique` (最新) / `/critique 2` (n 份前)\n"
         "  /kol_drift         (A) 检测大 V 主战场漂移,>30% 偏离时建议更新描述\n"
         "  /heat [N]          (B) 从最近 N 份简报抽未在 watchlist 的高频 ticker(默认 4 份)\n"
@@ -473,6 +475,48 @@ async def _handle_ticker(text: str = "") -> str:
     return await _ask_claude(prompt)
 
 
+def _parse_monitored_sources() -> tuple[list, list]:
+    """Read prompt.md tables and return (discord, wechat) lists of tuples:
+       discord: [(server / channel name, channel_id), ...]
+       wechat:  [(group name, chatroom_id), ...]
+    Used by /critique to do stratified random sampling so every source
+    eventually gets audited over multiple runs, not just a hardcoded subset.
+    """
+    discord: list[tuple[str, str]] = []
+    wechat: list[tuple[str, str]] = []
+    try:
+        text = PROMPT_MD_PATH.read_text(encoding="utf-8")
+    except Exception as exc:
+        log.warning("could not read prompt.md: %s", exc)
+        return discord, wechat
+
+    section = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("### Discord 频道"):
+            section = "discord"; continue
+        if s.startswith("### 微信群"):
+            section = "wechat"; continue
+        if s.startswith("###") or s.startswith("## "):
+            section = None
+            continue
+        if not section or not s.startswith("|"):
+            continue
+        # Skip header / separator rows
+        if "---" in s or "channel_id" in s or "chatroom_id" in s:
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if section == "discord" and len(cells) >= 3:
+            m = re.match(r"^\d{15,21}$", cells[2])
+            if m:
+                discord.append((f"{cells[0]} / {cells[1]}", cells[2]))
+        elif section == "wechat" and len(cells) >= 2:
+            m = re.match(r"^\d+@chatroom$", cells[1])
+            if m:
+                wechat.append((cells[0], cells[1]))
+    return discord, wechat
+
+
 async def _handle_critique(text: str = "") -> str:
     """Audit the most recent brief for gaps -- signals visible in the raw
     data window but missing from the brief. Reports each gap with a concrete
@@ -509,24 +553,40 @@ async def _handle_critique(text: str = "") -> str:
     else:
         window_s, mode = 5400, "盘后 (90min 窗口)"
 
+    # Stratified random sample: 3 Discord + 3 WeChat per call. Over multiple
+    # /critique runs each source eventually gets covered, vs hardcoded
+    # sampling that would systematically miss the unselected sources' gaps.
+    discord_all, wechat_all = _parse_monitored_sources()
+    sample_d = random.sample(discord_all, min(3, len(discord_all)))
+    sample_w = random.sample(wechat_all, min(3, len(wechat_all)))
+    sample_lines: list[str] = []
+    for i, (name, ch_id) in enumerate(sample_d, 1):
+        sample_lines.append(
+            f"    {i}. Discord「{name}」"
+            f"→ `mcp__discord-selfbot__read_channel_messages(channel_id='{ch_id}', limit=80)` 后过滤 timestamp ≥ since"
+        )
+    for i, (name, room) in enumerate(sample_w, len(sample_d) + 1):
+        sample_lines.append(
+            f"    {i}. 微信「{name}」"
+            f"→ `mcp__chatlog__wx_history(chatroom='{room}', since=since, limit=250)`"
+        )
+    sample_block = "\n".join(sample_lines) if sample_lines else "    (prompt.md 解析失败,fallback 让 Claude 自己读 prompt.md 再采样)"
+    sample_summary = (
+        ", ".join(d[0] for d in sample_d) + " | " +
+        ", ".join(w[0] for w in sample_w)
+    ) if sample_lines else "(无)"
+
     prompt = (
-        f"# 简报质量审查任务(轻量版)\n\n"
-        f"审查最近一份简报有没有漏掉**窗口内可见的明显信号**。**重要**:为了在合理时间内完成,**只采样最高信噪比的源**,不重扫全部 26 个频道/群。这是 trade-off — 会漏一些 gap 但能在 3-5 min 内出结果。如果你发现 critique 频繁漏关键 gap,可以考虑改成定时任务后台跑(那个 ok 跑 10+ min)。\n\n"
+        f"# 简报质量审查任务(stratified-random 采样版)\n\n"
+        f"审查最近一份简报有没有漏掉**窗口内可见的明显信号**。**采样策略**:每次随机抽 3 个 Discord 频道 + 3 个微信群("
+        f"全集 {len(discord_all)} + {len(wechat_all)}),多次 /critique 后每个源都会被审计到。**这次采样**:{sample_summary}\n\n"
         f"## 步骤\n\n"
         f"**步骤 1**:Read 待审简报 `{target}`(模式:{mode})。\n\n"
         f"**步骤 2**:Read 当前的 `{PROMPT_MD_PATH}` 和 `{MEMORY_MD_PATH}`,知道目前哪些群/频道/大V/watchlist 在跟踪 + 用户的真实角度。\n\n"
-        f"**步骤 3**:**采样式**重新拉同窗口的原始数据(不全扫):\n"
-        f"  - 用 `mcp__chatlog__current_time` 拿当前 EDT,**确认简报发布时刻**(`{name}` 时刻),算 since = 那一刻 - {window_s} 秒\n"
-        f"  - **采样 prompt.md 的高信号源**(限 6 个并行调用):\n"
-        f"    a. 大菊观「机构带飞」(channel_id 1434770162573250560)— 研报源,不会漏关键\n"
-        f"    b. 月哥「实盘校场🎖」(channel_id 1359098492462825633)— 实仓位硬信号\n"
-        f"    c. 顺哥「🐦🔥热股热议」(channel_id 1088870436558872587)— 中文短线主流\n"
-        f"    d. 微信群「美股科研小组1」(6219042027@chatroom)— 用 wx_history\n"
-        f"    e. 微信群「📝宏观分析+基本面研究📚」(26072906361@chatroom)\n"
-        f"    f. 微信群「🌊 🌊 🌊」(6228971957@chatroom)\n"
-        f"  - **不拉**:大 V 推 / X search / Polymarket 重扫 — 这些信号简报本身已经在 Phase B 调过,gap 通常在群讨论里\n"
-        f"  - **不拉**其他 7 个 Discord + 10 个微信群 — sample 6 个已经覆盖主要信号面\n\n"
-        f"**步骤 4**:**对比**简报 vs 这 6 个采样源的原始数据,找出**应该收进简报但漏了**的 actionable 信号。\n\n"
+        f"**步骤 3**:用 `mcp__chatlog__current_time` 拿当前 EDT,**确认简报发布时刻**(`{name}` 时刻),算 since = 那一刻 - {window_s} 秒。然后**并行**调用这 6 个采样源(其他源**这次跳过**,下次随机会轮到):\n\n"
+        f"{sample_block}\n\n"
+        f"**不拉**:大 V 推 / X search / Polymarket 重扫 — 这些信号简报本身已在 Phase B 调过;通过 slash command 重扫只徒增 latency,gap 通常在群讨论里。\n\n"
+        f"**步骤 4**:**对比**简报 vs 这 6 个采样源的原始数据,找出**应该收进简报但漏了**的 actionable 信号。**注意采样限制**:本次只覆盖 {len(sample_d)+len(sample_w)} / {len(discord_all)+len(wechat_all)} 个源,未抽中的源的 gap 这次不可见。\n\n"
         f"### 算 gap 的标准(必须满足客观可验证)\n"
         f"- **个股漏**:某 ticker 被 **≥3 个不同 sender** (跨群算) 提及,但简报 🎯/⚡ 都没出现\n"
         f"- **仓位漏**:实盘校场/某 KOL 发了**具体 entry/stop/target 或仓位调整数字**,但简报 ⚡ 没提\n"
