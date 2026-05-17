@@ -108,7 +108,11 @@ SYSTEM_PROMPT = f"""\
   - mcp__polymarket__get_market(id_or_slug)              单个市场详情
   - mcp__polymarket__list_events(query, limit, active_only)  事件列表。事件 = 一组相关市场(比如 "Fed June 会议" 下挂 25bp/50bp/hold 三个子市场)
   - mcp__polymarket__get_event(id_or_slug)               单个事件 + 全部子市场
-  - mcp__polymarket__top_movers(window='1mo', limit)     最近 1 月概率变动最大的市场(Gamma 只暴露 oneMonthPriceChange)。更短窗口的"热度"用 list_markets sort_by=volume24hr
+  - mcp__polymarket__top_movers(window='1mo', limit)     最近 1 月概率变动最大的市场(Gamma 只暴露 oneMonthPriceChange)
+  - mcp__polymarket__get_price_history(id_or_slug, lookback_hours, fidelity_minutes)  单个市场概率时间序列(走 CLOB,可自定义采样)。用来画图或丢给 Claude 自己算
+  - mcp__polymarket__prob_change(id_or_slug, lookback)   任意窗口的概率变化:lookback 用 '15m' / '1h' / '6h' / '24h' / '7d' / '1w' / '1mo' 等。**比 Gamma 的 oneMonthPriceChange 灵活,这是日常用最多的工具**
+  - mcp__polymarket__compute_vol(id_or_slug, lookback_days)  概率 log-return 的年化实现波动率。注意不是 BS-IV(Polymarket 不是期权),解读为"市场分歧度":高 = 还在博弈,低 = 共识(或薄流动性)
+  - mcp__polymarket__short_movers(window_hours, limit, scan_size)  真正的短窗口 movers (1h/24h/7d 都行)。代价:扫 scan_size 个市场各拉 history,5-15s/次,别频繁调
   - WebFetch / WebSearch                                  通用网页(非 X)
   - mcp__chatlog__current_time                            当前美东时间
   - Read / Edit / Write                                   读写本机文件(包括 prompt.md 配置)
