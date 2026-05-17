@@ -48,9 +48,11 @@ from gateway.platforms.weixin import (
     _api_post,
     _base_info,
     _extract_text,
+    _get_config,
     _load_sync_buf,
     _make_ssl_connector,
     _save_sync_buf,
+    _send_typing,
     send_weixin_direct,
 )
 
@@ -72,6 +74,14 @@ START_TIME = time.monotonic()
 GET_UPDATES_TIMEOUT_MS = 30_000
 LONG_POLL_RETRY_BACKOFF_S = 5.0
 CLAUDE_TIMEOUT_S = 600  # 10 min; long enough for MCP-heavy answers
+
+# Experimental: periodically ping iLink with a typing indicator (status=1
+# then immediately status=0) to test whether the typing endpoint refreshes
+# the outbound send-session enough to avoid needing the user to touch the
+# bot daily. Set to 0 to disable. Cheap and zero-quota (typing is its own
+# endpoint, not sendmessage). Logs are tagged 'keepalive:' so we can
+# correlate keepalive activity with successful tokenless pushes later.
+KEEPALIVE_INTERVAL_S = int(os.environ.get("KEEPALIVE_INTERVAL_S", "1800"))  # 30 min
 
 # Cross-platform: PROMPT_MD_PATH is the absolute path the configuration-
 # management mode will Read/Edit. Defaults to ~/Scripts/market-brief/prompt.md
@@ -544,6 +554,67 @@ async def _handle_message(creds: dict, message: dict) -> None:
     log.info("replied: %r", reply[:120])
 
 
+async def _fetch_typing_ticket(session, creds) -> str | None:
+    """Best-effort getconfig -> typing_ticket. None on any failure."""
+    try:
+        resp = await _get_config(
+            session,
+            base_url=creds["base_url"],
+            token=creds["token"],
+            user_id=creds["home_channel"],
+            context_token=None,
+        )
+    except Exception as exc:
+        log.warning("keepalive: getconfig failed: %s", exc)
+        return None
+    if resp.get("ret") not in (0, None):
+        log.warning("keepalive: getconfig ret=%s msg=%s",
+                    resp.get("ret"), resp.get("errmsg"))
+        return None
+    ticket = str(resp.get("typing_ticket") or "")
+    return ticket or None
+
+
+async def _keepalive_loop(creds, session) -> None:
+    """Periodically send a typing start+stop pair to user's chat. Hypothesis:
+    iLink treats typing pings as activity that keeps the outbound session
+    fresh without consuming sendmessage quota. Status=1 then 0 within 200ms
+    so the user never visibly sees a lingering 'typing...' indicator.
+
+    First fire after one full interval (not at startup) so a daemon restart
+    doesn't immediately ping. Wrapped in broad try/except: this is a
+    best-effort experiment, must not crash the listener.
+    """
+    if KEEPALIVE_INTERVAL_S <= 0:
+        log.info("keepalive: disabled (KEEPALIVE_INTERVAL_S=0)")
+        return
+    log.info("keepalive: typing-ping every %d s to %s",
+             KEEPALIVE_INTERVAL_S, creds["home_channel"][:8] + "…")
+    try:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_S)
+            ticket = await _fetch_typing_ticket(session, creds)
+            if not ticket:
+                log.warning("keepalive: no typing_ticket -- skipping this round")
+                continue
+            try:
+                await _send_typing(
+                    session, base_url=creds["base_url"], token=creds["token"],
+                    to_user_id=creds["home_channel"], typing_ticket=ticket, status=1,
+                )
+                await asyncio.sleep(0.2)
+                await _send_typing(
+                    session, base_url=creds["base_url"], token=creds["token"],
+                    to_user_id=creds["home_channel"], typing_ticket=ticket, status=0,
+                )
+                log.info("keepalive: typing-ping OK")
+            except Exception as exc:
+                log.warning("keepalive: typing-ping send failed: %s", exc)
+    except asyncio.CancelledError:
+        log.info("keepalive: cancelled (listener shutting down)")
+        raise
+
+
 async def main_loop() -> int:
     creds = _creds()
     missing = [k for k in ("account_id", "token", "home_channel") if not creds[k]]
@@ -557,41 +628,49 @@ async def main_loop() -> int:
     sync_buf = _load_sync_buf(str(HERMES_HOME), creds["account_id"]) or ""
 
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
-        while True:
-            try:
-                resp = await _api_post(
-                    session,
-                    base_url=creds["base_url"],
-                    endpoint=EP_GET_UPDATES,
-                    payload={"get_updates_buf": sync_buf},
-                    token=creds["token"],
-                    timeout_ms=GET_UPDATES_TIMEOUT_MS,
-                )
-            except asyncio.TimeoutError:
-                continue   # normal: long-poll timed out idle, just loop
-            except Exception as exc:
-                log.warning("get_updates error: %s — backing off %.1fs",
-                            exc, LONG_POLL_RETRY_BACKOFF_S)
-                await asyncio.sleep(LONG_POLL_RETRY_BACKOFF_S)
-                continue
-
-            ret = resp.get("ret", 0)
-            if ret and ret != 0:
-                log.warning("get_updates ret=%s msg=%s", ret, resp.get("errmsg"))
-                await asyncio.sleep(LONG_POLL_RETRY_BACKOFF_S)
-                continue
-
-            msgs = resp.get("msgs") or []
-            new_buf = resp.get("get_updates_buf") or sync_buf
-            if new_buf != sync_buf:
-                sync_buf = new_buf
-                _save_sync_buf(str(HERMES_HOME), creds["account_id"], sync_buf)
-
-            for m in msgs:
+        keepalive_task = asyncio.create_task(_keepalive_loop(creds, session))
+        try:
+            while True:
                 try:
-                    await _handle_message(creds, m)
-                except Exception:
-                    log.exception("handler crashed on message")
+                    resp = await _api_post(
+                        session,
+                        base_url=creds["base_url"],
+                        endpoint=EP_GET_UPDATES,
+                        payload={"get_updates_buf": sync_buf},
+                        token=creds["token"],
+                        timeout_ms=GET_UPDATES_TIMEOUT_MS,
+                    )
+                except asyncio.TimeoutError:
+                    continue   # normal: long-poll timed out idle, just loop
+                except Exception as exc:
+                    log.warning("get_updates error: %s — backing off %.1fs",
+                                exc, LONG_POLL_RETRY_BACKOFF_S)
+                    await asyncio.sleep(LONG_POLL_RETRY_BACKOFF_S)
+                    continue
+
+                ret = resp.get("ret", 0)
+                if ret and ret != 0:
+                    log.warning("get_updates ret=%s msg=%s", ret, resp.get("errmsg"))
+                    await asyncio.sleep(LONG_POLL_RETRY_BACKOFF_S)
+                    continue
+
+                msgs = resp.get("msgs") or []
+                new_buf = resp.get("get_updates_buf") or sync_buf
+                if new_buf != sync_buf:
+                    sync_buf = new_buf
+                    _save_sync_buf(str(HERMES_HOME), creds["account_id"], sync_buf)
+
+                for m in msgs:
+                    try:
+                        await _handle_message(creds, m)
+                    except Exception:
+                        log.exception("handler crashed on message")
+        finally:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 if __name__ == "__main__":
