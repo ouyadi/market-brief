@@ -56,6 +56,17 @@
 
 需要增删:在微信(若启用 listener)发"大 V 加 cathiedwood, jimcramer"等,listener 会按配置管理流程改本表。删除这一节(连同表头)即可禁用大 V 追踪。
 
+### 个股 watchlist(可选,通过 `mcp__twitter__search_tweets` cashtag 拉)
+
+morning-brief 在 Step 4e 自动 `search query='$TICKER' mode='live'` 抓过去窗口内的 X 讨论。有强信号 (N+ 条 actionable / 独家 catalyst / 大 V 提及) 就吸进 ⚡ 高优先级 或 🎯 个股共识 sections;无信号 skip。
+
+| Ticker | 关注理由 |
+|---|---|
+| <TICKER> | <一句话: 为何跟踪 -- 财报临近 / 长持 / 卖空候选 / 等> |
+| ... | ... |
+
+加/删用户在微信发"个股加 SKM, INTC, NVDA"或"个股删 SKM",listener 按配置管理流程修改本表。删除整节即可禁用 watchlist 富化。
+
 ## 流程
 
 1. **拿时间 + 确定模式**：调 `mcp__chatlog__current_time`。提取 EDT 小时 HH，按上面"时段感知"规则确定模式与 since（24h 或 90min）。
@@ -72,6 +83,8 @@
    - 盘前模式: limit=20(过去 12 小时大多有新内容)
    - 盘中/盘后模式: limit=8,然后**过滤掉**早于当前扫描窗口 `since` 的推(多数大 V 该窗口内没新推就忽略,不输出他)
    失败的 handle 在简报标"数据源缺失:大 V @xxx"。
+
+4e. **个股 watchlist 富化**(如果 `mcp__twitter__search_tweets` 可用 + `### 个股 watchlist` 表有条目):对每个 ticker 并行调 `mcp__twitter__search_tweets(query='$TICKER', limit=10, mode='live')`。过滤掉早于 since 的推。窗口内 ≥3 条 actionable (specific call / catalyst / volume spike 讨论):**吸进 `## ⚡ 高优先级关注` 或 `## 🎯 个股共识/新动向` sections**,标注"(watchlist)"。无信号则 skip。watchlist ticker 是 user explicit 关注的,优先级**高于**群里普通讨论。
 
 5c. **可执行方案富化**(仅**盘前模式**,且 `mcp__stock-price__*` 和 `mcp__twitter__*` 工具都可用时):从前面收集的群讨论 / 机构研报 / 大 V 推 里挑出 **Top 3 setup**,对每个 ticker 并行调:
    - `mcp__stock-price__get_quote(ticker)` — 当前价 + day high/low + 52w range + market cap

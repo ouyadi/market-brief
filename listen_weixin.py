@@ -100,18 +100,20 @@ SYSTEM_PROMPT = """\
 
 # 配置管理模式(关键)
 
-当用户的请求落到这些意图(关键词:**加进监控 / 加到列表 / 删群 / 移除 / 不要监控 / 更新监控群列表 / 把 X 加到简报 / 大 V 加 / 大 V 删 / 大 V 列表 / 跟踪 X 用户**)时,**直接动手改文件,不要问澄清**:
+当用户的请求落到这些意图(关键词:**加进监控 / 加到列表 / 删群 / 移除 / 不要监控 / 更新监控群列表 / 把 X 加到简报 / 大 V 加 / 大 V 删 / 大 V 列表 / 跟踪 X 用户 / 个股加 / 个股删 / 个股列表 / 加追踪 / 跟踪个股 / watchlist**)时,**直接动手改文件,不要问澄清**:
 
 监控配置文件: `C:\\Users\\ouyad\\Scripts\\market-brief\\prompt.md`
   - 微信群在 `### 微信群` 节,表格行格式: `| 群名 | chatroom_id |`
   - Discord 频道在 `### Discord 频道` 节,行格式: `| 服务器 | 频道 | channel_id |`
   - **大 V X 账号在 `### 大 V X 账号` 节**,行格式: `| 大 V 显示名 | X handle (without @) | 主战场 |`
+  - **个股 watchlist 在 `### 个股 watchlist` 节**,行格式: `| Ticker | 关注理由 |` (ticker 大写,不带 `$`)
 
 操作流程:
   1. **找 ID** (微信/Discord):
      - 微信群: 调 `mcp__chatlog__wx_sessions` 拉全表,然后按用户给的关键词做 substring 匹配。匹配到唯一群 → 直接用它的 chatroom_id。匹配到多个 → 把候选列出让用户选(只这种情况才问澄清)。
      - Discord: 调 `mcp__discord-selfbot__list_channels` 同理。
   2. **找 handle** (大 V): 用户给的就是 X handle(可能带或不带 `@`,strip 掉)。可选用 `mcp__twitter__fetch_user_tweets(username=...)` 试一下确认 handle 存在 + 顺便记录"主战场"一句话描述。
+     **找 ticker** (个股): 大写 1-5 字母 ASCII (strip 掉前导 `$`)。用户加 ticker 时也带一句话理由 (财报临近 / 长持 / 卖空候选 / 等);若用户没给理由,自己根据 `mcp__stock-price__get_info(ticker)` 抓 sector + market cap 写一句简短的。
   3. **改文件**: Read `prompt.md` 找到对应表格末尾,Edit 插入新行(保持表格对齐)。
   4. **删行**: Edit 把整行替换成空字符串(精确匹配 group/handle 关键字)。
   5. **报告**: 改完一句话总结,例如 "已加 3 群..." 或 "已加 2 个大 V: cathiedwood, jimcramer"。**不要打印 prompt.md 全文**。
@@ -193,6 +195,8 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/xfeed` / `/xfeed for_you` / `/xfeed following 25`\n"
         "  /plan [tickers]    可执行方案(stock-price + X live news 富化)\n"
         "                     例: `/plan` (从最新 brief 选 top 3) / `/plan TSLA NVDA INTC`\n"
+        "  /ticker TICKER     单 ticker 的 X 讨论速读 (cashtag search)\n"
+        "                     例: `/ticker SKM` / `/ticker INTC 6h` / `/ticker NVDA 30 top`\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -356,12 +360,65 @@ async def _handle_plan(text: str = "") -> str:
     return await _ask_claude(intro + body)
 
 
+async def _handle_ticker(text: str = "") -> str:
+    """
+    Ad-hoc X discussion for a single ticker (cashtag search).
+      /ticker SKM            default: $SKM, past 24h, 15 live tweets
+      /ticker SKM 6h         past 6h
+      /ticker SKM 30         30 tweets
+      /ticker SKM 6h top     'top' (engagement) mode instead of 'live'
+    """
+    args = text.split()[1:]
+    if not args:
+        return ("用法: /ticker TICKER [Xh] [N] [top|live]\n"
+                "例: /ticker SKM\n"
+                "    /ticker INTC 6h\n"
+                "    /ticker NVDA 30 top")
+
+    ticker = args[0].upper().lstrip("$")
+    if not re.match(r"^[A-Z]{1,5}$", ticker):
+        return f"无效 ticker: {args[0]!r} (应是 1-5 字母 ASCII,比如 SKM/INTC/NVDA)"
+
+    window = "24h"
+    limit = 15
+    mode = "live"
+    for a in args[1:]:
+        a_low = a.lower()
+        if re.match(r"^\d+h$", a_low):
+            window = a_low
+        elif a_low.isdigit():
+            limit = max(1, min(30, int(a_low)))
+        elif a_low in ("top", "live"):
+            mode = a_low
+
+    prompt = (
+        f"步骤 1: `mcp__chatlog__current_time` 拿当前 EDT。\n"
+        f"步骤 2: `mcp__twitter__search_tweets query='${ticker}' limit={limit} mode='{mode}'`。\n"
+        f"步骤 3: 过滤出过去 {window} 内的推(`posted_at` 对比 since=now-{window})。\n"
+        f"步骤 4: 输出中文 markdown:\n\n"
+        f"## ${ticker} X 讨论(过去 {window} × mode={mode})\n\n"
+        f"### 📈 主流情绪\n"
+        f"一句话:看多/看空/分歧/中性 + 大致比例\n\n"
+        f"### 🗣️ Top 5 信息量推\n"
+        f"按 retweet/like 隐含信号 + 内容独家性排序,每条:\n"
+        f"- `HH:MM @user`: 原文 (<100 字) — 一句话解读(catalyst/level/事件)\n\n"
+        f"### ⚠️ 红旗 (如有)\n"
+        f"shill / pumper / spam account / pre-IPO 投机迹象。无则 skip 整节。\n\n"
+        f"### 💡 综合判断\n"
+        f"Claude 给一句话:现在是否值得关注?偏多还是偏空?最重要 catalyst 是什么?\n\n"
+        f"如果窗口内 0 条:回 '${ticker} 过去 {window} 在 X 上无讨论'.\n"
+        f"输出 < 1500 字。"
+    )
+    return await _ask_claude(prompt)
+
+
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
     "/dv": _handle_dv,
     "/xfeed": _handle_xfeed,
     "/plan": _handle_plan,
+    "/ticker": _handle_ticker,
     "/help": _handle_help,
 }
 
