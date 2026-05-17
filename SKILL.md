@@ -453,6 +453,54 @@ without explicit user re-consent — main-account ban risk.
 - `~/twitter-mcp/logs/twitter_mcp.log` — structured wrapper log (tool calls)
 - `~/twitter-mcp/logs/twitter-mcp.YYYY-MM-DD.{out,err}.log` — daemon wrapper PowerShell stdout/stderr
 
+### Step 11 — Optional: Stock price MCP via yfinance
+
+Skip if the user only cares about chat-group intel without quantitative
+price/fundamentals overlay. Otherwise this is the cheapest of the optional
+MCPs to install (no auth, no Defender path) and unlocks the **enriched ⚡
+section in pre-market briefs** (Step 5c in prompt.md) plus the **/plan**
+slash command.
+
+```powershell
+# 1. Install yfinance + mcp into the existing hermes-agent venv
+$venvPy = "C:\Users\$env:USERNAME\hermes-agent\.venv\Scripts\python.exe"
+& $venvPy -m pip install yfinance mcp
+
+# 2. Copy MCP wrapper + installer into ~/stock-mcp
+$dst = "$env:USERPROFILE\stock-mcp"
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+Copy-Item .\stock_price_mcp.py "$dst\"
+Copy-Item .\install-stock-mcp.ps1 "$dst\"
+
+# 3. Register as scheduled task (At log on, hidden window)
+& "$dst\install-stock-mcp.ps1"
+Start-ScheduledTask -TaskName StockPriceMCP
+
+# 4. Register with claude
+claude mcp add --transport http --scope user stock-price http://127.0.0.1:3032/mcp
+claude mcp list   # should show 'stock-price ✓ Connected'
+```
+
+Smoke test:
+
+```powershell
+# In a shell with CLAUDE_CODE_OAUTH_TOKEN loaded
+"用 mcp__stock-price__get_quote ticker='NVDA'" | claude --print --dangerously-skip-permissions
+# expected: NVDA price + 52w range + market cap
+```
+
+Tools exposed:
+- `get_quote(ticker)` — current snapshot
+- `get_history(ticker, period, interval)` — OHLCV bars (caps 50 most recent)
+- `get_info(ticker)` — sector / forward_pe / next_earnings_date / dividend / MAs
+- `check_post_hoc(ticker, at_time, horizon)` — event-study micro: at a tweet/message timestamp + N-period horizon, returns price-at-time, max gain/drawdown, net move. **Use to grade KOL/group call accuracy**.
+
+Caveats:
+- yfinance scrapes Yahoo Finance, so high-freq calls (>10/min sustained)
+  may hit transient rate limits. Hourly market-brief usage is fine.
+- Does NOT hit the Defender file-visibility issue that Playwright did —
+  pure HTTP, no browser binary.
+
 ---
 
 ## Operational cheat sheet (give to user)
@@ -483,6 +531,36 @@ Get-Content $env:USERPROFILE\.hermes\.env
 
 # Stop the schedule
 Unregister-ScheduledTask -TaskName MarketBrief -Confirm:$false
+```
+
+### Slash commands (via the listener in WeChat)
+
+After the listener is up (Step 9), the user can DM the bot from WeChat with:
+
+| Command | What it does |
+|---|---|
+| `/ping` | Check listener is alive |
+| `/brief` | Trigger one `MarketBrief` run immediately |
+| `/dv [handle] [Nh]` | KOL digest. `/dv` = all KOLs × 2h; `/dv cathiedwood 24h` = single handle, custom window |
+| `/xfeed [tab] [N]` | X home timeline brief. `/xfeed` = For You + Following each 15; `/xfeed for_you`; `/xfeed following 25` |
+| `/plan [tickers]` | Enriched execution plan (stock-price + X live news + tech levels + entry/stop/target). `/plan` = top 3 from latest brief; `/plan TSLA NVDA` = specific tickers |
+| `/ticker TICKER [Nh] [top\|live]` | Single-ticker X discussion via cashtag. `/ticker SKM 6h` / `/ticker NVDA 30 top` |
+| `/help` | List all commands |
+| (any other text) | Free-form question → Claude with full MCP access |
+
+Config management (also via WeChat, free-form):
+- `加进监控 群名,...` / `删群 群名` — manages the WeChat group / Discord channel tables in `prompt.md`
+- `大 V 加 handle,...` / `大 V 删 handle` — manages the KOL table
+- `个股加 SKM, INTC, NVDA` / `个股删 SKM` — manages the watchlist
+Listener Claude does the wx_sessions / list_channels / fetch_user_tweets / get_info lookups + edits `prompt.md` itself.
+
+### MCPs registered at the end
+
+```text
+chatlog           http://127.0.0.1:5030/mcp   WeChat chat history (from chat-mcp-setup)
+discord-selfbot   http://127.0.0.1:6280/mcp   Discord channel history (from chat-mcp-setup)
+twitter           http://127.0.0.1:3031/mcp   X/Twitter via Playwright + cookies (Step 10)
+stock-price       http://127.0.0.1:3032/mcp   yfinance: quote/history/info/check_post_hoc (Step 11)
 ```
 
 ---

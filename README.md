@@ -96,6 +96,33 @@ cookie export, (b) uses your main X account — cookies live in
 
 ## Install
 
+### Quickstart (`quickstart.ps1` — recommended)
+
+After you've already run [chat-mcp-setup](https://github.com/ouyadi/mcp-chat-skills/tree/main/skills/chat-mcp-setup)
+(provides the `chatlog` + `discord-selfbot` MCP servers — see Prerequisites
+below):
+
+```powershell
+# 1. Clone this repo
+git clone https://github.com/ouyadi/market-brief.git $env:USERPROFILE\market-brief
+
+# 2. One command — installer walks through 7 idempotent phases
+cd $env:USERPROFILE\market-brief
+powershell -NoProfile -ExecutionPolicy Bypass -File .\quickstart.ps1
+```
+
+Phases:
+1. Prereq checks (Python 3.11, Chrome, claude CLI, chatlog/discord daemons)
+2. Python venv at `~/hermes-agent` + install all MCP deps + Playwright Chromium
+3. Copy runtime files to `~/Scripts/market-brief`, `~/twitter-mcp`, `~/stock-mcp`
+4. **Pause** for manual steps: fill `secrets.json`, edit `prompt.md` groups, scan iLink QR, extract X cookies
+5. Register 4 scheduled tasks (`MarketBrief`, `WeixinListener`, `TwitterMCP`, `StockPriceMCP`)
+6. Start daemons + `claude mcp add` the HTTP MCPs
+7. Optional smoke test (one `run.ps1 -SkipEmail`)
+
+Re-run anytime to resume (each phase auto-detects "already done"). Skip
+phases with `-SkipPhase 1,7` etc. Dry-run with `-DryRun`.
+
 ### As a Claude Code skill (Claude drives the install)
 
 On a Windows machine where you've already run [chat-mcp-setup](https://github.com/ouyadi/mcp-chat-skills/tree/main/skills/chat-mcp-setup)
@@ -174,6 +201,7 @@ written linearly for a human operator.
 | [`install-stock-mcp.ps1`](install-stock-mcp.ps1) | Registers `StockPriceMCP` task |
 | [`secrets.example.json`](secrets.example.json) | Template for `secrets.json` (OAuth + Gmail) |
 | [`hermes-py.ps1`](hermes-py.ps1) | Legacy wrapper kept for emergency fallback |
+| [`quickstart.ps1`](quickstart.ps1) | **One-command installer** — 7 idempotent phases (prereqs, venv, copy files, interactive setup, scheduled tasks, daemons + MCP register, smoke test) |
 
 After install on your machine, `secrets.json` and your personalized `prompt.md`
 (with your actual group IDs) will exist locally but are gitignored — never
