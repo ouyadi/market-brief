@@ -19,8 +19,9 @@
 # Skip specific phases with: SKIP_PHASES="1 7" bash quickstart-mac.sh
 #
 # Caveat: chatlog (WeChat 4.x reader) is the only piece this script CANNOT
-# install -- it's in this repo's chat-mcp-setup/ subdir (formerly the separate ouyadi/mcp-chat-skills repo
-# skill, host/macos path). Phase 1 only checks that chatlog daemon is up.
+# install -- it's in this repo's chat-mcp-setup/ subdir (host/macos path),
+# scrubbed mirror of the maintainer's private ouyadi/mcp-chat-skills repo.
+# Phase 1 only checks that chatlog daemon is up.
 
 set -euo pipefail
 
