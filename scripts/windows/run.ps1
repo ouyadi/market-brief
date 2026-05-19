@@ -53,6 +53,36 @@ function Log {
     Write-Host $line
 }
 
+function Log-CodexOutput {
+    param(
+        [object[]] $Lines,
+        [int] $ExitCode,
+        [string] $LastMessageFile
+    )
+    $lineArray = @($Lines | ForEach-Object { [string]$_ })
+    if ($ExitCode -ne 0) {
+        Log "    [codex] exited $ExitCode; output tail follows"
+        foreach ($line in ($lineArray | Select-Object -Last 120)) {
+            Log "    [codex] $line"
+        }
+        return
+    }
+
+    $warningCount = @($lineArray | Where-Object { $_ -match '\bWARN\b|warning|failed to load plugin|Cloudflare|challenge' }).Count
+    $reportLines = @($lineArray | Where-Object { $_ -match 'REPORT_WRITTEN|tokens used|ERROR:' })
+    foreach ($line in $reportLines) {
+        Log "    [codex] $line"
+    }
+    if ($warningCount -gt 0) {
+        Log "    [codex] suppressed $warningCount startup warning/log line(s)"
+    }
+    if (Test-Path $LastMessageFile) {
+        foreach ($line in (Get-Content -Encoding UTF8 $LastMessageFile)) {
+            Log "    [codex-final] $line"
+        }
+    }
+}
+
 # Rotate out any pre-existing log file that's UTF-16 (from older Tee-Object
 # code) -- mixing encodings makes the log unreadable.
 if (Test-Path $logFile) {
@@ -172,13 +202,8 @@ if ($backend -eq "codex" -or $backend -eq "gpt" -or $backend -eq "openai") {
     $codexArgs += "-"
     $llmOut = $prompt | & codex @codexArgs 2>&1
     $llmExit = $LASTEXITCODE
-    if ($llmOut) {
-        foreach ($line in $llmOut) { Log "    [codex] $line" }
-    }
-    if (Test-Path $lastMessageFile) {
-        foreach ($line in (Get-Content -Encoding UTF8 $lastMessageFile)) { Log "    [codex-final] $line" }
-        Remove-Item $lastMessageFile -ErrorAction SilentlyContinue
-    }
+    Log-CodexOutput -Lines $llmOut -ExitCode $llmExit -LastMessageFile $lastMessageFile
+    Remove-Item $lastMessageFile -ErrorAction SilentlyContinue
 } elseif ($backend -eq "claude") {
     $llmOut = $prompt | & claude `
         --print `
