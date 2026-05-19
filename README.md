@@ -278,7 +278,24 @@ brief 出来时已经知道:
 - **`/score [Nd] [hzn]`** — ⚡ setup 命中率统计
 - **`/reflect [Nd]`** — 自我检讨 ≥2 次重复出现的运行经验,沉淀到 memory.md(正向 / 负向 / 淘汰)
 
+Phase 2a scheduler 会在工作日晚 23:10 自动轮转跑一个 meta 命令,只生成待审 proposal,**绝不自动 apply**:
+
+| Day | Command |
+|---|---|
+| Mon | `/score 14d 3d` |
+| Tue | `/heat 8` |
+| Wed | `/critique` |
+| Thu | `/kol_drift` |
+| Fri | `/reflect 7d` |
+
 每个 slash 输出存 `~/Scripts/market-brief/last_<cmd>.md`,让后续"按上次建议加"这种 follow-up 能跨消息引用上次内容(每条微信消息是 fresh `claude --print` session,无内置记忆)。
+
+proposal 审核命令:
+- **`/proposals [Nd]`** — 列待审 proposal
+- **`/show <id>`** — 看完整内容 + diff preview
+- **`/apply <id>`** — 只对白名单 section 自动落盘
+- **`/reject <id>`** — 丢弃
+- **`/rollback memory.md|prompt.md`** — 回滚最近一次 apply
 
 **memory.md 5 节**(模板见 [`config/memory.template.md`](config/memory.template.md)):
 1. 信号优先级金字塔(期权市场定价 > Polymarket > 大V 跨源 > 群里多次 > 单条)

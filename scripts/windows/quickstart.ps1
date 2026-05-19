@@ -171,11 +171,17 @@ function Phase3-CopyFiles {
         @{Dir=$WIN_SCRIPTS; Name='schedule-install.ps1'},
         @{Dir=$WIN_SCRIPTS; Name='run-listener.ps1'},
         @{Dir=$WIN_SCRIPTS; Name='install-listener.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='run-selfevolve.ps1'},
+        @{Dir=$WIN_SCRIPTS; Name='install-selfevolve-scheduler.ps1'},
         @{Dir=$WIN_SCRIPTS; Name='hermes-py.ps1'},
         @{Dir=$WIN_SCRIPTS; Name='run-hidden.vbs'},   # no-flash launcher used by schedule-install.ps1 + install-listener.ps1
         @{Dir=$MCP_DIR;     Name='push_weixin.py'},
         @{Dir=$MCP_DIR;     Name='qr_login_bootstrap.py'},
         @{Dir=$MCP_DIR;     Name='listen_weixin.py'},
+        @{Dir=$MCP_DIR;     Name='selfevolve.py'},
+        @{Dir=$MCP_DIR;     Name='applier.py'},
+        @{Dir=$MCP_DIR;     Name='selfevolve_scheduler.py'},
+        @{Dir=$MCP_DIR;     Name='discord_image_ocr.py'},
         @{Dir=$CONFIG_DIR;  Name='secrets.example.json'}
     )
     foreach ($f in $marketFiles) {
@@ -331,6 +337,11 @@ function Phase5-Tasks {
     Info "registering WeixinListener task (At log on)"
     Run { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $SCRIPTS_DIR 'install-listener.ps1') | Out-Null } "install-listener.ps1"
     Ok "WeixinListener registered"
+
+    # SelfEvolveScheduler
+    Info "registering SelfEvolveScheduler task (weekdays 23:10)"
+    Run { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $SCRIPTS_DIR 'install-selfevolve-scheduler.ps1') | Out-Null } "install-selfevolve-scheduler.ps1"
+    Ok "SelfEvolveScheduler registered"
 
     # TwitterMCP (skip if no .env)
     $twEnv = Join-Path $TWITTER_DIR '.env'
