@@ -303,6 +303,7 @@ brief 出来时已经知道:
 
 - **Windows 上别用 uv 管理的 Python 装 Hermes Agent** —— Defender 实测会隔离 astral-sh 的 Python 分发版,venv 一启动就报 `No Python at …`。改用 `winget install Python.Python.3.11`。SKILL.md / SETUP-GUIDE.md 详细写了。
 - **Pillow 必装,Hermes Agent 不会自动拉** —— 否则 QR 扫码步骤崩 `ModuleNotFoundError: PIL`。venv 里 `pip install Pillow`。
+- **Discord 图片 OCR 依赖两层都要装** —— 系统层 `winget install --id tesseract-ocr.tesseract --source winget`,venv 层 `pip install pytesseract`。中文截图还需要 `~/Scripts/market-brief/tessdata/chi_sim.traineddata`;worker 会优先用这个本地 tessdata 目录,避免计划任务拿不到系统 PATH。
 - **iLink session quota**:历史上每 session ~10 条 outbound 后耗尽,需要人扫码或在微信回 bot 一句。**Hermes 已自动 tokenless retry**(`ret=-14` 触发后透明地降级 send,实测 30+ 天 0 失败),加上本仓 listener 的 typing-ping keepalive,日常 100% 通过率,你基本不用管。
 - **iLink token 长期过期**(几个月一次):重跑 `qr_login_bootstrap.py` 扫码,无法自动化。
 - **chatlog 是 TUI 应用**,只能 minimized 不能完全 hidden(没 console 它直接 crash)。其他所有任务都已通过 `wscript+VBS` 改成零窗口闪烁。

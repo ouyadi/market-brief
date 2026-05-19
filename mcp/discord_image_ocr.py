@@ -21,6 +21,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -35,6 +36,7 @@ from PIL import Image
 
 DEFAULT_MCP_URL = "http://127.0.0.1:6280/mcp"
 DEFAULT_CACHE_DIR = Path.home() / "Scripts" / "market-brief" / "vision_cache"
+DEFAULT_TESSDATA_DIR = Path.home() / "Scripts" / "market-brief" / "tessdata"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 TICKER_RE = re.compile(r"(?<![A-Z0-9])\$?([A-Z]{1,5})(?![A-Z0-9])")
 COMMON_WORDS = {
@@ -372,8 +374,17 @@ def run_ocr(image_path: Path, backend: str) -> tuple[str, str, str]:
         return "none", "", "No OCR backend installed (pytesseract/tesseract unavailable)"
 
     try:
+        tesseract_cmd = shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if Path(tesseract_cmd).exists():
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        lang = "eng"
+        config = ""
+        if DEFAULT_TESSDATA_DIR.exists():
+            config = f"--tessdata-dir {DEFAULT_TESSDATA_DIR}"
+            if (DEFAULT_TESSDATA_DIR / "chi_sim.traineddata").exists():
+                lang = "chi_sim+eng"
         with Image.open(image_path) as img:
-            text = pytesseract.image_to_string(img, lang="chi_sim+eng")
+            text = pytesseract.image_to_string(img, lang=lang, config=config)
         return "tesseract", text.strip(), ""
     except Exception as exc:
         return "tesseract", "", str(exc)
