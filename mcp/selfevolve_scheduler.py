@@ -92,10 +92,15 @@ def setup_logging() -> logging.Logger:
 log = setup_logging()
 
 
-def scrub_env_and_load_token() -> None:
+def prepare_llm_env() -> None:
     for name in ENV_TO_STRIP:
         os.environ.pop(name, None)
     os.environ["PYTHONUTF8"] = "1"
+    backend = (os.environ.get("MARKET_BRIEF_LLM_BACKEND") or "codex").strip().lower()
+    os.environ["MARKET_BRIEF_LLM_BACKEND"] = backend
+    if backend != "claude":
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        return
     if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         return
     secrets_path = SCRIPTS_DIR / "secrets.json"
@@ -156,7 +161,7 @@ def choose_command(command: str, now: datetime) -> tuple[str | None, str]:
 
 def within_market_window(now: datetime) -> bool:
     # MarketBrief is scheduled hourly 08:00-22:00. Phase 2a runs after the last
-    # brief to avoid competing for MCPs / Claude.
+    # brief to avoid competing for MCPs / the LLM backend.
     return 8 <= now.hour < 23
 
 
@@ -288,7 +293,7 @@ async def async_main(args: argparse.Namespace) -> int:
         print(f"DRY_RUN: would run {command_text} ({reason}; {cooldown_reason})")
         return 0
 
-    scrub_env_and_load_token()
+    prepare_llm_env()
     before = pending_ids()
     log.info("running %s (%s; %s)", command_text, reason, cooldown_reason)
     result = await run_selfevolve_command(command_text)

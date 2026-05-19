@@ -1,11 +1,12 @@
 # run-listener.ps1 -- start listen_weixin.py with the right env scrubbed in.
-# Same shape as run.ps1's auth/env section, just for the long-running listener.
+# Defaults to Codex/GPT; set MARKET_BRIEF_LLM_BACKEND=claude to use Claude CLI.
 
 $ErrorActionPreference = "Stop"
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $here     = Split-Path -Parent $MyInvocation.MyCommand.Path
+$backend  = if ($env:MARKET_BRIEF_LLM_BACKEND) { $env:MARKET_BRIEF_LLM_BACKEND.ToLowerInvariant() } else { "codex" }
 # Allow power users to point at a non-default venv via $env:HERMES_VENV.
 $venvPy   = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
             else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
@@ -14,7 +15,6 @@ $secrets  = Join-Path $here 'secrets.json'
 
 if (-not (Test-Path $venvPy))   { Write-Error "venv python missing at $venvPy"; exit 2 }
 if (-not (Test-Path $listener)) { Write-Error "listen_weixin.py missing at $listener"; exit 2 }
-if (-not (Test-Path $secrets))  { Write-Error "secrets.json missing at $secrets"; exit 2 }
 
 # Strip Claude Desktop-injected env vars that would break the npm CLI 405-style.
 @(
@@ -35,12 +35,19 @@ if (-not (Test-Path $secrets))  { Write-Error "secrets.json missing at $secrets"
     'CLAUDECODE'
 ) | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
 
-$cfg = Get-Content -Raw $secrets | ConvertFrom-Json
-if (-not $cfg.claudeCodeOauthToken) {
-    Write-Error "secrets.json missing claudeCodeOauthToken -- run 'claude setup-token'"
-    exit 2
+if ($backend -eq "claude") {
+    if (-not (Test-Path $secrets))  { Write-Error "secrets.json missing at $secrets"; exit 2 }
+    $cfg = Get-Content -Raw $secrets | ConvertFrom-Json
+    if (-not $cfg.claudeCodeOauthToken) {
+        Write-Error "secrets.json missing claudeCodeOauthToken -- run 'claude setup-token'"
+        exit 2
+    }
+    $env:CLAUDE_CODE_OAUTH_TOKEN = $cfg.claudeCodeOauthToken
+} else {
+    Remove-Item "Env:CLAUDE_CODE_OAUTH_TOKEN" -ErrorAction SilentlyContinue
 }
-$env:CLAUDE_CODE_OAUTH_TOKEN = $cfg.claudeCodeOauthToken
+$env:MARKET_BRIEF_LLM_BACKEND = $backend
+$env:MARKET_BRIEF_DIR = $here
 $env:PYTHONUTF8 = "1"
 $env:LISTEN_LOG_DIR = Join-Path $here 'logs'
 

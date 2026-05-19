@@ -1,7 +1,7 @@
 # Market brief runner -- invoked by Windows Task Scheduler hourly 08:00-22:00 EDT.
 #
 # Pipeline:
-#   1) run Claude Code with prompt.md
+#   1) run the configured LLM backend with prompt.md (Codex by default)
 #   2) read produced report
 #   3) push to WeChat via Hermes iLink   (primary channel)
 #   4) if WeChat push failed, send email (fallback / backup channel)
@@ -17,6 +17,9 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$backend = if ($env:MARKET_BRIEF_LLM_BACKEND) { $env:MARKET_BRIEF_LLM_BACKEND.ToLowerInvariant() } else { "codex" }
+$env:MARKET_BRIEF_LLM_BACKEND = $backend
+$env:MARKET_BRIEF_DIR = $here
 
 # --- 1. Resolve paths ----------------------------------------------------
 $promptFile  = Join-Path $here "prompt.md"
@@ -61,8 +64,8 @@ if (Test-Path $logFile) {
     } catch { }
 }
 
-# Tell the Claude child where to write -- avoids hour-boundary skew between
-# run.ps1 launch time and the moment Claude calls current_time inside.
+# Tell the LLM child where to write -- avoids hour-boundary skew between
+# run.ps1 launch time and the moment it calls current_time inside.
 $env:MARKET_BRIEF_OUTPUT = $reportFile
 
 # Pick a label for the email subject based on the trading-session bucket.
@@ -75,9 +78,9 @@ Log "[$([DateTime]::Now)] ==== market-brief run start (hour=$hour, session=$sess
 
 # --- env snapshot for forensics ------------------------------------------
 try {
-    Log "--- env snapshot (CLAUDE/ANTHROPIC/API) ---"
+    Log "--- env snapshot (LLM/CODEX/CLAUDE/ANTHROPIC/API) ---"
     foreach ($e in (Get-ChildItem env:)) {
-        if ($e.Name -notmatch 'CLAUDE|ANTHROPIC|API') { continue }
+        if ($e.Name -notmatch 'MARKET_BRIEF_LLM|CODEX|CLAUDE|ANTHROPIC|API') { continue }
         $name = $e.Name
         $val  = $e.Value
         if ($name -match 'TOKEN|KEY|PASSWORD|SECRET') {
@@ -120,13 +123,17 @@ if (-not (Test-Path $secretsFile)) {
 }
 $secrets = Get-Content -Raw $secretsFile | ConvertFrom-Json
 
-if (-not $secrets.claudeCodeOauthToken) {
-    Log "[ERROR] secrets.json missing claudeCodeOauthToken. Generate one with: claude setup-token"
-    exit 2
+if ($backend -eq "claude") {
+    if (-not $secrets.claudeCodeOauthToken) {
+        Log "[ERROR] secrets.json missing claudeCodeOauthToken. Generate one with: claude setup-token"
+        exit 2
+    }
+    $env:CLAUDE_CODE_OAUTH_TOKEN = $secrets.claudeCodeOauthToken
+} else {
+    Remove-Item "Env:CLAUDE_CODE_OAUTH_TOKEN" -ErrorAction SilentlyContinue
 }
-$env:CLAUDE_CODE_OAUTH_TOKEN = $secrets.claudeCodeOauthToken
 
-# --- 3. Run Claude Code --------------------------------------------------
+# --- 3. Run LLM backend --------------------------------------------------
 # Prepend persistent memory (cross-run user angles, signal priorities,
 # corrections that should outlive any single prompt.md edit). If
 # memory.md exists, its content is wrapped in a clear separator block
@@ -142,27 +149,60 @@ if (Test-Path $memoryFile) {
               $prompt
     Log "[$([DateTime]::Now)] prepended memory.md ($($memory.Length) chars)"
 }
-Log "[$([DateTime]::Now)] launching claude (this may take a few minutes)..."
+Log "[$([DateTime]::Now)] launching $backend (this may take a few minutes)..."
 
 # Pipe prompt via stdin to avoid quoting hell.
-# --dangerously-skip-permissions: required because the LAN MCP servers and
+# Dangerous permissions: required because the LAN MCP servers and
 #   WebFetch would otherwise prompt and block; this script runs unattended.
-# --output-format text: only print the model's final text output (not tool traces).
-$claudeOut = $prompt | & claude `
-    --print `
-    --dangerously-skip-permissions `
-    --output-format text `
-    2>&1
+$llmExit = 0
+if ($backend -eq "codex" -or $backend -eq "gpt" -or $backend -eq "openai") {
+    $lastMessageFile = Join-Path $logDir "codex-last-message-$date-$hour-$PID.txt"
+    Remove-Item $lastMessageFile -ErrorAction SilentlyContinue
+    $codexArgs = @(
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "-C", $here,
+        "--output-last-message", $lastMessageFile,
+        "--color", "never"
+    )
+    $codexModel = if ($env:MARKET_BRIEF_CODEX_MODEL) { $env:MARKET_BRIEF_CODEX_MODEL } else { "gpt-5.4" }
+    $codexArgs += @("--model", $codexModel)
+    Log "[$([DateTime]::Now)] codex model: $codexModel"
+    $codexArgs += "-"
+    $llmOut = $prompt | & codex @codexArgs 2>&1
+    $llmExit = $LASTEXITCODE
+    if ($llmOut) {
+        foreach ($line in $llmOut) { Log "    [codex] $line" }
+    }
+    if (Test-Path $lastMessageFile) {
+        foreach ($line in (Get-Content -Encoding UTF8 $lastMessageFile)) { Log "    [codex-final] $line" }
+        Remove-Item $lastMessageFile -ErrorAction SilentlyContinue
+    }
+} elseif ($backend -eq "claude") {
+    $llmOut = $prompt | & claude `
+        --print `
+        --dangerously-skip-permissions `
+        --output-format text `
+        2>&1
+    $llmExit = $LASTEXITCODE
+    if ($llmOut) {
+        foreach ($line in $llmOut) { Log "    [claude] $line" }
+    }
+} else {
+    Log "[ERROR] unsupported MARKET_BRIEF_LLM_BACKEND=$backend (expected codex or claude)"
+    exit 2
+}
 
-# Capture every line into the log
-if ($claudeOut) {
-    foreach ($line in $claudeOut) { Log "    [claude] $line" }
+if ($llmExit -ne 0) {
+    Log "[ERROR] $backend exited $llmExit. Aborting email."
+    exit 3
 }
 
 # --- 4. Verify the report exists -----------------------------------------
 if (-not (Test-Path $reportFile)) {
     Log "[ERROR] Expected report file not found: $reportFile"
-    Log "[ERROR] See claude stdout/stderr above. Aborting email."
+    Log "[ERROR] See $backend stdout/stderr above. Aborting email."
     exit 3
 }
 Log "[$([DateTime]::Now)] report ready: $reportFile"

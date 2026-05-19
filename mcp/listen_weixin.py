@@ -1,15 +1,16 @@
 """
-listen_weixin.py — inbound iLink long-poller that forwards messages to Claude.
+listen_weixin.py — inbound iLink long-poller that forwards messages to the LLM backend.
 
 For each incoming message addressed to our bot (filtered to the configured
 WEIXIN_HOME_CHANNEL so we only respond to the bot owner, not strangers):
 
   1. Filter out our own outbound echoes and empty/typing-only messages.
-  2. Match special slash commands first (cheap, no Claude spend):
+  2. Match special slash commands first (cheap, no LLM spend):
        /ping              -> reply "pong" + uptime
        /brief             -> Start-ScheduledTask MarketBrief (forces a run now)
        /help              -> reply the command list
-  3. Anything else: spawn `claude --print --dangerously-skip-permissions`
+  3. Anything else: spawn the configured LLM CLI (`codex exec` by default,
+     or `claude --print` when MARKET_BRIEF_LLM_BACKEND=claude)
      with a small system-prompt wrapper that introduces the stock-intel
      persona and the available MCP tools, feed the user's text on stdin,
      capture stdout, and push it back via send_weixin_direct.
@@ -20,8 +21,9 @@ Persisted state:
 
 Required env vars (from $HOME/.hermes/.env, written by qr_login_bootstrap.py):
   WEIXIN_ACCOUNT_ID, WEIXIN_TOKEN, WEIXIN_BASE_URL, WEIXIN_HOME_CHANNEL
-Plus, for the Claude subprocess:
-  CLAUDE_CODE_OAUTH_TOKEN     (loaded from secrets.json by the wrapper .ps1)
+LLM backend:
+  MARKET_BRIEF_LLM_BACKEND    codex (default) or claude
+  CLAUDE_CODE_OAUTH_TOKEN     only needed when backend=claude
 
 Run interactively for testing:
   python listen_weixin.py
@@ -79,7 +81,7 @@ log = logging.getLogger("listen")
 START_TIME = time.monotonic()
 GET_UPDATES_TIMEOUT_MS = 30_000
 LONG_POLL_RETRY_BACKOFF_S = 5.0
-CLAUDE_TIMEOUT_S = 900  # 15 min ceiling; long enough for MCP-heavy answers like /critique that re-fetch raw chat windows. Most slash commands finish in <2 min; this is the safety net.
+LLM_TIMEOUT_S = int(os.environ.get("MARKET_BRIEF_LLM_TIMEOUT_S", "900"))  # 15 min ceiling; long enough for MCP-heavy answers like /critique that re-fetch raw chat windows. Most slash commands finish in <2 min; this is the safety net.
 
 # Experimental: periodically ping iLink with a typing indicator (status=1
 # then immediately status=0) to test whether the typing endpoint refreshes
@@ -133,7 +135,7 @@ SYSTEM_PROMPT = f"""\
   - mcp__polymarket__list_events(query, limit, active_only)  事件列表。事件 = 一组相关市场(比如 "Fed June 会议" 下挂 25bp/50bp/hold 三个子市场)
   - mcp__polymarket__get_event(id_or_slug)               单个事件 + 全部子市场
   - mcp__polymarket__top_movers(window='1mo', limit)     最近 1 月概率变动最大的市场(Gamma 只暴露 oneMonthPriceChange)
-  - mcp__polymarket__get_price_history(id_or_slug, lookback_hours, fidelity_minutes)  单个市场概率时间序列(走 CLOB,可自定义采样)。用来画图或丢给 Claude 自己算
+  - mcp__polymarket__get_price_history(id_or_slug, lookback_hours, fidelity_minutes)  单个市场概率时间序列(走 CLOB,可自定义采样)。用来画图或丢给 LLM 自己算
   - mcp__polymarket__prob_change(id_or_slug, lookback)   任意窗口的概率变化:lookback 用 '15m' / '1h' / '6h' / '24h' / '7d' / '1w' / '1mo' 等。**比 Gamma 的 oneMonthPriceChange 灵活,这是日常用最多的工具**
   - mcp__polymarket__compute_vol(id_or_slug, lookback_days)  概率 log-return 的年化实现波动率。注意不是 BS-IV(Polymarket 不是期权),解读为"市场分歧度":高 = 还在博弈,低 = 共识(或薄流动性)
   - mcp__polymarket__short_movers(window_hours, limit, scan_size)  真正的短窗口 movers (1h/24h/7d 都行)。代价:扫 scan_size 个市场各拉 history,5-15s/次,别频繁调
@@ -158,7 +160,7 @@ SYSTEM_PROMPT = f"""\
   - 不发推、不下单。
   - 输出尽量短(<800 字),iLink 单条 ~2000 字会被切片。
 
-**重要 — 跨消息上下文**:每条微信消息都是 fresh `claude --print` session,你**看不到**上一条消息或之前 slash command 的回复。所以**当用户提到"上次"/"刚才"/"按你建议"/"那几只"等指代**,你**必须**:
+**重要 — 跨消息上下文**:每条微信消息都是 fresh LLM session,你**看不到**上一条消息或之前 slash command 的回复。所以**当用户提到"上次"/"刚才"/"按你建议"/"那几只"等指代**,你**必须**:
   1. **Read 本机文件** `{SCRIPTS_DIR}/last_<cmd>.md`(例如 `last_heat.md`、`last_critique.md`、`last_dv.md`、`last_plan.md`、`last_ticker.md`、`last_kol_drift.md`、`last_score.md`)拿上次该 slash command 的完整输出
   2. **Read 持久记忆** `{MEMORY_MD_PATH}` 拿用户跨次对话稳定的偏好(信号金字塔 / 反指 KOL / SKM = Anthropic proxy 这类)
   3. **Read 配置** `{PROMPT_MD_PATH}` 看当前 watchlist / KOL 表
@@ -312,7 +314,7 @@ async def _handle_help(text: str = "") -> str:
         "  /rollback <file>   `memory.md` 或 `prompt.md` 回退到最近一次 apply 之前\n"
         "\n"
         "  /help              显示此列表\n"
-        "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
+        "其他任何文本会丢给 Codex/GPT 自由问答(中文,带 MCP 工具)。"
     )
 
 
@@ -369,7 +371,7 @@ async def _handle_dv(text: str = "") -> str:
             f"**整体输出 <2000 字**(iLink 单条上限)。"
         )
 
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_xfeed(text: str = "") -> str:
@@ -419,13 +421,13 @@ async def _handle_xfeed(text: str = "") -> str:
             f"两个 tab 都出现 ≥2 次的 ticker / 主题 / 关键词。如果零交集,标'无明显共同信号'。\n\n"
             f"全报告 < 1900 字(iLink 单条上限)。**严格过滤**:段子、广告、纯个人生活全 skip,只留:股票/宏观/科技产品/政策。"
         )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_plan(text: str = "") -> str:
     """
     Ad-hoc enriched execution plan.
-      /plan                    — Claude reads latest brief, picks top 3 tickers
+      /plan                    — LLM reads latest brief, picks top 3 tickers
       /plan TSLA               — single ticker
       /plan TSLA NVDA INTC     — up to 5 tickers
     """
@@ -471,7 +473,7 @@ async def _handle_plan(text: str = "") -> str:
         "**约束**:整体输出 < 1800 字(iLink 单条上限)。如某 ticker 的工具失败,标"
         "'数据源缺失:{ticker} - {工具}'但不要 abort 整轮。"
     )
-    return await _ask_claude(intro + body)
+    return await _ask_llm(intro + body)
 
 
 async def _handle_ticker(text: str = "") -> str:
@@ -519,11 +521,11 @@ async def _handle_ticker(text: str = "") -> str:
         f"### ⚠️ 红旗 (如有)\n"
         f"shill / pumper / spam account / pre-IPO 投机迹象。无则 skip 整节。\n\n"
         f"### 💡 综合判断\n"
-        f"Claude 给一句话:现在是否值得关注?偏多还是偏空?最重要 catalyst 是什么?\n\n"
+        f"Codex/GPT 给一句话:现在是否值得关注?偏多还是偏空?最重要 catalyst 是什么?\n\n"
         f"如果窗口内 0 条:回 '${ticker} 过去 {window} 在 X 上无讨论'.\n"
         f"输出 < 1500 字。"
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 def _parse_monitored_sources() -> tuple[list, list]:
@@ -621,7 +623,7 @@ async def _handle_critique(text: str = "") -> str:
             f"    {i}. 微信「{name}」"
             f"→ `mcp__wxstore__wxstore_history(chat='{room}', since=since_dur, until=until_ts, limit=250)`"
         )
-    sample_block = "\n".join(sample_lines) if sample_lines else "    (prompt.md 解析失败,fallback 让 Claude 自己读 prompt.md 再采样)"
+    sample_block = "\n".join(sample_lines) if sample_lines else "    (prompt.md 解析失败,fallback 让 LLM 自己读 prompt.md 再采样)"
     sample_summary = (
         ", ".join(d[0] for d in sample_d) + " | " +
         ", ".join(w[0] for w in sample_w)
@@ -685,7 +687,7 @@ async def _handle_critique(text: str = "") -> str:
         f"- gap 数 0-5 个之间;如果 5+ 表示简报真的漏太多,只列最重要的 5 个,在末尾加 `... 还有 N 个未列`"
         + selfevolve.json_epilogue("critique")
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_kol_drift(text: str = "") -> str:
@@ -729,7 +731,7 @@ async def _handle_kol_drift(text: str = "") -> str:
         f"- 建议描述要可直接 copy 进 prompt.md / memory.md 表里,不要加额外评论"
         + selfevolve.json_epilogue("kol_drift")
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_heat(text: str = "") -> str:
@@ -788,7 +790,7 @@ async def _handle_heat(text: str = "") -> str:
         f"- 你确认要加 watchlist 时,在微信回'个股加 XYZ:<你的真实角度>',listener 走配置管理流程"
         + selfevolve.json_epilogue("heat")
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_reflect(text: str = "") -> str:
@@ -819,11 +821,11 @@ async def _handle_reflect(text: str = "") -> str:
         f"  **正向候选(好做法值得沉淀)**:\n"
         f"  - 某 prompt step 处理方式效果好(如 multi-wave pagination 减少 grep fallback)\n"
         f"  - 某 MCP 调用搭配产生有用结果(如 implied_move + unusual_activity 一起看)\n"
-        f"  - Claude 在 brief 里展示的 emergent 自适应行为\n"
+        f"  - LLM 在 brief 里展示的 emergent 自适应行为\n"
         f"  - 某种数据源结合得出特别准的信号\n\n"
         f"  **负向候选(避坑)**:\n"
         f"  - 某种调用反复失败(token-cap / timeout / rate-limit)\n"
-        f"  - 某种 prompt 写法导致 Claude 困惑或污染输出\n"
+        f"  - 某种 prompt 写法导致 LLM 困惑或污染输出\n"
         f"  - 某数据源持续不稳定 / 噪音多\n"
         f"  - 某种 sentiment 判断被反转后才对(没考虑到的反指)\n\n"
         f"**6.** **过滤**:\n"
@@ -863,7 +865,7 @@ async def _handle_reflect(text: str = "") -> str:
         f"- 优先**操作级**经验(具体规则、limit 数字、文件路径),不要写抽象哲学"
         + selfevolve.json_epilogue("reflect")
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_score(text: str = "") -> str:
@@ -956,7 +958,7 @@ async def _handle_score(text: str = "") -> str:
             ),
         )
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 async def _handle_search(text: str = "") -> str:
@@ -1007,11 +1009,11 @@ async def _handle_search(text: str = "") -> str:
         f"- emoji/sticker/纯链接 hit 跳过不展示\n"
         f"- 若 0 hit → 直接说'窗口内无相关讨论',不要硬编"
     )
-    return await _ask_claude(prompt)
+    return await _ask_llm(prompt)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Phase 2c+2d: applier slash commands (control-plane, no Claude needed)
+#  Phase 2c+2d: applier slash commands (control-plane, no LLM needed)
 # ────────────────────────────────────────────────────────────────────────────
 
 # Lazy import so a broken applier.py can't take down the listener at startup.
@@ -1105,8 +1107,76 @@ COMMANDS = {
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Claude dispatch
+#  LLM dispatch
 # ────────────────────────────────────────────────────────────────────────────
+
+def _llm_backend() -> str:
+    return (os.environ.get("MARKET_BRIEF_LLM_BACKEND") or "codex").strip().lower()
+
+
+async def _ask_llm(user_text: str) -> str:
+    backend = _llm_backend()
+    if backend in {"codex", "gpt", "openai"}:
+        return await _ask_codex(user_text)
+    if backend == "claude":
+        return await _ask_claude(user_text)
+    return f"❌ 未知 MARKET_BRIEF_LLM_BACKEND={backend!r}; 支持 codex 或 claude"
+
+
+async def _ask_codex(user_text: str) -> str:
+    """Run `codex exec` and return only the model's final message."""
+    prompt = SYSTEM_PROMPT + user_text.strip()
+    last_message = LOG_DIR / f"codex_last_message_{uuid.uuid4().hex}.txt"
+    cmd = [
+        os.environ.get("COMSPEC", "cmd.exe"),
+        "/c",
+        "codex",
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "-C", str(SCRIPTS_DIR),
+        "--output-last-message", str(last_message),
+        "--color", "never",
+    ]
+    model = os.environ.get("MARKET_BRIEF_CODEX_MODEL", "gpt-5.4").strip()
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append("-")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode("utf-8")),
+            timeout=LLM_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        last_message.unlink(missing_ok=True)
+        return f"❌ Codex/GPT 超时 ({LLM_TIMEOUT_S}s 无回应)"
+
+    stdout_text = stdout.decode("utf-8", "replace").strip()
+    stderr_text = stderr.decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        last_message.unlink(missing_ok=True)
+        err_tail = (stderr_text or stdout_text)[-800:]
+        return f"❌ Codex/GPT 异常 (exit {proc.returncode}):\n{err_tail}"
+
+    reply = ""
+    try:
+        if last_message.exists():
+            reply = last_message.read_text(encoding="utf-8").strip()
+    finally:
+        last_message.unlink(missing_ok=True)
+    return reply or stdout_text or "(Codex/GPT 返回空)"
+
 
 async def _ask_claude(user_text: str) -> str:
     """Run `claude --print --dangerously-skip-permissions` with the user text.
@@ -1130,14 +1200,14 @@ async def _ask_claude(user_text: str) -> str:
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=prompt.encode("utf-8")),
-            timeout=CLAUDE_TIMEOUT_S,
+            timeout=LLM_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
-        return f"❌ Claude 超时 ({CLAUDE_TIMEOUT_S}s 无回应)"
+        return f"❌ Claude 超时 ({LLM_TIMEOUT_S}s 无回应)"
 
     if proc.returncode != 0:
         err_tail = stderr.decode("utf-8", "replace")[-400:]
@@ -1211,7 +1281,7 @@ async def _handle_message(creds: dict, message: dict) -> None:
                 log.exception("selfevolve: extraction/persist failed for %s", cmd_key)
         # Persist the output so a follow-up free-form message ("按你建议加",
         # "刚才你说什么", etc.) can reconstruct what the previous slash
-        # command actually said. Each message spawns a fresh `claude --print`
+        # command actually said. Each message spawns a fresh LLM session
         # session with no shared memory; on-disk persistence is the bridge.
         try:
             stamp = time.strftime("%Y-%m-%d %H:%M:%S EDT", time.localtime())
@@ -1225,7 +1295,7 @@ async def _handle_message(creds: dict, message: dict) -> None:
         except Exception:
             log.exception("could not persist %s output", cmd_key)
     else:
-        reply = await _ask_claude(text)
+        reply = await _ask_llm(text)
 
     await _push_reply(creds, reply)
     log.info("replied: %r", reply[:120])

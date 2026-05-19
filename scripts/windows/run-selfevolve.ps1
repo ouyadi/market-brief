@@ -1,4 +1,5 @@
 # run-selfevolve.ps1 -- start Phase 2a self-evolve scheduler with env scrubbed.
+# Defaults to Codex/GPT; set MARKET_BRIEF_LLM_BACKEND=claude to use Claude CLI.
 
 param(
     [string] $Command = "auto",
@@ -13,6 +14,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $here      = Split-Path -Parent $MyInvocation.MyCommand.Path
+$backend   = if ($env:MARKET_BRIEF_LLM_BACKEND) { $env:MARKET_BRIEF_LLM_BACKEND.ToLowerInvariant() } else { "codex" }
 $venvPy    = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
              else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $scheduler = Join-Path $here 'selfevolve_scheduler.py'
@@ -20,7 +22,6 @@ $secrets   = Join-Path $here 'secrets.json'
 
 if (-not (Test-Path $venvPy))    { Write-Error "venv python missing at $venvPy"; exit 2 }
 if (-not (Test-Path $scheduler)) { Write-Error "selfevolve_scheduler.py missing at $scheduler"; exit 2 }
-if (-not (Test-Path $secrets))   { Write-Error "secrets.json missing at $secrets"; exit 2 }
 
 @(
     'ANTHROPIC_AUTH_TOKEN',
@@ -40,13 +41,19 @@ if (-not (Test-Path $secrets))   { Write-Error "secrets.json missing at $secrets
     'CLAUDECODE'
 ) | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
 
-$cfg = Get-Content -Raw $secrets | ConvertFrom-Json
-if (-not $cfg.claudeCodeOauthToken) {
-    Write-Error "secrets.json missing claudeCodeOauthToken -- run 'claude setup-token'"
-    exit 2
+if ($backend -eq "claude") {
+    if (-not (Test-Path $secrets))   { Write-Error "secrets.json missing at $secrets"; exit 2 }
+    $cfg = Get-Content -Raw $secrets | ConvertFrom-Json
+    if (-not $cfg.claudeCodeOauthToken) {
+        Write-Error "secrets.json missing claudeCodeOauthToken -- run 'claude setup-token'"
+        exit 2
+    }
+    $env:CLAUDE_CODE_OAUTH_TOKEN = $cfg.claudeCodeOauthToken
+} else {
+    Remove-Item "Env:CLAUDE_CODE_OAUTH_TOKEN" -ErrorAction SilentlyContinue
 }
 
-$env:CLAUDE_CODE_OAUTH_TOKEN = $cfg.claudeCodeOauthToken
+$env:MARKET_BRIEF_LLM_BACKEND = $backend
 $env:PYTHONUTF8 = "1"
 $env:SELFEVOLVE_LOG_DIR = Join-Path $here 'logs'
 $env:MARKET_BRIEF_DIR = $here
