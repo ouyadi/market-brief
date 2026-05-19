@@ -44,6 +44,11 @@ from pathlib import Path
 
 import aiohttp
 
+# Sibling module: self-evolution JSON schema + proposal storage (Phase 2b/2c/2d).
+# Lives next to this file at ~/Scripts/market-brief/selfevolve.py
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import selfevolve  # noqa: E402
+
 from gateway.platforms.weixin import (
     EP_GET_UPDATES,
     _api_post,
@@ -84,6 +89,11 @@ CLAUDE_TIMEOUT_S = 900  # 15 min ceiling; long enough for MCP-heavy answers like
 # correlate keepalive activity with successful tokenless pushes later.
 KEEPALIVE_INTERVAL_S = int(os.environ.get("KEEPALIVE_INTERVAL_S", "1800"))  # 30 min
 
+# Phase 2b: commands that emit <proposals>JSON</proposals> blocks for the
+# self-evolution applier to consume. Other commands (/ping, /brief, /dv, etc.)
+# have no JSON block and skip the extraction step in _handle_inbound.
+SELF_EVOLVE_COMMANDS = frozenset({"/reflect", "/critique", "/score", "/kol_drift", "/heat"})
+
 # Cross-platform: PROMPT_MD_PATH is the absolute path the configuration-
 # management mode will Read/Edit. Defaults to ~/Scripts/market-brief/prompt.md
 # on both Windows and macOS. Override with MARKET_BRIEF_DIR env var if
@@ -95,7 +105,14 @@ MEMORY_MD_PATH = SCRIPTS_DIR / "memory.md"
 SYSTEM_PROMPT = f"""\
 你是一名美股情报员,通过微信跟用户对话。回答必须简洁、可操作、中文。
 你能调用这些工具:
-  - mcp__chatlog__wx_history / wx_search / wx_sessions   微信群历史 / 模糊找群 / 列所有会话
+  - mcp__wxstore__wxstore_history(chat, since='86400', until=None, limit=100)  **微信群消息时间范围查询**(从我们自己的 SQLite 读,与 WeChat 文件无锁竞争)。`since` 支持 '86400'/'5400' 秒数字符串或 '24h'/'7d'/'30d',`chat='all'` = 全部群。返回 JSON 含 messages 数组。**优先用这个,不是老的 wx_history**
+  - mcp__wxstore__wxstore_semantic(query, chats='', window='30d', limit=20)  **跨群语义向量检索**(qwen3-embedding 本地)。比关键词搜索召回率高,适合:
+      · 跨窗口找话题:"过去 30 天讨论 INTC 加仓的群"
+      · 反向找 KOL:"哪些群提过 Tam 通胀 6% 预测"
+      · 题材映射:"长鑫存储 IPO" → 召回所有跨群相关讨论(即使没出现 cashtag)
+      `chats` 是逗号分隔 chatroom_id(空字符串 = 全部已索引);`window` 用 1d/7d/30d/90d/1y;`limit` 是 top_k
+  - mcp__wxstore__wxstore_stats()  看 wxstore 内部状态(总消息数、各群分布、最新消息时间)。诊断 ingest 是否正常工作
+  - mcp__chatlog__wx_sessions / wx_search / wx_chatrooms   会话列表 / 关键词 / 群列表(`wx_history` 已弃用 — 改用 wxstore_history!chatlog 跟 WeChat 抢文件锁会挂)
   - mcp__discord-selfbot__read_channel_messages          Discord 频道历史
   - mcp__discord-selfbot__list_channels                  Discord 频道列表
   - mcp__twitter__fetch_tweet_by_url(url)                抓单条 X tweet 内容(用户登录态,绕过登录墙)。**默认 include_thread=True,自动展开同作者 self-reply 形成的 thread**;返回的 dict 里若有 `thread` 字段说明这条是 thread head
@@ -147,6 +164,17 @@ SYSTEM_PROMPT = f"""\
   3. **Read 配置** `{PROMPT_MD_PATH}` 看当前 watchlist / KOL 表
 
 **这三个文件确实存在**,不要轻信"找不到"就回"我看不到上下文" — 一定先 Read 试一下。Read 失败再说找不到。
+
+**重要 — 简报细节查询路径(关键)**:用户在微信收到的是**只有"📱 微信速读"的精简版**(≤1900 字, 5 个 setup + 跨V + 宏观 + 技术位)。当用户在微信对话里**进一步问简报细节**, 关键词例:**"X 详情" / "刚才 INTC 那段展开" / "ASTS JPM 那段" / "完整 INTC 分析" / "把 setup 都给我" / "🎙 大 V 都说啥" / "宏观展开"** 等, 你**必须**:
+
+  1. **不重跑分析** — **绝不**调 `mcp__twitter__*` / `mcp__chatlog__*` / `mcp__polymarket__*` / `mcp__financialjuice__*` 等去重新拉数据. 那要 5-10 分钟而且会和定时简报抢资源
+  2. **Read 最新简报存档** — 调 `mcp__chatlog__current_time` 拿当前 EDT, 算出最新简报路径(格式 `~/Reports/{{YYYY-MM-DD}}-{{HH 两位}}-brief.md`, 跨平台用 `Path.home()`). 如果当前小时简报还没写出,fallback 到上一小时
+  3. **按用户问的范围 grep / extract**:
+     - 问某 ticker(如 "INTC 详情"): 用 Grep 或者 Read 整份, 找所有 INTC 相关的 ⚡/🎯/🎙/🏛 sub-section, 拼接成一条 ≤1900 字回复
+     - 问某 section(如 "🎙 都说啥"): extract 整个 ## 🎙 大 V 速读 section 内容
+     - 问"完整 setup": extract ## ⚡ 高优先级关注 整段
+  4. **回复格式**: 不带 markdown bold, 不带 doc header(用户已读速读了), 直接把 grep 出来的内容**精简后**推回, 控制 ≤1900 字 (超了告诉用户 "完整本机在 `~/Reports/...md`, 用 PC 看")
+  5. **如果简报文件不存在**(如系统刚开机): 告诉用户 "本时段简报还没生成, 下次 brief 时间是 HH:00 EDT", 不要硬编造内容
 
 # 配置管理模式(关键)
 
@@ -273,6 +301,16 @@ async def _handle_help(text: str = "") -> str:
         "                     例: `/score` (7d, horizon 3d) / `/score 14d 1w`\n"
         "  /reflect [Nd]      自我检讨 ≥2 次重复出现的运行经验,提议沉淀到 memory.md (正向/负向)\n"
         "                     例: `/reflect` (7d) / `/reflect 14d`\n"
+        "  /search [Nd] q     跨群语义检索(wxstore 主存储)\n"
+        "                     例: `/search INTC 加仓` (30d) / `/search 7d 通胀 6%`\n"
+        "\n"
+        "  ── 闭环 applier (Phase 2c+2d,人审 self-evolve 提议) ──\n"
+        "  /proposals [Nd]    列出待审 proposals (近 30d 默认)\n"
+        "  /show <id>         显示某个 proposal 的完整内容 + diff preview\n"
+        "  /apply <id>        落盘(只对 writable=✓ 的;BLACKLISTED 会拒)\n"
+        "  /reject <id>       丢弃(移到 rejected/)\n"
+        "  /rollback <file>   `memory.md` 或 `prompt.md` 回退到最近一次 apply 之前\n"
+        "\n"
         "  /help              显示此列表\n"
         "其他任何文本会丢给 Claude 自由问答(中文,带 MCP 工具)。"
     )
@@ -581,7 +619,7 @@ async def _handle_critique(text: str = "") -> str:
     for i, (name, room) in enumerate(sample_w, len(sample_d) + 1):
         sample_lines.append(
             f"    {i}. 微信「{name}」"
-            f"→ `mcp__chatlog__wx_history(chatroom='{room}', since=since, limit=250)`"
+            f"→ `mcp__wxstore__wxstore_history(chat='{room}', since=since_dur, until=until_ts, limit=250)`"
         )
     sample_block = "\n".join(sample_lines) if sample_lines else "    (prompt.md 解析失败,fallback 让 Claude 自己读 prompt.md 再采样)"
     sample_summary = (
@@ -596,17 +634,32 @@ async def _handle_critique(text: str = "") -> str:
         f"## 步骤\n\n"
         f"**步骤 1**:Read 待审简报 `{target}`(模式:{mode})。\n\n"
         f"**步骤 2**:Read 当前的 `{PROMPT_MD_PATH}` 和 `{MEMORY_MD_PATH}`,知道目前哪些群/频道/大V/watchlist 在跟踪 + 用户的真实角度。\n\n"
-        f"**步骤 3**:用 `mcp__chatlog__current_time` 拿当前 EDT,**确认简报发布时刻**(`{name}` 时刻),算 since = 那一刻 - {window_s} 秒。然后**并行**调用这 6 个采样源(其他源**这次跳过**,下次随机会轮到):\n\n"
+        f"**步骤 3**:用 `mcp__chatlog__current_time` 拿当前 EDT 的 unix 秒(now)。**确认简报发布时刻**(`{name}` 时刻,unix 秒,记为 `T`)。**计算两个变量**:\n"
+        f"  - `since_dur` = (now - T + {window_s}) 秒 — 从现在回看多远(wxstore_history 的 since 是 duration 字符串)\n"
+        f"  - `until_ts` = `T` 的 unix 秒字符串 — 拉到这一刻就停(否则简报发布**之后**的消息也会混进来污染审查)\n"
+        f"然后**并行**调用这 6 个采样源(其他源**这次跳过**,下次随机会轮到):\n\n"
         f"{sample_block}\n\n"
         f"**不拉**:大 V 推 / X search / Polymarket 重扫 — 这些信号简报本身已在 Phase B 调过;通过 slash command 重扫只徒增 latency,gap 通常在群讨论里。\n\n"
         f"**步骤 4**:**对比**简报 vs 这 6 个采样源的原始数据,找出**应该收进简报但漏了**的 actionable 信号。**注意采样限制**:本次只覆盖 {len(sample_d)+len(sample_w)} / {len(discord_all)+len(wechat_all)} 个源,未抽中的源的 gap 这次不可见。\n\n"
+        f"**步骤 4.5**(跨群验证 — 用语义检索补盲点):对 Step 4 找到的每个候选 gap(尤其是 ticker / KOL 名字 / 题材关键词),调 "
+        f"`mcp__wxstore__wxstore_semantic(query='<gap-related keyword>', window='7d', limit=10)` 看其他**未抽中的群**有没有同主题讨论。"
+        f"返回 hits 看 sender + content + chat_id:\n"
+        f"  - 若多个未抽中群也有相关讨论 → **systemic gap**(简报真的漏了),升级置信度\n"
+        f"  - 若只 sampled 群有 → **incidental**,可能这次随机抽样运气好\n"
+        f"  - 若 0 hit → 这个 gap 仅 sampled 群内部出现,可能不是 systemic\n"
+        f"  - 若返回 `error` 字段(Ollama 暂时不可用之类) → 这步**跳过**,直接走 Step 5 不影响主流程\n\n"
         f"### 算 gap 的标准(必须满足客观可验证)\n"
         f"- **个股漏**:某 ticker 被 **≥3 个不同 sender** (跨群算) 提及,但简报 🎯/⚡ 都没出现\n"
         f"- **仓位漏**:实盘校场/某 KOL 发了**具体 entry/stop/target 或仓位调整数字**,但简报 ⚡ 没提\n"
         f"- **大 V 漏**:prompt.md 跟踪的某大 V 在窗口内发了 actionable 推(具体 ticker / 具体 call / 具体数字),但简报 🎙️ 漏列\n"
         f"  - 注:Cramer/Schiff 是反指,他们 'actionable' 的方向要 flip 后才算\n"
         f"- **技术位漏**:**≥2 个群讨论同一大盘点位**(SPY/QQQ/VIX 整数关、长债 yield 等),但简报 📊 没提\n"
-        f"- **宏观漏**:Polymarket 24h 概率剧动 (≥5pp 绝对) + 群里也讨论同一事件,但简报 🏛️ 没体现\n\n"
+        f"- **宏观漏**:Polymarket 24h 概率剧动 (≥5pp 绝对) + 群里也讨论同一事件,但简报 🏛️ 没体现\n"
+        f"- **速读失真**(新加,2026-05-18 起 — 用户在微信只看 📱 微信速读 section):简报里 `## ⚡ 高优先级关注` 下面**已经写了**的 setup,**没出现**在同一份简报的 `## 📱 微信速读` 节里 → 速读压缩遗漏高优 setup。Step 1 Read 待审简报时,**同时定位** `## ⚡` 和 `## 📱` 两个 section,对比:\n"
+        f"  · ⚡ 里每个 setup 的 ticker / 立场 / 关键数字,**至少**要在 📱 速读里出现一次 ticker + 立场\n"
+        f"  · ⚡ 写「INTC 多」但 📱 完全没提 INTC → **速读失真**\n"
+        f"  · ⚡ 写「TSLA 多 entry $XXX」📱 只提了「TSLA」但没立场没数字 → 仍算 partial 失真(置信度=中)\n"
+        f"  · 速读本身设计 ≤1900 字,主动 trim 低 conviction setup 是允许的;**只有高 conviction / actionable setup 被砍才是 gap**\n\n"
         f"### **绝不**算 gap 的\n"
         f"- 闲聊 / 段子 / 营销内容\n"
         f"- 单个人单次提到某 ticker\n"
@@ -630,6 +683,7 @@ async def _handle_critique(text: str = "") -> str:
         f"- 不要写 explanatory 段落、不要寒暄、不要总结改造历史\n"
         f"- 每个 gap 必须可验证(带具体出处),不允许'感觉漏了 XYZ'这种主观判断\n"
         f"- gap 数 0-5 个之间;如果 5+ 表示简报真的漏太多,只列最重要的 5 个,在末尾加 `... 还有 N 个未列`"
+        + selfevolve.json_epilogue("critique")
     )
     return await _ask_claude(prompt)
 
@@ -673,6 +727,7 @@ async def _handle_kol_drift(text: str = "") -> str:
         f"- 反指 KOL 仍维持 inverse 关系不算漂移\n"
         f"- 必须用具体推作证据,不允许'感觉漂了'这种主观判断\n"
         f"- 建议描述要可直接 copy 进 prompt.md / memory.md 表里,不要加额外评论"
+        + selfevolve.json_epilogue("kol_drift")
     )
     return await _ask_claude(prompt)
 
@@ -731,6 +786,7 @@ async def _handle_heat(text: str = "") -> str:
         f"- 必须 cite 简报文件名 + section,便于你验证\n"
         f"- **绝不**编 thesis 描述(memory.md '行为约束'有规则:generic 描述是历史 bug)\n"
         f"- 你确认要加 watchlist 时,在微信回'个股加 XYZ:<你的真实角度>',listener 走配置管理流程"
+        + selfevolve.json_epilogue("heat")
     )
     return await _ask_claude(prompt)
 
@@ -805,6 +861,7 @@ async def _handle_reflect(text: str = "") -> str:
         f"- 已在 memory.md 的不要重复报\n"
         f"- 不允许 fabrication,只基于实际看到的 brief / log 内容\n"
         f"- 优先**操作级**经验(具体规则、limit 数字、文件路径),不要写抽象哲学"
+        + selfevolve.json_epilogue("reflect")
     )
     return await _ask_claude(prompt)
 
@@ -838,10 +895,17 @@ async def _handle_score(text: str = "") -> str:
         f"  - 立场=空 且 `net_move <= -1.0%` → **win**\n"
         f"  - 立场=空 且 `net_move >= +1.0%` → **loss**\n"
         f"  - `-1.0% < net_move < +1.0%` → **flat**(不计入)\n\n"
-        f"**步骤 5**:聚合统计:\n"
+        f"**步骤 5**:聚合统计(**多维度交叉看**):\n"
         f"  - **整体**:W / L / Flat,胜率 = W / (W + L)\n"
         f"  - **按 ticker**:每个 ticker 的 setup 次数 + W/L/F + 胜率(只列 ≥2 个 setup 的)\n"
-        f"  - **按大 V 关联**:setup 的 source 里跟踪的大 V (查 prompt.md 表),分别统计相关 ticker 的胜率;反指 KOL (Cramer/Schiff) 把方向 flip 后再算\n\n"
+        f"  - **按大 V 关联**:setup 的 source 里跟踪的大 V (查 prompt.md 表),分别统计相关 ticker 的胜率;反指 KOL (Cramer/Schiff) 把方向 flip 后再算\n"
+        f"  - **按 source_kind**(新加,2026-05-18 起):判断每个 setup 的数据来源类型并分别看胜率:\n"
+        f"    · `text` — setup 来自群文字/X 推/Polymarket 数字,无 OCR 介入\n"
+        f"    · `ocr`  — setup 主要依据是 OCR 解读的图片(实盘校场截图、月哥 broker 截图、郭明錤长图等)\n"
+        f"    · `cross_validated` — ≥2 个独立源(text + ocr / 2 个不同群 / 实盘校场 + 期权 unusual activity)同向 confirm\n"
+        f"    · `n/a` — 判断不出的,跳过不归类\n"
+        f"    源头分类**从简报里找**:`### TICKER` 下面的'消息面/基本面'子节里是否引用了'实盘校场截图''broker 仓位图''看图解析'等关键词 → ocr;只有文字 quote → text;明确两个独立源 confirm → cross_validated\n"
+        f"  - **按 window_aware**(新加):观月亭/小林ablue 等时段性源(memory.md '观月亭🌒' 一段有定义)关联的 setup 单独看 — 这些数据源 absent ≠ failure,胜率不能跟 always-on 源直接比\n\n"
         f"## 输出格式 (严格)\n\n"
         f"```\n"
         f"## ⚡ Setup 命中率 (最近 {lookback_days} 天,horizon={horizon})\n\n"
@@ -854,22 +918,167 @@ async def _handle_score(text: str = "") -> str:
         f"- **$XYZ**:N setup,W-L-F → 胜率\n"
         f"- ... (按 setup 数 × 胜率排,top 5)\n"
         f"\n"
+        f"### 按 source_kind\n"
+        f"- **text**(N=X):W-L-F → 胜率 X%\n"
+        f"- **ocr**(N=X):W-L-F → 胜率 X%\n"
+        f"- **cross_validated**(N=X):W-L-F → 胜率 X%\n"
+        f"  - 注:cross_validated 胜率应该 ≥ text/ocr 单独;若不是,说明 cross-validation 信号选择有偏差,需 reflect\n"
+        f"\n"
         f"### 按大 V 关联\n"
         f"- **@imnotharsh** (INTC bull):N 个相关 setup,胜率 X%\n"
         f"- **@Cramer-flipped**:... (注:Cramer 反指后看)\n"
         f"- ... (只列 ≥2 setup 的)\n"
         f"\n"
         f"### 建议\n"
-        f"一句话:**信号金字塔**应该调整哪些权重?哪些 ticker / KOL 命中率持续低需要重新审视 thesis?\n"
+        f"一句话:**信号金字塔**应该调整哪些权重?哪些 ticker / KOL 命中率持续低需要重新审视 thesis?source_kind 之间胜率有显著差距吗(暗示某种来源系统性失真)?\n"
         f"```\n\n"
         f"**数据不足**(N < 5 actionable setup)时:输出 `## 命中率:数据不足({{N}} 个 setup,至少需要 5 个才有统计意义)。继续观察。`\n\n"
         f"**约束**:\n"
         f"- 总输出 < 1500 字\n"
         f"- 数字必须真实(从 check_post_hoc 实际返回值算),不允许估算\n"
         f"- 标注 sample size,N < 5 直接说不足而非硬编故事\n"
-        f"- 反指 KOL 一定要 flip 后算 — 否则结果会被错误负相关污染"
+        f"- 反指 KOL 一定要 flip 后算 — 否则结果会被错误负相关污染\n"
+        f"- source_kind 判断**只 based on 简报里实际写的内容**,不要根据训练数据脑补「这种 ticker 通常 ocr」"
+        + selfevolve.json_epilogue(
+            "score",
+            stats_schema=(
+                "{\n"
+                '    "overall": {"long": {"w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
+                '                "short": {"w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
+                '                "combined": {"n_actionable": 0, "n_flat": 0, "win_rate": 0.0}},\n'
+                '    "by_ticker": [{"ticker": "INTC", "n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "..."],\n'
+                '    "by_kol":    [{"handle": "imnotharsh", "is_inverse": false, "n": 0, "w": 0, "l": 0, "win_rate": 0.0}, "..."],\n'
+                '    "by_source_kind": {"text":            {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
+                '                       "ocr":             {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
+                '                       "cross_validated": {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}},\n'
+                '    "window_aware_sample_size": 0\n'
+                "  }"
+            ),
+        )
     )
     return await _ask_claude(prompt)
+
+
+async def _handle_search(text: str = "") -> str:
+    """语义检索:跨所有微信群的历史向量搜索。
+
+    用法:
+      /search INTC 加仓        — 默认 30d 窗口
+      /search 30d INTC 加仓    — 指定窗口 (1d/7d/30d/90d/1y)
+      /search 牛哥 ASTS 评估   — 自然语言查询,不需要 cashtag
+    """
+    args = text.split(maxsplit=2)
+    if len(args) < 2:
+        return ("用法:`/search [window] <query>`,例:\n"
+                "  `/search INTC 加仓`(默认 30d)\n"
+                "  `/search 7d 通胀 6%`(自定义窗口)\n"
+                "  `/search 90d 牛哥 ASTS`(自然语言)")
+    window_re = re.compile(r"^(\d+)([dwy])$|^1y$")
+    if len(args) >= 3 and window_re.match(args[1]):
+        window = args[1]
+        query = args[2]
+    else:
+        window = "30d"
+        query = " ".join(args[1:])
+
+    prompt = (
+        f"# 跨群语义检索任务\n\n"
+        f"用户查询:**{query}**(窗口:{window})\n\n"
+        f"**步骤 1**:调 `mcp__wxstore__wxstore_semantic(query='{query}', window='{window}', limit=20)` —— wxstore 本机 sqlite-vec + Ollama qwen3-embedding,**这是当前 RAG 主存储**。\n\n"
+        f"**步骤 2**:处理返回结果:\n"
+        f"  - 若返回 JSON 含 `error` 字段(Ollama 暂时不可用 / wxstore 服务挂等)→ 告诉用户'语义检索暂时不可用(<error 内容>),降级到关键词搜索'。然后调 `mcp__chatlog__wx_search(keyword='<extract main keyword>', limit=15)` 作为 fallback —— 注意这是 chatlog 元数据查询,不抢锁\n"
+        f"  - 若返回 `hits` 数组 → 按下面格式展示。每条 hit 含 `chat`/`chat_name`/`sender_name`/`ts`/`text`/`distance`(距离越小越相关)\n\n"
+        f"**步骤 3**:用 `mcp__chatlog__current_time` 拿当前时间(为相对时间表达)。\n\n"
+        f"## 输出格式 (严格)\n\n"
+        f"```\n"
+        f"## 语义检索:{query}(窗口 {window})\n\n"
+        f"找到 N 条相关消息(按相关度排序):\n\n"
+        f"### 1. <群名>(<相对时间,如 '2 天前 21:30'>)\n"
+        f"  **{{sender}}**: {{content 前 150 字,长截断}}\n"
+        f"\n"
+        f"### 2. ...(以此类推,最多 10 条)\n"
+        f"\n"
+        f"### 综合\n"
+        f"一句话总结:这些讨论的核心观点 / 是否有 actionable signal / 涉及哪些 ticker。\n"
+        f"```\n\n"
+        f"**约束**:\n"
+        f"- 总输出 < 1500 字(微信单条上限)\n"
+        f"- 同一群多条 hit 时合并到同一 section,按时间倒序\n"
+        f"- emoji/sticker/纯链接 hit 跳过不展示\n"
+        f"- 若 0 hit → 直接说'窗口内无相关讨论',不要硬编"
+    )
+    return await _ask_claude(prompt)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Phase 2c+2d: applier slash commands (control-plane, no Claude needed)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Lazy import so a broken applier.py can't take down the listener at startup.
+def _applier():
+    import applier  # noqa: WPS433
+    return applier
+
+
+async def _handle_proposals(text: str = "") -> str:
+    """List pending self-evolve proposals. Optional Nd lookback (default 30d).
+
+    用法:`/proposals` (近 30 天)  /  `/proposals 7d`
+    """
+    args = text.split()[1:]
+    days = 30
+    if args:
+        m = re.match(r"^(\d+)d$", args[0].lower())
+        if m:
+            days = max(1, min(90, int(m.group(1))))
+    return _applier().list_pending(max_age_days=days)
+
+
+async def _handle_show(text: str = "") -> str:
+    """显示某个 proposal 的完整内容 + diff preview。
+
+    用法:`/show <prop_id>` (id 是 /proposals 列表里第一段那串)
+    """
+    args = text.split()[1:]
+    if not args:
+        return "用法:`/show <prop_id>` —— id 是 /proposals 列出的那串(如 `20260518T205500_reflect_01_d671`)"
+    return _applier().show_proposal(args[0].strip("`"))
+
+
+async def _handle_apply(text: str = "") -> str:
+    """落盘一个 proposal:备份 target file,append patch 到指定 section,
+    把 proposal 文件移到 applied/。仅适用于 writable=true (即 memory.md
+    的 ## 运行经验:正向/负向 + ## 信号优先级金字塔, 或 prompt.md 的
+    ## 行为约束)。
+
+    用法:`/apply <prop_id>`
+    """
+    args = text.split()[1:]
+    if not args:
+        return "用法:`/apply <prop_id>` —— 先 `/proposals` 列出待审,再 `/show <id>` 看 diff,确认后再 /apply"
+    return _applier().apply_proposal(args[0].strip("`"))
+
+
+async def _handle_reject(text: str = "") -> str:
+    """拒绝一个 proposal,移到 rejected/。
+
+    用法:`/reject <prop_id>`
+    """
+    args = text.split()[1:]
+    if not args:
+        return "用法:`/reject <prop_id>`"
+    return _applier().reject_proposal(args[0].strip("`"))
+
+
+async def _handle_rollback(text: str = "") -> str:
+    """回退 memory.md 或 prompt.md 到最近一次 backup。
+
+    用法:`/rollback memory.md`  或  `/rollback prompt.md`
+    """
+    args = text.split()[1:]
+    if not args:
+        return "用法:`/rollback memory.md` 或 `/rollback prompt.md` —— 恢复到最近一次 apply 之前的版本"
+    return _applier().rollback_file(args[0].strip("`"))
 
 
 COMMANDS = {
@@ -884,6 +1093,13 @@ COMMANDS = {
     "/heat": _handle_heat,
     "/score": _handle_score,
     "/reflect": _handle_reflect,
+    "/search": _handle_search,
+    # Phase 2c+2d applier control plane
+    "/proposals": _handle_proposals,
+    "/show":      _handle_show,
+    "/apply":     _handle_apply,
+    "/reject":    _handle_reject,
+    "/rollback":  _handle_rollback,
     "/help": _handle_help,
 }
 
@@ -974,6 +1190,25 @@ async def _handle_message(creds: dict, message: dict) -> None:
     handler = COMMANDS.get(cmd_key)
     if handler is not None:
         reply = await handler(text)
+        # Phase 2b: self-evolve commands also emit a <proposals>JSON</proposals>
+        # block. Extract + persist proposals; strip the block from the reply
+        # so the WeChat user only sees the markdown. Non-self-evolve commands
+        # have no JSON block; extract_proposals_block returns reply unchanged.
+        if cmd_key in SELF_EVOLVE_COMMANDS:
+            try:
+                cleaned, proposals_payload = selfevolve.extract_proposals_block(reply)
+                if proposals_payload is not None:
+                    written = selfevolve.save_proposals(cmd_key.lstrip("/"), proposals_payload)
+                    log.info(
+                        "selfevolve: %s emitted %d proposal(s) → %s",
+                        cmd_key, len(written),
+                        ", ".join(p.name for p in written) or "(empty)",
+                    )
+                else:
+                    log.info("selfevolve: %s did not emit a parseable <proposals> JSON", cmd_key)
+                reply = cleaned
+            except Exception:
+                log.exception("selfevolve: extraction/persist failed for %s", cmd_key)
         # Persist the output so a follow-up free-form message ("按你建议加",
         # "刚才你说什么", etc.) can reconstruct what the previous slash
         # command actually said. Each message spawns a fresh `claude --print`
