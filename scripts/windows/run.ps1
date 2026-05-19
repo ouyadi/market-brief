@@ -69,7 +69,11 @@ function Log-CodexOutput {
     }
 
     $warningCount = @($lineArray | Where-Object { $_ -match '\bWARN\b|warning|failed to load plugin|Cloudflare|challenge' }).Count
-    $reportLines = @($lineArray | Where-Object { $_ -match 'REPORT_WRITTEN|tokens used|ERROR:' })
+    $reportLines = @($lineArray | Where-Object {
+        $_ -match '^\s*REPORT_WRITTEN:\s+' -or
+        $_ -match '^\s*tokens used\b' -or
+        $_ -match '^\s*ERROR:'
+    })
     foreach ($line in $reportLines) {
         Log "    [codex] $line"
     }
@@ -92,6 +96,28 @@ if (Test-Path $logFile) {
             Move-Item -Path $logFile -Destination "$logFile.utf16.bak" -Force -ErrorAction SilentlyContinue
         }
     } catch { }
+}
+
+# Keep one active brief run per install. Task Scheduler is configured with
+# MultipleInstances=IgnoreNew, but that only works if the scheduled action
+# stays alive for the whole child process. The lock also protects manual smoke
+# tests from overlapping an hourly run.
+$lockFile = Join-Path $logDir "market-brief.lock"
+try {
+    $script:briefLock = [System.IO.File]::Open(
+        $lockFile,
+        [System.IO.FileMode]::OpenOrCreate,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+    $lockText = "pid=$PID started=$([DateTime]::Now.ToString('o')) backend=$backend"
+    $lockBytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
+    $script:briefLock.SetLength(0)
+    $script:briefLock.Write($lockBytes, 0, $lockBytes.Length)
+    $script:briefLock.Flush()
+} catch {
+    Log "[WARN] another market-brief run appears active; skipping this tick. $($_.Exception.Message)"
+    exit 0
 }
 
 # Tell the LLM child where to write -- avoids hour-boundary skew between
@@ -200,17 +226,39 @@ if ($backend -eq "codex" -or $backend -eq "gpt" -or $backend -eq "openai") {
     $codexArgs += @("--model", $codexModel)
     Log "[$([DateTime]::Now)] codex model: $codexModel"
     $codexArgs += "-"
-    $llmOut = $prompt | & codex @codexArgs 2>&1
-    $llmExit = $LASTEXITCODE
+    # Native commands that write stderr can raise NativeCommandError under
+    # $ErrorActionPreference=Stop on Windows PowerShell 5.1, even when the
+    # process itself would continue normally. Capture stdout/stderr and trust
+    # the exit code instead so scheduled runs do not disappear after launch.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $llmOut = $prompt | & codex @codexArgs 2>&1
+        $llmExit = $LASTEXITCODE
+    } catch {
+        $llmOut = @("PowerShell caught codex exception: $($_.Exception.Message)")
+        $llmExit = 1
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
     Log-CodexOutput -Lines $llmOut -ExitCode $llmExit -LastMessageFile $lastMessageFile
     Remove-Item $lastMessageFile -ErrorAction SilentlyContinue
 } elseif ($backend -eq "claude") {
-    $llmOut = $prompt | & claude `
-        --print `
-        --dangerously-skip-permissions `
-        --output-format text `
-        2>&1
-    $llmExit = $LASTEXITCODE
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $llmOut = $prompt | & claude `
+            --print `
+            --dangerously-skip-permissions `
+            --output-format text `
+            2>&1
+        $llmExit = $LASTEXITCODE
+    } catch {
+        $llmOut = @("PowerShell caught claude exception: $($_.Exception.Message)")
+        $llmExit = 1
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
     if ($llmOut) {
         foreach ($line in $llmOut) { Log "    [claude] $line" }
     }

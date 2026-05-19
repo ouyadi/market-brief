@@ -9,8 +9,10 @@
 '
 ' wscript.exe + this VBS is the historical Windows fix:
 '   - wscript.exe itself has no console (it's a windowless host).
-'   - WshShell.Run(cmd, 0, False) spawns the child with windowStyle=Hidden
-'     from the moment of CreateProcess, so PowerShell never gets a console.
+'   - WshShell.Run(cmd, 0, True) spawns the child with windowStyle=Hidden
+'     from the moment of CreateProcess, so PowerShell never gets a console,
+'     while still waiting for the child to exit. This lets Task Scheduler's
+'     running/success/failure state reflect the actual child process.
 '
 ' Usage from a Task Scheduler action:
 '   Execute:  wscript.exe
@@ -31,4 +33,4 @@ For i = 1 To WScript.Arguments.Count - 1
     cmdLine = cmdLine & " " & q & WScript.Arguments(i) & q
 Next
 
-CreateObject("WScript.Shell").Run cmdLine, 0, False
+WScript.Quit CreateObject("WScript.Shell").Run(cmdLine, 0, True)
