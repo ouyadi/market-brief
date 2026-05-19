@@ -22,6 +22,7 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -35,6 +36,7 @@ from PIL import Image
 
 
 DEFAULT_MCP_URL = "http://127.0.0.1:6280/mcp"
+SCRIPTS_DIR = Path(os.environ.get("MARKET_BRIEF_DIR") or (Path.home() / "Scripts" / "market-brief"))
 DEFAULT_CACHE_DIR = Path.home() / "Scripts" / "market-brief" / "vision_cache"
 DEFAULT_TESSDATA_DIR = Path.home() / "Scripts" / "market-brief" / "tessdata"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -73,6 +75,9 @@ class OcrResult:
     ocr_error: str
     tickers: list[str]
     created_at: str
+    vision_backend: str = ""
+    vision_text: str = ""
+    vision_error: str = ""
 
 
 class McpClient:
@@ -356,9 +361,151 @@ def process_task(task: AttachmentTask, cache_dir: Path, backend: str) -> OcrResu
         ocr_backend=ocr_backend,
         ocr_text=ocr_text,
         ocr_error=ocr_error,
+        vision_backend="",
+        vision_text="",
+        vision_error="",
         tickers=tickers,
         created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
     )
+
+
+VISION_PROMPT = """\
+你是一名交易截图/中文群聊截图 OCR 审核员。请读取图片,提取对美股简报有用的信息。
+
+只输出一个 JSON object,不要 markdown,不要解释。字段:
+{
+  "tickers": ["AAPL"],
+  "action": "buy|sell|hold|watch|unknown",
+  "summary": "中文一句话总结截图内容",
+  "prices": ["17-18", "700"],
+  "position": "仓位/股数/合约数/到期日/行权价等,没有就空字符串",
+  "confidence": 0.0
+}
+
+规则:
+- ticker 用大写,不带 $。
+- 如果看不清,confidence 低并在 summary 说明。
+- 不要编造图片里没有的信息。
+"""
+
+
+def run_codex_vision(image_path: Path, model: str, timeout_s: int) -> tuple[str, str, list[str]]:
+    out_path = image_path.with_suffix(f".vision-{int(time.time())}.txt")
+    cmd = [
+        os.environ.get("COMSPEC", "cmd.exe"),
+        "/c",
+        "codex",
+        "exec",
+        "-m", model,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "-C", str(SCRIPTS_DIR),
+        "-i", str(image_path),
+        "--output-last-message", str(out_path),
+        "--color", "never",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=VISION_PROMPT,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        out_path.unlink(missing_ok=True)
+        return "", f"codex vision timed out after {timeout_s}s", []
+
+    output = proc.stdout or ""
+    reply = ""
+    try:
+        if out_path.exists():
+            reply = out_path.read_text(encoding="utf-8").strip()
+    finally:
+        out_path.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        return "", f"codex vision exit {proc.returncode}: {output[-1200:]}", []
+    text = reply or _extract_last_json(output) or output.strip()
+    return text, "", extract_vision_tickers(text)
+
+
+def _extract_last_json(text: str) -> str:
+    start = text.rfind("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return ""
+    return text[start:end + 1].strip()
+
+
+def extract_vision_tickers(text: str) -> list[str]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return extract_tickers(text)
+    raw = data.get("tickers") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return extract_tickers(text)
+    tickers = []
+    for value in raw:
+        ticker = str(value).strip().upper().lstrip("$")
+        if re.fullmatch(r"[A-Z]{1,5}", ticker) and ticker not in COMMON_WORDS:
+            tickers.append(ticker)
+    return sorted(set(tickers))
+
+
+def needs_vision_review(result: OcrResult, mode: str) -> bool:
+    if mode == "all":
+        return True
+    if mode == "missing":
+        return not bool(result.ocr_text)
+    # low-confidence mode: OCR is empty, too sparse, tickerless, or likely noisy.
+    text_len = len((result.ocr_text or "").strip())
+    return (
+        text_len == 0
+        or text_len < 40
+        or not result.tickers
+        or len(result.tickers) > 10
+    )
+
+
+def apply_vision_fallback(
+    results: list[OcrResult],
+    backend: str,
+    model: str,
+    max_images: int,
+    timeout_s: int,
+    mode: str,
+) -> None:
+    if backend == "none" or max_images <= 0:
+        return
+    used = 0
+    for result in results:
+        if used >= max_images:
+            break
+        if not needs_vision_review(result, mode):
+            continue
+        image_path = Path(result.image_path)
+        if not image_path.exists():
+            result.vision_backend = backend
+            result.vision_error = f"image missing: {image_path}"
+            continue
+        if backend != "codex":
+            result.vision_backend = backend
+            result.vision_error = f"unknown vision backend: {backend}"
+            continue
+        used += 1
+        vision_text, vision_error, vision_tickers = run_codex_vision(image_path, model=model, timeout_s=timeout_s)
+        result.vision_backend = "codex"
+        result.vision_text = vision_text
+        result.vision_error = vision_error
+        if vision_tickers:
+            # Vision is used specifically when OCR looks sparse or noisy, so
+            # prefer the model's structured ticker list over raw OCR matches.
+            result.tickers = vision_tickers
 
 
 def run_ocr(image_path: Path, backend: str) -> tuple[str, str, str]:
@@ -421,7 +568,8 @@ def write_markdown(path: Path, results: list[OcrResult], backend: str, scan_erro
         "## Summary",
         "",
         f"- with_tickers: {sum(1 for r in results if r.tickers)}",
-        f"- needs_vision: {sum(1 for r in results if not r.ocr_text)}",
+        f"- needs_vision: {sum(1 for r in results if not r.ocr_text and not r.vision_text)}",
+        f"- vision_resolved: {sum(1 for r in results if r.vision_text)}",
         f"- ocr_backends: {', '.join(sorted({r.ocr_backend for r in results})) if results else 'none'}",
         "",
     ]
@@ -450,6 +598,13 @@ def write_markdown(path: Path, results: list[OcrResult], backend: str, scan_erro
             lines.append(f"- caption: {caption[:240]}")
         if result.ocr_text:
             lines.extend(["", "```text", result.ocr_text[:4000], "```"])
+        if result.vision_text:
+            lines.extend(["", "```json", result.vision_text[:4000], "```"])
+            lines.append(f"- status: vision_resolved ({result.vision_backend})")
+        elif result.vision_error:
+            lines.append(f"- vision_error: {result.vision_error}")
+        elif result.ocr_text:
+            lines.append("- status: ocr_resolved")
         else:
             lines.append(f"- status: needs_vision ({result.ocr_error})")
         lines.append("")
@@ -476,6 +631,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--max-images", type=int, default=15)
     parser.add_argument("--backend", choices=["auto", "none", "tesseract"], default="auto")
+    parser.add_argument("--vision-backend", choices=["none", "codex"], default="none")
+    parser.add_argument("--vision-mode", choices=["missing", "low-confidence", "all"], default="low-confidence")
+    parser.add_argument("--vision-model", default=os.environ.get("MARKET_BRIEF_CODEX_MODEL", "gpt-5.4"))
+    parser.add_argument("--vision-max-images", type=int, default=6)
+    parser.add_argument("--vision-timeout", type=int, default=180)
     parser.add_argument("--jsonl", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--print-markdown", action="store_true")
@@ -483,6 +643,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     if args.limit < 1 or args.limit > 200:
         raise SystemExit("--limit must be between 1 and 200")
@@ -537,10 +699,22 @@ def main(argv: list[str] | None = None) -> int:
                     ocr_backend=args.backend,
                     ocr_text="",
                     ocr_error=f"download/process failed: {exc}",
+                    vision_backend="",
+                    vision_text="",
+                    vision_error="",
                     tickers=extract_tickers(task.caption),
                     created_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
                 )
             )
+
+    apply_vision_fallback(
+        results,
+        backend=args.vision_backend,
+        model=args.vision_model,
+        max_images=args.vision_max_images,
+        timeout_s=args.vision_timeout,
+        mode=args.vision_mode,
+    )
 
     jsonl_path, markdown_path = default_output_paths(args.cache_dir)
     jsonl_path = args.jsonl or jsonl_path
@@ -554,7 +728,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"JSONL_WRITTEN: {jsonl_path}")
         print(f"MARKDOWN_WRITTEN: {markdown_path}")
         print(f"IMAGES_PROCESSED: {len(results)}")
-        print(f"NEEDS_VISION: {sum(1 for r in results if not r.ocr_text)}")
+        print(f"NEEDS_VISION: {sum(1 for r in results if not r.ocr_text and not r.vision_text)}")
+        print(f"VISION_RESOLVED: {sum(1 for r in results if r.vision_text)}")
     return 0
 
 
