@@ -183,6 +183,7 @@ function Phase3-CopyFiles {
         @{Dir=$MCP_DIR;     Name='selfevolve_scheduler.py'},
         @{Dir=$MCP_DIR;     Name='discord_image_ocr.py'},
         @{Dir=$MCP_DIR;     Name='brief_image.py'},
+        @{Dir=$MCP_DIR;     Name='brief_image_gpt.py'},
         @{Dir=$CONFIG_DIR;  Name='secrets.example.json'}
     )
     foreach ($f in $marketFiles) {

@@ -286,8 +286,9 @@ $venvPy   = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.e
             else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $pushTool = Join-Path $here 'push_weixin.py'
 $imageTool = Join-Path $here 'brief_image.py'
+$gptImageTool = Join-Path $here 'brief_image_gpt.py'
 $wxPushOk = $false
-$wechatMode = if ($env:MARKET_BRIEF_WECHAT_MODE) { $env:MARKET_BRIEF_WECHAT_MODE.ToLowerInvariant() } else { "image" }
+$wechatMode = if ($env:MARKET_BRIEF_WECHAT_MODE) { $env:MARKET_BRIEF_WECHAT_MODE.ToLowerInvariant() } else { "gpt-image" }
 
 if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
     # IMPORTANT: This script's top-level $ErrorActionPreference is "Stop",
@@ -300,7 +301,28 @@ if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        if ($wechatMode -eq "image" -and (Test-Path $imageTool)) {
+        if ($wechatMode -eq "gpt-image" -and (Test-Path $gptImageTool)) {
+            $gptImageFile = [System.IO.Path]::ChangeExtension($reportFile, ".gpt.png")
+            Log "[$([DateTime]::Now)] generating GPT image brief: $gptImageFile"
+            $gptImageOut = & $venvPy $gptImageTool $reportFile --output $gptImageFile 2>&1
+            foreach ($line in $gptImageOut) { Log "    [gpt-image] $line" }
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $gptImageFile)) {
+                $caption = "Market brief $date $hour:00 $sessionTag"
+                Log "[$([DateTime]::Now)] pushing GPT image brief to WeChat..."
+                $pushOut = & $venvPy $pushTool --image $gptImageFile --caption $caption 2>&1
+                foreach ($line in $pushOut) { Log "    [push] $line" }
+                if ($LASTEXITCODE -eq 0) {
+                    $wxPushOk = $true
+                    Log "[$([DateTime]::Now)] WeChat GPT image push OK"
+                } else {
+                    Log "[WARN] GPT image push exited $LASTEXITCODE -- falling back to text speed-read"
+                }
+            } else {
+                Log "[WARN] GPT image generation exited $LASTEXITCODE -- falling back to text speed-read"
+            }
+        }
+
+        if (-not $wxPushOk -and $wechatMode -eq "image" -and (Test-Path $imageTool)) {
             $imageFile = [System.IO.Path]::ChangeExtension($reportFile, ".png")
             Log "[$([DateTime]::Now)] rendering image brief: $imageFile"
             $renderOut = & $venvPy $imageTool $reportFile --output $imageFile 2>&1
