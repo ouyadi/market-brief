@@ -285,18 +285,11 @@ Log "[$([DateTime]::Now)] report ready: $reportFile"
 $venvPy   = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
             else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $pushTool = Join-Path $here 'push_weixin.py'
+$imageTool = Join-Path $here 'brief_image.py'
 $wxPushOk = $false
+$wechatMode = if ($env:MARKET_BRIEF_WECHAT_MODE) { $env:MARKET_BRIEF_WECHAT_MODE.ToLowerInvariant() } else { "image" }
 
 if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
-    # Push three sections as separate iLink messages so 🎯 个股 and 🎙️ 大V
-    # signal don't get squeezed out of the single ⚡ chunk. push_weixin.py
-    # skips missing sections gracefully (e.g. 🎙️ may be omitted by the model
-    # if no KOL had new tweets in the window).
-    # Section needles built from UTF-8 bytes to keep this .ps1 pure ASCII.
-    $secZap = [System.Text.Encoding]::UTF8.GetString([byte[]](0xE2,0x9A,0xA1))   # ⚡
-    $secTgt = [System.Text.Encoding]::UTF8.GetString([byte[]](0xF0,0x9F,0x8E,0xAF)) # 🎯
-    $secMic = [System.Text.Encoding]::UTF8.GetString([byte[]](0xF0,0x9F,0x8E,0x99)) # 🎙
-    Log "[$([DateTime]::Now)] pushing $secZap + $secTgt + $secMic sections to WeChat (3 messages)..."
     # IMPORTANT: This script's top-level $ErrorActionPreference is "Stop",
     # which makes PowerShell raise an exception whenever a native command
     # writes ANY text to stderr. Hermes' Python logger emits stderr WARNINGs
@@ -307,13 +300,42 @@ if ((Test-Path $venvPy) -and (Test-Path $pushTool)) {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $pushOut = & $venvPy $pushTool $reportFile --section $secZap --section $secTgt --section $secMic 2>&1
-        foreach ($line in $pushOut) { Log "    [push] $line" }
-        if ($LASTEXITCODE -eq 0) {
-            $wxPushOk = $true
-            Log "[$([DateTime]::Now)] WeChat push OK"
-        } else {
-            Log "[WARN] WeChat push exited $LASTEXITCODE -- will fall back to email"
+        if ($wechatMode -eq "image" -and (Test-Path $imageTool)) {
+            $imageFile = [System.IO.Path]::ChangeExtension($reportFile, ".png")
+            Log "[$([DateTime]::Now)] rendering image brief: $imageFile"
+            $renderOut = & $venvPy $imageTool $reportFile --output $imageFile 2>&1
+            foreach ($line in $renderOut) { Log "    [image] $line" }
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $imageFile)) {
+                $caption = "Market brief $date $hour:00 $sessionTag"
+                Log "[$([DateTime]::Now)] pushing image brief to WeChat..."
+                $pushOut = & $venvPy $pushTool --image $imageFile --caption $caption 2>&1
+                foreach ($line in $pushOut) { Log "    [push] $line" }
+                if ($LASTEXITCODE -eq 0) {
+                    $wxPushOk = $true
+                    Log "[$([DateTime]::Now)] WeChat image push OK"
+                } else {
+                    Log "[WARN] image push exited $LASTEXITCODE -- falling back to text speed-read"
+                }
+            } else {
+                Log "[WARN] image render exited $LASTEXITCODE -- falling back to text speed-read"
+            }
+        }
+
+        if (-not $wxPushOk) {
+            # Push only the phone speed-read section as one iLink message. The
+            # full report remains on disk for PC reading and listener follow-up
+            # queries. Section needle built from UTF-8 bytes to keep this .ps1
+            # pure ASCII.
+            $secPhone = [System.Text.Encoding]::UTF8.GetString([byte[]](0xF0,0x9F,0x93,0xB1)) # 📱
+            Log "[$([DateTime]::Now)] pushing $secPhone speed-read section to WeChat (1 message)..."
+            $pushOut = & $venvPy $pushTool $reportFile --section $secPhone --bare 2>&1
+            foreach ($line in $pushOut) { Log "    [push] $line" }
+            if ($LASTEXITCODE -eq 0) {
+                $wxPushOk = $true
+                Log "[$([DateTime]::Now)] WeChat text push OK"
+            } else {
+                Log "[WARN] text push exited $LASTEXITCODE -- will fall back to email"
+            }
         }
     } catch {
         Log "[WARN] WeChat push threw: $($_.Exception.Message) -- will fall back to email"

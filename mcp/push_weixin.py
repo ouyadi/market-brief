@@ -3,16 +3,16 @@ Push a markdown file to WeChat via Hermes Agent's iLink adapter.
 
 Usage:
   python push_weixin.py <markdown_file>
-  python push_weixin.py <markdown_file> --section "⚡"
+  python push_weixin.py <markdown_file> --section "📱" --bare
   python push_weixin.py --message "short literal message"
+  python push_weixin.py --image brief.png --caption "盘中简报"
 
 Reads credentials from ~/.hermes/.env (written by qr_login_bootstrap.py).
 Falls back to ~/.hermes/weixin/accounts/<id>.json if .env is incomplete.
 
 When --section is given, only the H2 section whose heading contains that
-substring is pushed, prefixed with the report's pre-H2 header (title +
-mode + scan-window metadata). This keeps each push to ~1 chunk and stays
-well under iLink's ~10/session quota.
+substring is pushed. By default it is prefixed with the report's pre-H2 header;
+use --bare for the single-message WeChat speed-read section.
 
 Exit codes:
   0 success, 2 config error, 3 send error, 4 section not found.
@@ -33,10 +33,15 @@ from gateway.platforms.weixin import send_weixin_direct
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
 
-def extract_section(markdown: str, needle: str) -> str | None:
+def extract_section(markdown: str, needle: str, bare: bool = False) -> str | None:
     """
     Return the report header (everything before the first H2) + the H2 section
     whose heading contains ``needle``. Returns None if no matching section.
+
+    When ``bare=True``, skip the doc header AND the matched section's own H2
+    heading line. Use for the WeChat speed-read push where the section's first
+    body line is already a user-facing header and the doc header would bloat
+    the single-message budget.
     """
     lines = markdown.splitlines()
     h2_re = re.compile(r"^##\s+(.*)$")
@@ -46,14 +51,17 @@ def extract_section(markdown: str, needle: str) -> str | None:
     if not h2_idxs:
         return None
 
-    header = "\n".join(lines[: h2_idxs[0]]).rstrip()
+    header = "" if bare else "\n".join(lines[: h2_idxs[0]]).rstrip()
 
     needle_lower = needle.lower()
     for pos, idx in enumerate(h2_idxs):
         title = h2_re.match(lines[idx]).group(1)
         if needle_lower in title.lower():
             end = h2_idxs[pos + 1] if pos + 1 < len(h2_idxs) else len(lines)
-            section = "\n".join(lines[idx:end]).rstrip()
+            section_start = idx + 1 if bare else idx
+            section = "\n".join(lines[section_start:end]).strip()
+            if not section:
+                return None
             return f"{header}\n\n{section}\n" if header else section + "\n"
     return None
 
@@ -176,7 +184,10 @@ def smart_chunks(text: str, max_len: int = _CHUNK_TARGET) -> list[str]:
     return [c for c in out if c]
 
 
-async def _push(message: str) -> int:
+async def _push(
+    message: str,
+    media_files: list[tuple[str, bool]] | None = None,
+) -> int:
     creds = _load_credentials()
     missing = [k for k in ("account_id", "token", "home_channel") if not creds[k]]
     if missing:
@@ -190,6 +201,25 @@ async def _push(message: str) -> int:
     extra = {"account_id": creds["account_id"], "base_url": creds["base_url"]}
     if creds["cdn_base_url"]:
         extra["cdn_base_url"] = creds["cdn_base_url"]
+
+    if media_files:
+        result = await send_weixin_direct(
+            extra=extra,
+            token=creds["token"],
+            chat_id=creds["home_channel"],
+            message=message,
+            media_files=media_files,
+        )
+        if result.get("success"):
+            names = ", ".join(Path(p).name for p, _ in media_files)
+            print(
+                f"OK: pushed media to chat_id={creds['home_channel']} "
+                f"(message_id={result.get('message_id')}, files={names})"
+            )
+            return 0
+        err = result.get("error", "unknown error")
+        print(f"[ERROR] weixin media push failed: {err}", file=sys.stderr)
+        return 3
 
     chunks = smart_chunks(message)
     any_failed = False
@@ -230,6 +260,8 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("path", nargs="?", help="Path to a markdown file to push.")
     group.add_argument("--message", "-m", help="Literal message string to push.")
+    group.add_argument("--image", help="Local image file to push as native WeChat media.")
+    parser.add_argument("--caption", default="", help="Short caption used with --image.")
     parser.add_argument(
         "--section",
         "-s",
@@ -243,11 +275,27 @@ def main() -> int:
             'Example: --section "⚡" --section "🎯" --section "🎙️"'
         ),
     )
+    parser.add_argument(
+        "--bare",
+        action="store_true",
+        default=False,
+        help=(
+            "Strip the doc header and matched section H2. Use for the WeChat "
+            "speed-read section where the body is the whole single message."
+        ),
+    )
     args = parser.parse_args()
 
     if args.message:
         # Single literal push -- still one message.
         return asyncio.run(_push(args.message))
+
+    if args.image:
+        image_path = Path(args.image)
+        if not image_path.exists():
+            print(f"[ERROR] image file not found: {image_path}", file=sys.stderr)
+            return 2
+        return asyncio.run(_push(args.caption or "", media_files=[(str(image_path), False)]))
 
     p = Path(args.path)
     if not p.exists():
@@ -276,7 +324,7 @@ def main() -> int:
     import time as _time
     INTER_SECTION_DELAY_S = 5.0
     for idx, needle in enumerate(args.section):
-        extracted = extract_section(text, needle)
+        extracted = extract_section(text, needle, bare=args.bare)
         if extracted is None:
             print(
                 f"[WARN] no H2 section contains substring {needle!r} -- skipping",
