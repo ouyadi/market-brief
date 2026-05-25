@@ -56,7 +56,7 @@ log = logging.getLogger("stock-mcp")
 
 mcp = FastMCP(
     "stock-price",
-    host="127.0.0.1",
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
     port=int(os.environ.get("STOCK_MCP_PORT", "3032")),
 )
 

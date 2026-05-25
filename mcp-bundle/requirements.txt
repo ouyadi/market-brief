@@ -1,0 +1,8 @@
+# Aggregated runtime deps for fred / tradier / polymarket / stock-price /
+# financialjuice MCP servers. Pinned upper bounds intentionally loose
+# (these are stable APIs); rebuild bundle quarterly to refresh.
+mcp>=1.0,<2
+aiohttp>=3.9,<4
+redis>=5.0,<6
+yfinance>=0.2,<1
+supervisor>=4.2,<5
