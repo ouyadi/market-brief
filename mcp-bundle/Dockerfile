@@ -1,5 +1,5 @@
-# Bundle of five Python FastMCP servers for OCI Coolify deploy.
-# One container, one supervisord, five processes — keeps Coolify dashboard
+# Bundle of six Python FastMCP servers for OCI Coolify deploy.
+# One container, one supervisord, six processes — keeps Coolify dashboard
 # tidy and shares the Python runtime / pip cache.
 #
 # Contains the API-only MCPs that don't need a desktop client:
@@ -8,6 +8,7 @@
 #   - polymarket (3033)      Polymarket Gamma REST
 #   - stock-price (3032)     yfinance wrapper (quote/info/options)
 #   - financialjuice (3034)  FJ RSS / endpoint scraper
+#   - sa-rss (7050)          SeekingAlpha public RSS feeds (Phase A SA integration)
 #
 # NOT bundled (kept on Windows desktop): chatlog/wxstore (need WeChat
 # client), twitter (Playwright + browser cookies), discord-selfbot
@@ -41,7 +42,7 @@ COPY mcp-bundle/supervisord.conf /etc/supervisord.conf
 # Document which ports this container exposes. Coolify maps them
 # internally via the coolify network so sibling containers can reach
 # alphalens-mcp-bundle:3032 etc.
-EXPOSE 3032 3033 3034 3035 3036
+EXPOSE 3032 3033 3034 3035 3036 7050
 
 # Tiny TCP healthcheck against fred (lightest MCP).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
