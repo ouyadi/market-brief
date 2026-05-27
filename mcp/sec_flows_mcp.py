@@ -111,7 +111,10 @@ async def _get_json(url: str) -> dict[str, Any]:
                             await asyncio.sleep(2.0)
                             continue
                     r.raise_for_status()
-                    return await r.json()
+                    # SEC frequently serves JSON with Content-Type: text/html
+                    # for archive `index.json` files. Pass content_type=None
+                    # to skip aiohttp's mime-type validation — we know it's JSON.
+                    return await r.json(content_type=None)
             except aiohttp.ClientError:
                 if attempt == 1:
                     raise
@@ -264,7 +267,9 @@ def _parse_form4(xml_text: str) -> dict[str, Any]:
             for tx in c:
                 if _strip_ns(tx.tag) != tx_tag:
                     continue
-                code = _find_value(tx, "transactionCoding", "transactionCode")
+                # transactionCode is direct text, NOT wrapped in <value>
+                # (unlike most Form 4 fields). All other amounts ARE wrapped.
+                code = _find_text(tx, "transactionCoding", "transactionCode")
                 date = _find_value(tx, "transactionDate")
                 shares = _to_float(_find_value(tx, "transactionAmounts", "transactionShares"))
                 price = _to_float(_find_value(tx, "transactionAmounts", "transactionPricePerShare"))
@@ -321,8 +326,10 @@ def _parse_13f(xml_text: str) -> list[dict[str, Any]]:
         # raw and multiply by 1000 to be safe for older periods. Modern filings
         # also have x1000 in practice. Acceptable error: x1000 inflation on
         # 2023+ data would be obvious vs market cap, can be normalized post-hoc.
-        value_raw = _to_float(_find_text(entry, "value"))
-        value_usd = value_raw * 1000 if value_raw is not None else None
+        # 13F-HR "value" column: pre-2023 filings reported in thousands of USD,
+        # 2023+ filings report direct USD. We assume modern (no x1000). For old
+        # backfills, callers can detect & rescale post-hoc if needed.
+        value_usd = _to_float(_find_text(entry, "value"))
         shrs_node = next((c for c in entry if _strip_ns(c.tag) == "shrsOrPrnAmt"), None)
         shares = _to_float(_find_text(shrs_node, "sshPrnamt"))
         shares_type = _find_text(shrs_node, "sshPrnamtType")     # 'SH' or 'PRN'
@@ -406,6 +413,9 @@ async def parse_form4_xml(accession: str, cik: str) -> dict[str, Any]:
     """
     try:
         acc_nd = _accession_no_dashes(accession)
+        # Archive path uses the SUBJECT CIK (issuer for Form 4, fund for
+        # 13F) — NOT the filer/reporting-owner CIK. EDGAR indexes filings
+        # under whoever the filing is ABOUT.
         cik_int = int(cik)
         cache_key = f"f4:{acc_nd}"
         hit = _cache_get(cache_key, TTL_XML_BODY)
@@ -504,6 +514,8 @@ async def parse_13f_xml(accession: str, fund_cik: str) -> dict[str, Any]:
     """
     try:
         acc_nd = _accession_no_dashes(accession)
+        # Archive path uses the SUBJECT CIK (the fund whose holdings are
+        # reported), not the filing agent's CIK encoded in the accession.
         cik_int = int(fund_cik)
         cache_key = f"f13f:{acc_nd}"
         hit = _cache_get(cache_key, TTL_XML_BODY)
