@@ -175,6 +175,12 @@ async def get_info(ticker: str) -> dict:
         return {
             "ticker": ticker.upper(),
             "name": info.get("shortName") or info.get("longName"),
+            # yfinance quoteType is the canonical instrument-type tag:
+            # 'EQUITY' / 'ETF' / 'MUTUALFUND' / 'INDEX' / 'CURRENCY' /
+            # 'CRYPTOCURRENCY'. alphalens uses this to gate cluster
+            # membership instead of maintaining a hand-curated ETF set
+            # (which kept missing new ARK/SPDR/PIMCO names).
+            "quote_type": info.get("quoteType"),
             "sector": info.get("sector"),
             "industry": info.get("industry"),
             "country": info.get("country"),
