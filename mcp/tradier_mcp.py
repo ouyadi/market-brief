@@ -295,6 +295,112 @@ async def get_history(
     }
 
 
+# ── Options tools ─────────────────────────────────────────────────────────
+@mcp.tool()
+async def get_option_expirations(symbol: str) -> dict:
+    """List available option expiration dates for a symbol.
+
+    Returns sorted ascending YYYY-MM-DD strings. Use this before
+    get_option_chain to pick a target expiration (e.g. nearest to 30d out
+    for IV-30d signals).
+
+    Tradier returns standard + weekly + LEAPS expirations in one call.
+    """
+    params = {"symbol": symbol.upper(), "includeAllRoots": "true", "strikes": "false"}
+    data = await _tradier_request("markets/options/expirations", params)
+    expirations = data.get("expirations", {})
+    if expirations == "null" or expirations is None:
+        return {"success": True, "symbol": symbol.upper(), "count": 0, "expirations": []}
+
+    raw = expirations.get("date", []) if isinstance(expirations, dict) else []
+    if isinstance(raw, str):  # Tradier returns string when only one date
+        raw = [raw]
+    return {
+        "success": True,
+        "symbol": symbol.upper(),
+        "count": len(raw),
+        "expirations": raw,
+    }
+
+
+@mcp.tool()
+async def get_option_chain(symbol: str, expiration: str, greeks: bool = True) -> dict:
+    """Full option chain for one expiration.
+
+    With greeks=True, every option includes Tradier-computed Greeks +
+    bid/mid/ask implied vol. mid_iv is the broker-grade IV we use for
+    vol_features. yfinance's option_chain().impliedVolatility is unreliable
+    (we observed near-zero values for liquid ATM strikes); Tradier's mid_iv
+    is consistently correct.
+
+    Args:
+      symbol: e.g. 'NVDA'
+      expiration: 'YYYY-MM-DD' from get_option_expirations
+      greeks: include Greeks + IV. Costs slightly more compute server-side
+              but gives the data we actually need. Default True.
+
+    Returns chain as list of {strike, option_type, bid, ask, last, volume,
+    open_interest, greeks: {delta, gamma, theta, vega, mid_iv, ...}}.
+    """
+    params = {
+        "symbol": symbol.upper(),
+        "expiration": expiration,
+        "greeks": "true" if greeks else "false",
+    }
+    data = await _tradier_request("markets/options/chains", params)
+    options = data.get("options", {})
+    if options == "null" or options is None:
+        return {
+            "success": True,
+            "symbol": symbol.upper(),
+            "expiration": expiration,
+            "count": 0,
+            "options": [],
+        }
+
+    raw = options.get("option", []) if isinstance(options, dict) else []
+    if isinstance(raw, dict):  # single-strike response
+        raw = [raw]
+
+    out = []
+    for o in raw:
+        item = {
+            "symbol": o.get("symbol"),
+            "strike": o.get("strike"),
+            "option_type": o.get("option_type"),
+            "bid": o.get("bid"),
+            "ask": o.get("ask"),
+            "last": o.get("last"),
+            "volume": o.get("volume"),
+            "open_interest": o.get("open_interest"),
+            "expiration_date": o.get("expiration_date"),
+            "underlying_symbol": o.get("underlying_symbol"),
+        }
+        if greeks:
+            g = o.get("greeks") or {}
+            item["greeks"] = {
+                "delta": g.get("delta"),
+                "gamma": g.get("gamma"),
+                "theta": g.get("theta"),
+                "vega": g.get("vega"),
+                "rho": g.get("rho"),
+                "bid_iv": g.get("bid_iv"),
+                "mid_iv": g.get("mid_iv"),
+                "ask_iv": g.get("ask_iv"),
+                "smv_vol": g.get("smv_vol"),
+                "updated_at": g.get("updated_at"),
+            }
+        out.append(item)
+
+    return {
+        "success": True,
+        "symbol": symbol.upper(),
+        "expiration": expiration,
+        "count": len(out),
+        "options": out,
+    }
+
+
 # ── Stream tools (admin / introspection) ──────────────────────────────────
 @mcp.tool()
 async def stream_status() -> dict:
