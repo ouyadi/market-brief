@@ -7,34 +7,46 @@ Price / fundamentals (read-only):
   get_info(ticker)                               sector / market cap / next earnings / dividend
   check_post_hoc(ticker, at_time, horizon)       event-study micro for KOL/call accuracy eval
 
-Options (read-only, with computed Greeks):
+Options (read-only, Tradier-backed):
   list_expirations(ticker)                       all tradeable expiry dates
   get_option_chain(ticker, expiration, ...)      chain rows + Δ/Γ/Θ/Vega/Rho
   implied_move(ticker, expiration)               ATM straddle / spot = % move priced in
   unusual_activity(ticker, expiration, ...)      strikes where volume >> open interest
   compute_greeks(ticker, expiration, strike, ...) single-strike Greeks lookup
 
-Greeks computed via Black-Scholes from yfinance's `impliedVolatility` field
-plus a configurable risk-free rate (default 4.5%; override per-call). Yahoo's
-IV can be stale at quiet strikes -- treat Greeks at zero-volume strikes as
-approximate.
+Options data comes from the Tradier brokerage REST API (TRADIER_API_TOKEN).
+yfinance's option_chain is unreliable off-hours -- we observed openInterest=0,
+bid=ask=null and impliedVolatility=0 for liquid ATM strikes outside RTH. Tradier
+serves broker-grade data: real open interest, full bid/ask coverage, and
+Greeks (incl. mid_iv) on every contract. So `impliedVolatility` is now Tradier's
+greeks.mid_iv and the Greeks subobject is Tradier's own delta/gamma/theta/vega/rho
+(no more Black-Scholes recompute). _bs_greeks is kept only as a fallback for the
+rare contract Tradier returns without greeks.
+
+Price / fundamentals tools (get_quote / get_history / get_info /
+check_post_hoc) still use yfinance -- they are not options data.
 
 Runs on 127.0.0.1:3032/mcp as a daemon (At-Log-On scheduled task `StockPriceMCP`).
 
 Caveat: yfinance scrapes Yahoo Finance. High-freq calls can hit rate limits.
 Our usage (hourly market-brief + ad-hoc KOL evaluation) is well within tolerable
 levels, but if you start seeing intermittent empty responses, that's the
-likely cause -- wait a few minutes and retry.
+likely cause -- wait a few minutes and retry. The Tradier REST path is rate
+limited to 120 req/min (shared global lock).
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import math
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aiohttp
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
 
@@ -59,6 +71,116 @@ mcp = FastMCP(
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
     port=int(os.environ.get("STOCK_MCP_PORT", "3032")),
 )
+
+# ── Tradier REST client (options data source) ──────────────────────────────
+# Same token as tradier-mcp. yfinance options are unreliable off-hours; Tradier
+# broker data has real OI / full bid-ask / Greeks. See module docstring.
+TRADIER_API_TOKEN = os.environ.get("TRADIER_API_TOKEN", "")
+TRADIER_REST_BASE = os.environ.get("TRADIER_REST_BASE", "https://api.tradier.com/v1")
+
+_TRADIER_HTTP_TIMEOUT_S = 15
+_TRADIER_RATE_INTERVAL_S = 60.0 / 120  # Tradier prod: 120 req/min
+_tradier_last_call = 0.0
+_tradier_lock = asyncio.Lock()
+
+
+async def _tradier_request(path: str, params: dict | None = None) -> dict:
+    """GET a Tradier REST endpoint, return parsed JSON.
+
+    Bearer auth, JSON accept, global ~120 req/min rate limit shared across all
+    option tools. Raises RuntimeError on missing token or non-200 (callers
+    catch and surface {"error": ...}).
+    """
+    if not TRADIER_API_TOKEN:
+        raise RuntimeError("TRADIER_API_TOKEN env var is not set")
+
+    global _tradier_last_call
+    async with _tradier_lock:
+        wait = _TRADIER_RATE_INTERVAL_S - (time.time() - _tradier_last_call)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _tradier_last_call = time.time()
+
+    timeout = aiohttp.ClientTimeout(total=_TRADIER_HTTP_TIMEOUT_S)
+    headers = {"Authorization": f"Bearer {TRADIER_API_TOKEN}", "Accept": "application/json"}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        url = f"{TRADIER_REST_BASE}/{path.lstrip('/')}"
+        async with session.get(url, params=params, headers=headers) as r:
+            text = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"Tradier {path} → {r.status}: {text[:200]}")
+            return json.loads(text)
+
+
+async def _tradier_expirations(symbol: str) -> list[str]:
+    """List option expiration dates (ascending YYYY-MM-DD) for a symbol."""
+    data = await _tradier_request(
+        "markets/options/expirations",
+        {"symbol": symbol.upper(), "includeAllRoots": "true", "strikes": "false"},
+    )
+    expirations = data.get("expirations", {})
+    if expirations == "null" or expirations is None:
+        return []
+    raw = expirations.get("date", []) if isinstance(expirations, dict) else []
+    if isinstance(raw, str):  # Tradier returns a bare string when only one date
+        raw = [raw]
+    return list(raw)
+
+
+async def _tradier_chain(symbol: str, expiration: str, greeks: bool = True) -> list[dict]:
+    """Fetch the raw Tradier option chain for one expiration as a list of dicts.
+
+    Each dict carries Tradier's native field names (strike, option_type, bid,
+    ask, last, volume, open_interest, greeks{delta,gamma,theta,vega,rho,mid_iv,...}).
+    """
+    data = await _tradier_request(
+        "markets/options/chains",
+        {"symbol": symbol.upper(), "expiration": expiration, "greeks": "true" if greeks else "false"},
+    )
+    options = data.get("options", {})
+    if options == "null" or options is None:
+        return []
+    raw = options.get("option", []) if isinstance(options, dict) else []
+    if isinstance(raw, dict):  # single-strike response
+        raw = [raw]
+    return list(raw)
+
+
+async def _tradier_resolve_expiration(symbol: str, expiration: str | None) -> str | None:
+    """If no expiration given, return the nearest future one. Returns None if
+    the symbol has no listed options, or if a given expiration isn't tradeable."""
+    exps = await _tradier_expirations(symbol)
+    if not exps:
+        return None
+    if expiration is None:
+        # Tradier returns ascending; expirations are all >= today.
+        return exps[0]
+    return expiration if expiration in exps else None
+
+
+def _f(v) -> float | None:
+    """Tradier numeric → float|None (Tradier sends numbers, occasionally null)."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _tradier_spot(symbol: str) -> float:
+    """Underlying last price via Tradier quote. Falls back to prevclose if the
+    market is closed and `last` is null. Returns 0.0 if unavailable."""
+    data = await _tradier_request("markets/quotes", {"symbols": symbol.upper(), "greeks": "false"})
+    raw = data.get("quotes", {})
+    if raw == "null" or raw is None:
+        return 0.0
+    q = raw.get("quote") if isinstance(raw, dict) else None
+    if isinstance(q, list):
+        q = q[0] if q else None
+    if not isinstance(q, dict):
+        return 0.0
+    return _f(q.get("last")) or _f(q.get("close")) or _f(q.get("prevclose")) or 0.0
 
 
 HORIZON_TO_DELTA = {
@@ -188,6 +310,11 @@ async def get_info(ticker: str) -> dict:
             "forward_pe": info.get("forwardPE"),
             "trailing_pe": info.get("trailingPE"),
             "dividend_yield": info.get("dividendYield"),
+            # Phase 5M-3 — analyst-driven growth proxy (most recent quarter
+            # YoY EPS growth). Best free signal without paid consensus feed.
+            "earnings_growth": info.get("earningsGrowth"),
+            "revenue_growth": info.get("revenueGrowth"),
+            "payout_ratio": info.get("payoutRatio"),
             "beta": info.get("beta"),
             "employees": info.get("fullTimeEmployees"),
             "next_earnings_date": next_earnings,
@@ -310,6 +437,10 @@ def _bs_greeks(
 
     Returns delta/gamma/theta(per day)/vega(per 1% IV)/rho(per 1% rate).
     None values if any input is degenerate (T<=0, sigma<=0, S<=0, K<=0).
+
+    Kept as a fallback only: options Greeks now come straight from Tradier
+    (greeks subobject + mid_iv). This is used when Tradier returns a contract
+    with no greeks block (rare).
     """
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {"delta": None, "gamma": None, "theta": None, "vega": None, "rho": None}
@@ -358,41 +489,43 @@ def _years_to_expiry(expiration: str) -> float:
     return delta.total_seconds() / (365.0 * 86400.0)
 
 
-def _slim_row(row, spot: float, T: float, r: float, opt_type: str,
+def _slim_row(o: dict, spot: float, T: float, r: float, opt_type: str,
               include_greeks: bool) -> dict:
-    """Reduce one yfinance options-chain row to a brief-friendly dict +
-    optional Greeks. Skip Greeks if IV is missing/zero."""
+    """Reduce one Tradier option dict to a brief-friendly dict + optional
+    Greeks. Schema is identical to the previous yfinance version (consumers
+    rely on these exact field names): Tradier `open_interest` -> openInterest,
+    greeks.mid_iv -> impliedVolatility, `last` -> lastPrice, others verbatim.
+
+    Greeks come straight from Tradier; if Tradier omits the greeks block we
+    fall back to Black-Scholes from mid_iv."""
+    strike = _f(o.get("strike")) or 0.0
+    g = o.get("greeks") or {}
+    mid_iv = _f(g.get("mid_iv"))
     out = {
-        "strike": float(row.strike),
-        "lastPrice": float(row.lastPrice) if row.lastPrice else None,
-        "bid": float(row.bid) if row.bid else None,
-        "ask": float(row.ask) if row.ask else None,
-        "volume": int(row.volume) if row.volume else 0,
-        "openInterest": int(row.openInterest) if row.openInterest else 0,
-        "impliedVolatility": (
-            round(float(row.impliedVolatility), 4)
-            if row.impliedVolatility else None
-        ),
-        "inTheMoney": bool(row.inTheMoney) if hasattr(row, "inTheMoney") else None,
+        "strike": strike,
+        "lastPrice": _f(o.get("last")),
+        "bid": _f(o.get("bid")),
+        "ask": _f(o.get("ask")),
+        "volume": int(o.get("volume") or 0),
+        "openInterest": int(o.get("open_interest") or 0),
+        "impliedVolatility": round(mid_iv, 4) if mid_iv else None,
+        # Tradier doesn't ship an inTheMoney flag; derive it from spot vs strike.
+        "inTheMoney": (
+            (spot > strike) if opt_type == "call" else (spot < strike)
+        ) if spot and strike else None,
     }
-    if include_greeks and out["impliedVolatility"]:
-        out["greeks"] = _bs_greeks(spot, out["strike"], T, r,
-                                   out["impliedVolatility"], opt_type)
+    if include_greeks:
+        if g:
+            out["greeks"] = {
+                "delta": _f(g.get("delta")),
+                "gamma": _f(g.get("gamma")),
+                "theta": _f(g.get("theta")),
+                "vega": _f(g.get("vega")),
+                "rho": _f(g.get("rho")),
+            }
+        elif mid_iv:  # fallback: Tradier gave no greeks but we have an IV
+            out["greeks"] = _bs_greeks(spot, strike, T, r, mid_iv, opt_type)
     return out
-
-
-def _resolve_expiration(t, expiration: str | None) -> str | None:
-    """If no expiration given, pick the nearest in the future. Returns None
-    if the ticker has no options at all."""
-    try:
-        opts = t.options
-    except Exception:
-        return None
-    if not opts:
-        return None
-    if expiration is None:
-        return opts[0]
-    return expiration if expiration in opts else None
 
 
 @mcp.tool()
@@ -403,8 +536,7 @@ async def list_expirations(ticker: str) -> dict:
     get_option_chain or implied_move to know what expirations exist.
     """
     try:
-        t = yf.Ticker(ticker.upper())
-        opts = list(t.options)
+        opts = await _tradier_expirations(ticker)
         log.info("list_expirations %s -> %d expirations", ticker, len(opts))
         return {"ticker": ticker.upper(), "count": len(opts), "expirations": opts}
     except Exception as e:
@@ -428,19 +560,19 @@ async def get_option_chain(
     near_strike_pct: keep strikes within ±this% of spot. Pass 100 for full chain.
     limit: max rows per type after filtering (sorted by closeness to spot).
     with_greeks: when True (default) each row gets a `greeks` subobject
-                 (Δ/Γ/Θ/Vega/Rho). Set False if you only need raw data.
-    risk_free_rate: decimal (0.045 = 4.5%). Use 0 to take the module default.
+                 (Δ/Γ/Θ/Vega/Rho) straight from Tradier. Set False to omit.
+    risk_free_rate: decimal (0.045 = 4.5%). Only used for the Black-Scholes
+                    fallback when Tradier omits a contract's greeks.
 
     Returns calls/puts arrays, sorted by strike ascending.
     """
     try:
-        t = yf.Ticker(ticker.upper())
-        exp = _resolve_expiration(t, expiration or None)
+        exp = await _tradier_resolve_expiration(ticker, expiration or None)
         if exp is None:
             return _err(ticker, ValueError(f"no options or unknown expiration {expiration!r}"),
                         "get_option_chain")
 
-        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        spot = await _tradier_spot(ticker)
         if spot <= 0:
             return _err(ticker, ValueError("could not determine spot price"),
                         "get_option_chain")
@@ -450,9 +582,21 @@ async def get_option_chain(
                         "get_option_chain")
         r = risk_free_rate if risk_free_rate > 0 else DEFAULT_RFR
 
-        chain = t.option_chain(exp)
+        options = await _tradier_chain(ticker, exp, greeks=with_greeks)
         lo = spot * (1 - near_strike_pct / 100.0)
         hi = spot * (1 + near_strike_pct / 100.0)
+
+        def _build(opt_type: str) -> list[dict]:
+            # Tradier option_type is 'call' / 'put'.
+            rows = [o for o in options
+                    if (o.get("option_type") == opt_type
+                        and (_f(o.get("strike")) or 0) >= lo
+                        and (_f(o.get("strike")) or 0) <= hi)]
+            rows.sort(key=lambda o: abs((_f(o.get("strike")) or 0) - spot))
+            rows = rows[:limit]
+            slim = [_slim_row(o, spot, T, r, opt_type, with_greeks) for o in rows]
+            slim.sort(key=lambda d: d["strike"])
+            return slim
 
         result = {
             "ticker": ticker.upper(),
@@ -462,15 +606,9 @@ async def get_option_chain(
             "risk_free_rate": r,
         }
         if contract_type in ("calls", "both"):
-            calls = chain.calls[(chain.calls.strike >= lo) & (chain.calls.strike <= hi)]
-            calls = calls.iloc[(calls.strike - spot).abs().argsort()[:limit]].sort_values("strike")
-            result["calls"] = [_slim_row(r_, spot, T, r, "call", with_greeks)
-                               for r_ in calls.itertuples()]
+            result["calls"] = _build("call")
         if contract_type in ("puts", "both"):
-            puts = chain.puts[(chain.puts.strike >= lo) & (chain.puts.strike <= hi)]
-            puts = puts.iloc[(puts.strike - spot).abs().argsort()[:limit]].sort_values("strike")
-            result["puts"] = [_slim_row(r_, spot, T, r, "put", with_greeks)
-                              for r_ in puts.itertuples()]
+            result["puts"] = _build("put")
         log.info("get_option_chain %s %s near=%g%% -> %d calls / %d puts",
                  ticker, exp, near_strike_pct,
                  len(result.get("calls", [])), len(result.get("puts", [])))
@@ -490,30 +628,40 @@ async def implied_move(ticker: str, expiration: str = "") -> dict:
     expiration: ISO 'YYYY-MM-DD'. If "", uses the nearest in the future.
 
     Computed: pick the strike closest to spot, average its call + put
-    mid-prices (bid/ask average), divide by spot.
+    mid-prices (bid/ask average, else last), divide by spot.
     """
     try:
-        t = yf.Ticker(ticker.upper())
-        exp = _resolve_expiration(t, expiration or None)
+        exp = await _tradier_resolve_expiration(ticker, expiration or None)
         if exp is None:
             return _err(ticker, ValueError("no options available"), "implied_move")
-        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        spot = await _tradier_spot(ticker)
         if spot <= 0:
             return _err(ticker, ValueError("could not determine spot"), "implied_move")
-        chain = t.option_chain(exp)
+        options = await _tradier_chain(ticker, exp, greeks=True)
 
-        def _atm(df):
-            return df.iloc[(df.strike - spot).abs().argsort()[:1]].iloc[0]
+        def _atm(opt_type: str) -> dict | None:
+            rows = [o for o in options if o.get("option_type") == opt_type
+                    and _f(o.get("strike")) is not None]
+            if not rows:
+                return None
+            return min(rows, key=lambda o: abs((_f(o.get("strike")) or 0) - spot))
 
-        c = _atm(chain.calls)
-        p = _atm(chain.puts)
+        c = _atm("call")
+        p = _atm("put")
+        if c is None or p is None:
+            return _err(ticker, ValueError("no ATM call/put in chain"), "implied_move")
 
-        def _mid(bid, ask, last):
-            if bid and ask: return (float(bid) + float(ask)) / 2.0
-            return float(last) if last else 0.0
+        def _mid(o: dict) -> float:
+            bid, ask = _f(o.get("bid")), _f(o.get("ask"))
+            if bid and ask:
+                return (bid + ask) / 2.0
+            return _f(o.get("last")) or 0.0
 
-        call_mid = _mid(c.bid, c.ask, c.lastPrice)
-        put_mid = _mid(p.bid, p.ask, p.lastPrice)
+        def _iv(o: dict) -> float | None:
+            return _f((o.get("greeks") or {}).get("mid_iv"))
+
+        call_mid = _mid(c)
+        put_mid = _mid(p)
         straddle = call_mid + put_mid
         move_pct = straddle / spot * 100.0
         T = _years_to_expiry(exp)
@@ -524,8 +672,8 @@ async def implied_move(ticker: str, expiration: str = "") -> dict:
             "expiration": exp,
             "days_to_expiry": round(T * 365, 2),
             "spot": round(spot, 4),
-            "atm_call_strike": float(c.strike),
-            "atm_put_strike": float(p.strike),
+            "atm_call_strike": _f(c.get("strike")),
+            "atm_put_strike": _f(p.get("strike")),
             "call_mid": round(call_mid, 4),
             "put_mid": round(put_mid, 4),
             "straddle": round(straddle, 4),
@@ -533,12 +681,8 @@ async def implied_move(ticker: str, expiration: str = "") -> dict:
             "implied_move_abs": round(straddle, 4),
             "upper_breakeven": round(spot + straddle, 4),
             "lower_breakeven": round(spot - straddle, 4),
-            "atm_iv_call": (
-                round(float(c.impliedVolatility), 4) if c.impliedVolatility else None
-            ),
-            "atm_iv_put": (
-                round(float(p.impliedVolatility), 4) if p.impliedVolatility else None
-            ),
+            "atm_iv_call": round(_iv(c), 4) if _iv(c) else None,
+            "atm_iv_put": round(_iv(p), 4) if _iv(p) else None,
         }
     except Exception as e:
         return _err(ticker, e, "implied_move")
@@ -561,51 +705,54 @@ async def unusual_activity(
 
     expiration: ISO 'YYYY-MM-DD'. If "", uses the nearest in the future.
 
-    Returns calls + puts, each sorted by vol/OI ratio descending.
+    Returns calls + puts, each sorted by vol/OI ratio descending. Open interest
+    is now Tradier's real broker OI (yfinance reported OI=0 off-hours, which
+    made every strike look unusual).
     """
     try:
-        t = yf.Ticker(ticker.upper())
-        exp = _resolve_expiration(t, expiration or None)
+        exp = await _tradier_resolve_expiration(ticker, expiration or None)
         if exp is None:
             return _err(ticker, ValueError("no options available"), "unusual_activity")
-        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
-        chain = t.option_chain(exp)
+        spot = await _tradier_spot(ticker)
+        options = await _tradier_chain(ticker, exp, greeks=True)
 
-        def _filter_unusual(df):
-            df = df.copy()
-            df["volume_filled"] = df["volume"].fillna(0).astype(int)
-            df["oi_filled"] = df["openInterest"].fillna(0).astype(int)
-            # Treat OI=0 as 1 to avoid div-by-zero; that's still "unusual"
-            # if volume is high.
-            df["vol_oi_ratio"] = df["volume_filled"] / df["oi_filled"].clip(lower=1)
-            df = df[(df["volume_filled"] >= min_volume) &
-                    (df["vol_oi_ratio"] >= min_vol_oi_ratio)]
-            df = df.sort_values("vol_oi_ratio", ascending=False).head(limit)
-            return df
+        def _filter_unusual(opt_type: str) -> list[dict]:
+            rows = []
+            for o in options:
+                if o.get("option_type") != opt_type:
+                    continue
+                vol = int(o.get("volume") or 0)
+                oi = int(o.get("open_interest") or 0)
+                # Treat OI=0 as 1 to avoid div-by-zero; that's still "unusual"
+                # if volume is high. (Matches the prior yfinance behavior; with
+                # Tradier real OI, genuine zero-OI strikes are now rare.)
+                ratio = vol / max(oi, 1)
+                if vol >= min_volume and ratio >= min_vol_oi_ratio:
+                    rows.append((o, vol, oi, ratio))
+            rows.sort(key=lambda x: x[3], reverse=True)
+            return rows[:limit]
 
-        def _row_to_dict(row, opt_type):
+        def _row_to_dict(item, opt_type):
+            o, vol, oi, ratio = item
+            strike = _f(o.get("strike")) or 0.0
+            mid_iv = _f((o.get("greeks") or {}).get("mid_iv"))
             return {
-                "strike": float(row.strike),
+                "strike": strike,
                 "contract_type": opt_type,
-                "volume": int(row.volume_filled),
-                "openInterest": int(row.oi_filled),
-                "vol_oi_ratio": round(float(row.vol_oi_ratio), 2),
-                "lastPrice": float(row.lastPrice) if row.lastPrice else None,
-                "bid": float(row.bid) if row.bid else None,
-                "ask": float(row.ask) if row.ask else None,
-                "impliedVolatility": (
-                    round(float(row.impliedVolatility), 4)
-                    if row.impliedVolatility else None
-                ),
+                "volume": vol,
+                "openInterest": oi,
+                "vol_oi_ratio": round(ratio, 2),
+                "lastPrice": _f(o.get("last")),
+                "bid": _f(o.get("bid")),
+                "ask": _f(o.get("ask")),
+                "impliedVolatility": round(mid_iv, 4) if mid_iv else None,
                 "moneyness_pct": (
-                    round((float(row.strike) / spot - 1) * 100, 2) if spot else None
+                    round((strike / spot - 1) * 100, 2) if spot else None
                 ),
             }
 
-        unusual_calls = [_row_to_dict(r_, "call")
-                         for r_ in _filter_unusual(chain.calls).itertuples()]
-        unusual_puts = [_row_to_dict(r_, "put")
-                        for r_ in _filter_unusual(chain.puts).itertuples()]
+        unusual_calls = [_row_to_dict(it, "call") for it in _filter_unusual("call")]
+        unusual_puts = [_row_to_dict(it, "put") for it in _filter_unusual("put")]
         log.info("unusual_activity %s %s -> %d calls / %d puts",
                  ticker, exp, len(unusual_calls), len(unusual_puts))
         return {
@@ -634,17 +781,20 @@ async def compute_greeks(
     expiration: ISO 'YYYY-MM-DD'.
     strike: exact strike (must exist in the chain).
     contract_type: 'call' or 'put'.
-    risk_free_rate: decimal, 0 takes the module default (4.5%).
+    risk_free_rate: decimal, 0 takes the module default (4.5%). Only used for
+                    the Black-Scholes fallback when Tradier omits greeks.
+
+    Greeks + impliedVolatility (mid_iv) come straight from Tradier.
     """
     if contract_type not in ("call", "put"):
         return _err(ticker, ValueError("contract_type must be 'call' or 'put'"),
                     "compute_greeks")
     try:
-        t = yf.Ticker(ticker.upper())
-        if expiration not in (t.options or []):
+        exps = await _tradier_expirations(ticker)
+        if expiration not in exps:
             return _err(ticker, ValueError(f"unknown expiration {expiration!r}"),
                         "compute_greeks")
-        spot = float(t.fast_info.get("lastPrice") or t.fast_info.get("regularMarketPrice") or 0)
+        spot = await _tradier_spot(ticker)
         if spot <= 0:
             return _err(ticker, ValueError("could not determine spot"), "compute_greeks")
         T = _years_to_expiry(expiration)
@@ -652,18 +802,29 @@ async def compute_greeks(
             return _err(ticker, ValueError("expiration is in the past"), "compute_greeks")
         r = risk_free_rate if risk_free_rate > 0 else DEFAULT_RFR
 
-        chain = t.option_chain(expiration)
-        df = chain.calls if contract_type == "call" else chain.puts
-        row = df[df.strike == strike]
-        if row.empty:
-            available = sorted(df.strike.tolist())
-            nearest = min(available, key=lambda s: abs(s - strike))
+        options = await _tradier_chain(ticker, expiration, greeks=True)
+        same_type = [o for o in options if o.get("option_type") == contract_type
+                     and _f(o.get("strike")) is not None]
+        matches = [o for o in same_type if _f(o.get("strike")) == strike]
+        if not matches:
+            available = sorted(_f(o.get("strike")) for o in same_type)
+            nearest = min(available, key=lambda s: abs(s - strike)) if available else None
             return _err(ticker,
                         ValueError(f"strike {strike} not in chain. Nearest: {nearest}"),
                         "compute_greeks")
-        row = row.iloc[0]
-        iv = float(row.impliedVolatility) if row.impliedVolatility else 0.0
-        greeks = _bs_greeks(spot, strike, T, r, iv, contract_type)
+        o = matches[0]
+        g = o.get("greeks") or {}
+        iv = _f(g.get("mid_iv")) or 0.0
+        if g:  # Tradier greeks (preferred)
+            greeks = {
+                "delta": _f(g.get("delta")),
+                "gamma": _f(g.get("gamma")),
+                "theta": _f(g.get("theta")),
+                "vega": _f(g.get("vega")),
+                "rho": _f(g.get("rho")),
+            }
+        else:  # fallback: Black-Scholes from mid_iv
+            greeks = _bs_greeks(spot, strike, T, r, iv, contract_type)
         log.info("compute_greeks %s %s %s %s -> Δ=%s", ticker, expiration, strike,
                  contract_type, greeks.get("delta"))
         return {
@@ -675,11 +836,11 @@ async def compute_greeks(
             "days_to_expiry": round(T * 365, 2),
             "risk_free_rate": r,
             "impliedVolatility": round(iv, 4) if iv else None,
-            "bid": float(row.bid) if row.bid else None,
-            "ask": float(row.ask) if row.ask else None,
-            "lastPrice": float(row.lastPrice) if row.lastPrice else None,
-            "volume": int(row.volume) if row.volume else 0,
-            "openInterest": int(row.openInterest) if row.openInterest else 0,
+            "bid": _f(o.get("bid")),
+            "ask": _f(o.get("ask")),
+            "lastPrice": _f(o.get("last")),
+            "volume": int(o.get("volume") or 0),
+            "openInterest": int(o.get("open_interest") or 0),
             "greeks": greeks,
         }
     except Exception as e:
