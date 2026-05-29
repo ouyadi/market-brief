@@ -121,7 +121,13 @@ async def _get_json(url: str, params: dict[str, Any] | None = None) -> dict[str,
                             await asyncio.sleep(2.0)
                             continue
                     r.raise_for_status()
-                    return await r.json()
+                    # SEC's Archives static server serves .json files (e.g. a
+                    # filing's index.json) with Content-Type: text/html, which
+                    # aiohttp's .json() rejects with ContentTypeError even though
+                    # the body IS json. content_type=None skips the mimetype
+                    # check and parses the body regardless. (data.sec.gov
+                    # endpoints already send application/json, so this is safe.)
+                    return await r.json(content_type=None)
             except aiohttp.ClientError as e:
                 if attempt == 1:
                     raise
