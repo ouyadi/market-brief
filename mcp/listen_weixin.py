@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -2010,6 +2011,90 @@ async def _await_with_working_ack(awaitable, creds: dict, user_text: str) -> str
     return await task
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Inbound authorization hardening — audit P0 (K1/K2)
+#
+#  The owner check in _handle_message (sender_id == home_channel) is the ONLY
+#  gate in front of code-execution verbs: free-text messages run an UNSANDBOXED
+#  codex/claude with file-write + shell, /brief launches PowerShell, /apply and
+#  /rollback write to disk. A single spoofed or relayed `from_user_id` would
+#  otherwise grant arbitrary code execution on this desktop. Defense in depth:
+#    1. (always on) rate-limit how often the dangerous verbs may fire.
+#    2. (opt-in, recommended) require a per-session unlock with a shared secret
+#       WEIXIN_CONTROL_SECRET before any dangerous verb is honored. Set it in
+#       ~/.hermes/.env and unlock with `/unlock <secret>` (re-lock with `/lock`).
+#  Read-only commands (/heat, /ticker, /context, …) are never gated.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Control config is read from the process env first, then ~/.hermes/.env (the
+# same file _creds() uses) so the owner can keep all WEIXIN_* settings together.
+_HERMES_ENV = _parse_env_file(HERMES_HOME / ".env")
+
+
+def _control_cfg(key: str, default: str = "") -> str:
+    val = os.environ.get(key)
+    if not val:
+        val = _HERMES_ENV.get(key, default)
+    return (val or "").strip()
+
+
+CONTROL_SECRET = _control_cfg("WEIXIN_CONTROL_SECRET")
+UNLOCK_TTL_S = int(_control_cfg("WEIXIN_CONTROL_UNLOCK_TTL_S", "1800") or "1800")
+DANGER_RATELIMIT_N = int(_control_cfg("WEIXIN_DANGER_RATELIMIT_N", "20") or "20")
+DANGER_RATELIMIT_WINDOW_S = int(_control_cfg("WEIXIN_DANGER_RATELIMIT_WINDOW_S", "60") or "60")
+
+# Slash verbs that execute code / write files / launch processes. Free-text
+# (no matching handler) reaches the unsandboxed agent and is dangerous too.
+_DANGER_COMMANDS = {"/brief", "/apply", "/rollback", "/reject"}
+
+_unlock_until: float = 0.0
+_danger_call_times: list[float] = []
+
+
+def _is_danger_invocation(cmd_key: str, has_handler: bool) -> bool:
+    return (not has_handler) or (cmd_key in _DANGER_COMMANDS)
+
+
+def _control_locked() -> bool:
+    """True when a control secret is configured and the session is not unlocked."""
+    if not CONTROL_SECRET:
+        return False
+    return time.monotonic() >= _unlock_until
+
+
+def _handle_lock_unlock(text: str) -> str | None:
+    """Handle `/unlock <secret>` and `/lock`. Returns a reply, or None if the
+    message is neither (normal dispatch then continues). Callers return right
+    after, so the secret is never persisted to the context store."""
+    global _unlock_until
+    parts = text.split(maxsplit=1)
+    verb = parts[0].lower() if parts else ""
+    if verb == "/lock":
+        _unlock_until = 0.0
+        return "🔒 已上锁。危险指令(自由文本 agent、/brief、/apply)需 `/unlock <secret>` 才能执行。"
+    if verb != "/unlock":
+        return None
+    if not CONTROL_SECRET:
+        return "ℹ️ 未配置 WEIXIN_CONTROL_SECRET — 危险指令当前仅由发件人 id + 限流保护。建议在 ~/.hermes/.env 设置 secret 以加固。"
+    supplied = parts[1].strip() if len(parts) > 1 else ""
+    if supplied and hmac.compare_digest(supplied, CONTROL_SECRET):
+        _unlock_until = time.monotonic() + UNLOCK_TTL_S
+        return f"🔓 已解锁 {UNLOCK_TTL_S // 60} 分钟。`/lock` 可立即上锁。"
+    log.warning("control: failed /unlock attempt")
+    return "❌ secret 不正确。"
+
+
+def _danger_rate_ok() -> bool:
+    """Sliding-window rate limit shared by all dangerous verbs."""
+    now = time.monotonic()
+    cutoff = now - DANGER_RATELIMIT_WINDOW_S
+    _danger_call_times[:] = [t for t in _danger_call_times if t >= cutoff]
+    if len(_danger_call_times) >= DANGER_RATELIMIT_N:
+        return False
+    _danger_call_times.append(now)
+    return True
+
+
 async def _handle_message(creds: dict, message: dict) -> None:
     sender_id = str(message.get("from_user_id") or "").strip()
     if not sender_id:
@@ -2032,6 +2117,22 @@ async def _handle_message(creds: dict, message: dict) -> None:
     # Match special commands (case-sensitive, must be prefix)
     cmd_key = text.split()[0].lower()
     handler = COMMANDS.get(cmd_key)
+
+    # ── P0 hardening (K1/K2): lock/unlock + gate code-execution verbs ─────────
+    lock_reply = _handle_lock_unlock(text)
+    if lock_reply is not None:
+        await _push_reply(creds, lock_reply)
+        return
+    if _is_danger_invocation(cmd_key, handler is not None):
+        if _control_locked():
+            log.warning("control: blocked locked danger verb cmd=%s", cmd_key or "(chat)")
+            await _push_reply(creds, "🔒 该操作需先解锁:发送 `/unlock <secret>`。")
+            return
+        if not _danger_rate_ok():
+            log.warning("control: rate-limited danger verb cmd=%s", cmd_key or "(chat)")
+            await _push_reply(creds, "⏳ 危险操作过于频繁,请稍后再试。")
+            return
+
     if handler is not None:
         reply = await _await_with_working_ack(handler(text), creds, text)
         # Phase 2b: self-evolve commands also emit a <proposals>JSON</proposals>
@@ -2156,6 +2257,16 @@ async def main_loop() -> int:
 
     log.info("listener up. account=%s chat=%s",
              creds["account_id"][:8] + "…", creds["home_channel"][:8] + "…")
+
+    if not CONTROL_SECRET:
+        log.warning(
+            "WEIXIN_CONTROL_SECRET not set — code-execution verbs (free-text agent, "
+            "/brief, /apply) are gated ONLY by sender-id + rate-limit. Set "
+            "WEIXIN_CONTROL_SECRET in ~/.hermes/.env and use /unlock <secret> for a second factor."
+        )
+    else:
+        log.info("control: WEIXIN_CONTROL_SECRET active — dangerous verbs require /unlock (TTL %ds)",
+                 UNLOCK_TTL_S)
 
     sync_buf = _load_sync_buf(str(HERMES_HOME), creds["account_id"]) or ""
 
