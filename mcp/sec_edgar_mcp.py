@@ -188,6 +188,45 @@ async def _resolve_cik(ticker_or_cik: str) -> str | None:
     return mp.get(s)
 
 
+# iXBRL "R-files" — R1.htm, R22.htm, … — are per-statement financial-report
+# fragments EDGAR generates from the inline XBRL. They're .htm but almost pure
+# markup (a few hundred chars of text after stripping), so the naïve
+# "first non-exhibit .htm" picker used to land on R1.htm and return ~770 chars
+# instead of the real 10-K body. Exclude them explicitly.
+_IXBRL_R_RE = re.compile(r"(^|/)r\d+\.htm$", re.IGNORECASE)
+
+
+def _pick_primary_doc(documents: list[dict[str, Any]]) -> str | None:
+    """Choose the primary filing document (the actual 10-K / 10-Q / 8-K body)
+    from a filing's document list.
+
+    EDGAR's index.json `type` field is unreliable on the static Archives host
+    (it frequently carries the index *icon* name like "text.gif" rather than a
+    form type), so we cannot key off document type. Instead we pick the
+    LARGEST .htm document that is not an index page, not an exhibit, and not an
+    iXBRL R-fragment. The real filing body is reliably the biggest such file
+    (e.g. NVDA's nvda-YYYYMMDD.htm at ~2 MB dwarfs every R-file).
+    """
+    best_name: str | None = None
+    best_size = -1
+    fallback_name: str | None = None  # any .htm, used if every doc looks excluded
+    fallback_size = -1
+    for d in documents:
+        name = (d.get("name") or "")
+        n = name.lower()
+        if not n.endswith(".htm") and not n.endswith(".html"):
+            continue
+        # Prefer exact byte size; fall back to rounded size_kb if absent.
+        size = int(d.get("size_bytes") or round(float(d.get("size_kb") or 0) * 1024))
+        if size > fallback_size:
+            fallback_size, fallback_name = size, name
+        if "index" in n or n.startswith("ex") or _IXBRL_R_RE.search(n):
+            continue
+        if size > best_size:
+            best_size, best_name = size, name
+    return best_name or fallback_name
+
+
 # ── Tools ──────────────────────────────────────────────────────────────────
 @mcp.tool()
 async def health() -> dict[str, Any]:
@@ -339,21 +378,18 @@ async def get_filing_metadata(
     base = f"{SEC_WWW}/Archives/edgar/data/{int(cik)}/{acc_clean}"
     for it in items:
         name = it.get("name") or ""
+        size_bytes = int(it.get("size") or 0)
         documents.append({
             "name": name,
             "type": it.get("type"),
-            "size_kb": round(int(it.get("size") or 0) / 1024, 1),
+            "size_bytes": size_bytes,
+            "size_kb": round(size_bytes / 1024, 1),
             "url": f"{base}/{name}" if name else None,
         })
 
-    # Try to pick out a primary doc (usually the largest HTML / .htm file
-    # whose name isn't an index or exhibit).
-    primary = None
-    for d in documents:
-        n = (d["name"] or "").lower()
-        if n.endswith(".htm") and "index" not in n and not n.startswith("ex"):
-            primary = d["name"]
-            break
+    # Pick the primary doc — largest non-exhibit, non-iXBRL-fragment .htm.
+    # (See _pick_primary_doc for why size, not the unreliable `type`, drives this.)
+    primary = _pick_primary_doc(documents)
 
     out.update({
         "success": True,
