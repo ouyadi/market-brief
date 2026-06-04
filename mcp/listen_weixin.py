@@ -33,11 +33,13 @@ Or via the install-listener.ps1 scheduled task at log on.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import random
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -82,6 +84,7 @@ START_TIME = time.monotonic()
 GET_UPDATES_TIMEOUT_MS = 30_000
 LONG_POLL_RETRY_BACKOFF_S = 5.0
 LLM_TIMEOUT_S = int(os.environ.get("MARKET_BRIEF_LLM_TIMEOUT_S", "900"))  # 15 min ceiling; long enough for MCP-heavy answers like /critique that re-fetch raw chat windows. Most slash commands finish in <2 min; this is the safety net.
+WORKING_ACK_AFTER_S = int(os.environ.get("WECHAT_WORKING_ACK_AFTER_S", "20"))
 
 # Experimental: periodically ping iLink with a typing indicator (status=1
 # then immediately status=0) to test whether the typing endpoint refreshes
@@ -103,6 +106,19 @@ SELF_EVOLVE_COMMANDS = frozenset({"/reflect", "/critique", "/score", "/kol_drift
 SCRIPTS_DIR = Path(os.environ.get("MARKET_BRIEF_DIR") or (Path.home() / "Scripts" / "market-brief"))
 PROMPT_MD_PATH = SCRIPTS_DIR / "prompt.md"
 MEMORY_MD_PATH = SCRIPTS_DIR / "memory.md"
+CONTEXT_DB_PATH = Path(os.environ.get("WECHAT_CONTEXT_DB") or (SCRIPTS_DIR / "wechat_context.sqlite"))
+CONTEXT_ENABLED = os.environ.get("WECHAT_CONTEXT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+CONTEXT_RECENT_MESSAGES = int(os.environ.get("WECHAT_CONTEXT_RECENT_MESSAGES", "20"))
+CONTEXT_CHAR_BUDGET = int(os.environ.get("WECHAT_CONTEXT_CHAR_BUDGET", "7000"))
+CONTEXT_MEMORY_CHAR_BUDGET = int(os.environ.get("WECHAT_CONTEXT_MEMORY_CHAR_BUDGET", "4500"))
+CONTEXT_MESSAGE_CHAR_LIMIT = int(os.environ.get("WECHAT_CONTEXT_MESSAGE_CHAR_LIMIT", "5000"))
+CONTEXT_SUMMARY_TRIGGER_MESSAGES = int(os.environ.get("WECHAT_CONTEXT_SUMMARY_TRIGGER_MESSAGES", "36"))
+CONTEXT_SUMMARY_TARGET_CHARS = int(os.environ.get("WECHAT_CONTEXT_SUMMARY_TARGET_CHARS", "1800"))
+REMINDER_ENABLED = os.environ.get("WECHAT_REMINDER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+REMINDER_CHECK_INTERVAL_S = int(os.environ.get("WECHAT_REMINDER_CHECK_INTERVAL_S", "900"))
+REMINDER_REPEAT_INTERVAL_S = int(os.environ.get("WECHAT_REMINDER_REPEAT_INTERVAL_S", "2700"))
+REMINDER_MAX_SENDS = int(os.environ.get("WECHAT_REMINDER_MAX_SENDS", "4"))
+REMINDER_BRIEF_LOOKBACK_HOURS = int(os.environ.get("WECHAT_REMINDER_BRIEF_LOOKBACK_HOURS", "30"))
 
 SYSTEM_PROMPT = f"""\
 你是一名美股情报员,通过微信跟用户对话。回答必须简洁、可操作、中文。
@@ -160,12 +176,14 @@ SYSTEM_PROMPT = f"""\
   - 不发推、不下单。
   - 输出尽量短(<800 字),iLink 单条 ~2000 字会被切片。
 
-**重要 — 跨消息上下文**:每条微信消息都是 fresh LLM session,你**看不到**上一条消息或之前 slash command 的回复。所以**当用户提到"上次"/"刚才"/"按你建议"/"那几只"等指代**,你**必须**:
-  1. **Read 本机文件** `{SCRIPTS_DIR}/last_<cmd>.md`(例如 `last_heat.md`、`last_critique.md`、`last_dv.md`、`last_plan.md`、`last_ticker.md`、`last_kol_drift.md`、`last_score.md`)拿上次该 slash command 的完整输出
-  2. **Read 持久记忆** `{MEMORY_MD_PATH}` 拿用户跨次对话稳定的偏好(信号金字塔 / 反指 KOL / SKM = Anthropic proxy 这类)
-  3. **Read 配置** `{PROMPT_MD_PATH}` 看当前 watchlist / KOL 表
+**重要 — 跨消息上下文**:listener 会在每次普通微信问答前自动注入:
+  1. `wechat_context.sqlite` 的本微信会话滚动摘要 + 最近对话
+  2. `{MEMORY_MD_PATH}` 的长期系统记忆摘要(截断)
+  3. 当前用户消息
 
-**这三个文件确实存在**,不要轻信"找不到"就回"我看不到上下文" — 一定先 Read 试一下。Read 失败再说找不到。
+因此当用户提到"上次"/"刚才"/"按你建议"/"那几只"等指代,先用自动注入的微信上下文解析。若仍不够,再 Read 本机文件 `{SCRIPTS_DIR}/last_<cmd>.md`(例如 `last_heat.md`、`last_critique.md`、`last_dv.md`、`last_plan.md`、`last_ticker.md`、`last_kol_drift.md`、`last_score.md`)拿上次 slash command 的完整输出,并 Read `{PROMPT_MD_PATH}` / `{MEMORY_MD_PATH}` 补足配置和长期偏好。
+
+**记忆边界**:微信上下文是短期会话状态;`memory.md` 是长期系统规则。不要把临时聊天自动当成永久事实。只有用户明确说"记住"/"以后都这样"/"改规则"时,才建议把稳定偏好沉淀到 `memory.md`。
 
 **重要 — 简报细节查询路径(关键)**:用户在微信收到的是**只有"📱 微信速读"的精简版**(≤1900 字, 5 个 setup + 跨V + 宏观 + 技术位)。当用户在微信对话里**进一步问简报细节**, 关键词例:**"X 详情" / "刚才 INTC 那段展开" / "ASTS JPM 那段" / "完整 INTC 分析" / "把 setup 都给我" / "🎙 大 V 都说啥" / "宏观展开"** 等, 你**必须**:
 
@@ -235,6 +253,673 @@ def _creds() -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+#  WeChat conversation memory
+# ────────────────────────────────────────────────────────────────────────────
+
+def _context_now() -> int:
+    return int(time.time())
+
+
+def _clip_text(value: str, limit: int) -> str:
+    value = (value or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"\n...[truncated {len(value) - limit} chars]"
+
+
+def _context_conn() -> sqlite3.Connection:
+    CONTEXT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(CONTEXT_DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _init_context_db() -> None:
+    if not CONTEXT_ENABLED:
+        return
+    with _context_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'chat',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summaries (
+                chat_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                last_message_id INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_id_id ON messages(chat_id, id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                event_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                source_path TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                acked_at INTEGER,
+                last_sent_at INTEGER,
+                next_send_at INTEGER NOT NULL,
+                send_count INTEGER NOT NULL DEFAULT 0,
+                max_sends INTEGER NOT NULL DEFAULT 4
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(acked_at, next_send_at, send_count)"
+        )
+
+
+def _record_context_message(chat_id: str, role: str, content: str, source: str = "chat") -> None:
+    if not CONTEXT_ENABLED or not chat_id or not content.strip():
+        return
+    _init_context_db()
+    with _context_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO messages(chat_id, role, content, source, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (chat_id, role, _clip_text(content, CONTEXT_MESSAGE_CHAR_LIMIT), source, _context_now()),
+        )
+
+
+def _clear_context(chat_id: str) -> None:
+    _init_context_db()
+    with _context_conn() as conn:
+        conn.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+        conn.execute("DELETE FROM summaries WHERE chat_id=?", (chat_id,))
+
+
+def _context_overview(chat_id: str, sample: int = 6) -> str:
+    if not CONTEXT_ENABLED:
+        return "微信短期记忆: disabled (WECHAT_CONTEXT_ENABLED=0)"
+    _init_context_db()
+    with _context_conn() as conn:
+        msg_count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,)
+        ).fetchone()[0]
+        summary_row = conn.execute(
+            "SELECT summary, updated_at, last_message_id FROM summaries WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT role, content, source, created_at
+            FROM messages
+            WHERE chat_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, sample),
+        ).fetchall()
+    summary = (summary_row["summary"] if summary_row else "").strip()
+    lines = [
+        "微信短期记忆: enabled",
+        f"DB: {CONTEXT_DB_PATH}",
+        f"messages: {msg_count}",
+        f"rolling_summary: {'yes' if summary else 'no'}",
+    ]
+    if summary:
+        lines.append("\n摘要:")
+        lines.append(_clip_text(summary, 700))
+    if rows:
+        lines.append("\n最近消息:")
+        for row in reversed(rows):
+            ts = time.strftime("%m-%d %H:%M", time.localtime(int(row["created_at"])))
+            content = _clip_text(row["content"], 220).replace("\n", " ")
+            lines.append(f"- {ts} {row['role']}[{row['source']}]: {content}")
+    return "\n".join(lines)
+
+
+def _load_memory_snapshot() -> str:
+    if CONTEXT_MEMORY_CHAR_BUDGET <= 0 or not MEMORY_MD_PATH.exists():
+        return ""
+    try:
+        return _clip_text(MEMORY_MD_PATH.read_text(encoding="utf-8"), CONTEXT_MEMORY_CHAR_BUDGET)
+    except Exception as exc:
+        log.warning("context: failed reading memory.md: %s", exc)
+        return ""
+
+
+def _load_wechat_context(chat_id: str | None) -> str:
+    if not CONTEXT_ENABLED or not chat_id:
+        return ""
+    _init_context_db()
+    with _context_conn() as conn:
+        summary_row = conn.execute(
+            "SELECT summary FROM summaries WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT role, content, source, created_at
+            FROM messages
+            WHERE chat_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, CONTEXT_RECENT_MESSAGES),
+        ).fetchall()
+
+    memory_snapshot = _load_memory_snapshot()
+    parts = [
+        "\n\n# 微信后端上下文记忆\n",
+        "下面内容由 listener 自动注入,用于解决微信多轮对话 stateless。"
+        "优先用它解析'刚才/上一条/第二个方案/按你建议'等指代。"
+        "不要把临时聊天自动当成长期规则;只有用户明确说'记住/以后都这样'时,才建议沉淀到 memory.md。\n",
+    ]
+    if memory_snapshot:
+        parts.append("\n## 长期系统记忆 memory.md 摘要(截断)\n")
+        parts.append("```md\n" + memory_snapshot + "\n```\n")
+    summary = (summary_row["summary"] if summary_row else "").strip()
+    if summary:
+        parts.append("\n## 本微信会话滚动摘要\n")
+        parts.append(summary + "\n")
+    if rows:
+        parts.append("\n## 最近微信对话(旧→新)\n")
+        total = 0
+        kept: list[str] = []
+        for row in reversed(rows):
+            ts = time.strftime("%m-%d %H:%M", time.localtime(int(row["created_at"])))
+            content = row["content"].strip()
+            line = f"{ts} {row['role']}[{row['source']}]: {content}"
+            total += len(line)
+            kept.append(line)
+            while total > CONTEXT_CHAR_BUDGET and kept:
+                total -= len(kept.pop(0))
+        parts.append("\n".join(kept) + "\n")
+    parts.append("\n# 当前用户消息\n")
+    return "".join(parts)
+
+
+async def _refresh_context_summary_if_needed(chat_id: str) -> None:
+    if not CONTEXT_ENABLED or CONTEXT_SUMMARY_TRIGGER_MESSAGES <= 0:
+        return
+    _init_context_db()
+    with _context_conn() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,)
+        ).fetchone()[0]
+        if count <= CONTEXT_SUMMARY_TRIGGER_MESSAGES:
+            return
+        cutoff_row = conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE chat_id=?
+            ORDER BY id DESC
+            LIMIT 1 OFFSET ?
+            """,
+            (chat_id, max(CONTEXT_RECENT_MESSAGES, 0)),
+        ).fetchone()
+        if not cutoff_row:
+            return
+        cutoff_id = int(cutoff_row["id"])
+        summary_row = conn.execute(
+            "SELECT summary, last_message_id FROM summaries WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        last_message_id = int(summary_row["last_message_id"]) if summary_row else 0
+        existing_summary = (summary_row["summary"] if summary_row else "").strip()
+        if cutoff_id <= last_message_id:
+            return
+        rows = conn.execute(
+            """
+            SELECT id, role, content, source, created_at
+            FROM messages
+            WHERE chat_id=? AND id>? AND id<=?
+            ORDER BY id ASC
+            """,
+            (chat_id, last_message_id, cutoff_id),
+        ).fetchall()
+    if not rows:
+        return
+
+    transcript = []
+    for row in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(row["created_at"])))
+        transcript.append(f"{ts} {row['role']}[{row['source']}]: {row['content']}")
+    prompt = (
+        "你在维护一个微信后端 LLM 的滚动会话摘要。"
+        "请把旧摘要和新增对话合并成中文要点,保留用户偏好、未完成事项、指代对象、已给出的建议和明确承诺。"
+        "删除寒暄、重复内容和过期细节。不要新增事实。"
+        f"目标长度 <= {CONTEXT_SUMMARY_TARGET_CHARS} 字。\n\n"
+        f"旧摘要:\n{existing_summary or '(none)'}\n\n"
+        "新增对话:\n" + "\n".join(transcript)
+    )
+    summary = await _run_codex_prompt(prompt, timeout_s=min(LLM_TIMEOUT_S, 300))
+    if not summary or summary.startswith("❌"):
+        log.warning("context: summary refresh skipped: %s", summary[:160])
+        return
+    summary = _clip_text(summary, CONTEXT_SUMMARY_TARGET_CHARS)
+    with _context_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO summaries(chat_id, summary, updated_at, last_message_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                summary=excluded.summary,
+                updated_at=excluded.updated_at,
+                last_message_id=excluded.last_message_id
+            """,
+            (chat_id, summary, _context_now(), cutoff_id),
+        )
+        conn.execute(
+            "DELETE FROM messages WHERE chat_id=? AND id<=?",
+            (chat_id, cutoff_id),
+        )
+    log.info("context: refreshed rolling summary through message id %s", cutoff_id)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Proactive reminder inbox
+# ────────────────────────────────────────────────────────────────────────────
+
+def _reminder_id_slug(event_id: str) -> str:
+    return event_id.split(":", 1)[-1][:32]
+
+
+def _format_observation_lines(prop: dict, limit: int = 2) -> list[str]:
+    rows: list[str] = []
+    for obs in (prop.get("observations") or [])[:limit]:
+        if not isinstance(obs, dict):
+            continue
+        quote = str(obs.get("quote") or "").strip()
+        if not quote:
+            continue
+        where = str(obs.get("file") or "").strip()
+        line = obs.get("line")
+        if line:
+            where = f"{where}:{line}" if where else f"line {line}"
+        rows.append(f"- {_clip_text(quote, 150)}" + (f" ({where})" if where else ""))
+    return rows
+
+
+def _proposal_action_hint(prop_id: str, writable: bool) -> str:
+    if writable:
+        return (
+            f"操作: `/show {prop_id}` 看改动;确认就 `/apply {prop_id}`;不采纳用 `/reject {prop_id}`。"
+        )
+    return (
+        f"操作: `/show {prop_id}` 看完整证据;人工处理后可 `/reject {prop_id}` 归档。"
+    )
+
+
+def _proposal_ack_selector(prop_id: str) -> str:
+    parts = prop_id.split("_")
+    if len(parts) >= 3:
+        return "_".join(parts[-3:])
+    return prop_id[-12:] if len(prop_id) > 12 else prop_id
+
+
+def _format_proposal_reminder(prop: dict) -> tuple[str, str]:
+    prop_id = str(prop.get("id") or "").strip()
+    kind = str(prop.get("kind") or "proposal")
+    command = str(prop.get("command") or "").strip()
+    confidence = str(prop.get("confidence") or "?").strip()
+    writable = bool(prop.get("writable"))
+    source_kind = str(prop.get("source_kind") or "").strip()
+    summary = str(prop.get("summary") or "").strip()
+    patch = str(prop.get("patch") or prop.get("target_section") or "").strip()
+    confidence_zh = {"high": "高", "mid": "中", "low": "低"}.get(confidence, confidence)
+
+    if kind == "watchlist_candidate":
+        ticker = str(prop.get("ticker") or "未命名标的").strip().upper()
+        heat_count = prop.get("heat_count")
+        heat = f"热度 {heat_count}" if heat_count not in (None, "") else "热度待确认"
+        title = f"建议人工确认是否加入 watchlist: {ticker}"
+        lines = [
+            f"系统发现 `{ticker}` 在最近简报里反复出现,可能值得纳入跟踪。",
+            f"结论: {summary or '需要你判断是否真的有可持续 thesis。'}",
+            f"强度: {confidence_zh}置信 / {heat}",
+        ]
+        evidence = _format_observation_lines(prop)
+        if evidence:
+            lines.append("证据:")
+            lines.extend(evidence)
+        lines.extend([
+            _proposal_action_hint(prop_id, writable=False),
+            f"不想再提醒: `/ack {_proposal_ack_selector(prop_id)}`",
+        ])
+        return title, "\n".join(lines)
+
+    if kind == "kol_drift":
+        handle = str(prop.get("handle") or "某个 KOL").strip()
+        current_desc = str(prop.get("current_desc") or "").strip()
+        actual_focus = str(prop.get("actual_focus") or "").strip()
+        suggested_desc = str(prop.get("suggested_desc") or summary or "").strip()
+        title = f"建议复核 KOL 描述: {handle}"
+        lines = [
+            f"`{handle}` 的近期内容可能和当前大V库描述不一致。",
+            f"观察到: {actual_focus or '近期关注点发生变化。'}",
+        ]
+        if current_desc:
+            lines.append(f"当前描述: {_clip_text(current_desc, 180)}")
+        if suggested_desc:
+            lines.append(f"建议描述: {_clip_text(suggested_desc, 220)}")
+        evidence = _format_observation_lines(prop)
+        if evidence:
+            lines.append("证据:")
+            lines.extend(evidence)
+        lines.extend([
+            _proposal_action_hint(prop_id, writable=False),
+            f"不想再提醒: `/ack {_proposal_ack_selector(prop_id)}`",
+        ])
+        return title, "\n".join(lines)
+
+    if kind in {"positive_experience", "negative_experience", "gap", "rule_update"}:
+        zh = {
+            "positive_experience": "沉淀一条有效经验",
+            "negative_experience": "沉淀一条避坑经验",
+            "gap": "修补一次信息漏扫",
+            "rule_update": "调整一条评分/运行规则",
+        }.get(kind, "复核 self-evolve 建议")
+        title = f"Self-evolve 建议: {zh}"
+        lines = [
+            summary or zh,
+            f"置信: {confidence_zh}" + (f" / 来源: {source_kind}" if source_kind else ""),
+        ]
+        if patch:
+            lines.append("拟写入内容:")
+            lines.append(_clip_text(patch, 520))
+        evidence = _format_observation_lines(prop)
+        if evidence:
+            lines.append("证据:")
+            lines.extend(evidence)
+        lines.extend([
+            _proposal_action_hint(prop_id, writable=writable),
+            f"不想再提醒: `/ack {_proposal_ack_selector(prop_id)}`",
+        ])
+        return title, "\n".join(lines)
+
+    title = f"Self-evolve 建议待审: {kind or command or 'proposal'}"
+    body = (
+        f"{summary or _clip_text(patch, 500) or '有一条 self-evolve 建议需要你判断。'}\n"
+        f"置信: {confidence_zh}; 是否可直接落盘: {'是' if writable else '否'}\n"
+        f"{_proposal_action_hint(prop_id, writable=writable)}\n"
+        f"不想再提醒: `/ack {_proposal_ack_selector(prop_id)}`"
+    )
+    return title, body
+
+
+def _extract_markdown_section(markdown: str, heading: str) -> str:
+    marker = f"## {heading}"
+    start = markdown.find(marker)
+    if start < 0:
+        return ""
+    rest = markdown[start + len(marker):]
+    next_match = re.search(r"\n##\s+", rest)
+    if next_match:
+        rest = rest[: next_match.start()]
+    return rest.strip()
+
+
+def _upsert_reminder(
+    event_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    source_path: str = "",
+    *,
+    max_sends: int = REMINDER_MAX_SENDS,
+) -> None:
+    if not REMINDER_ENABLED:
+        return
+    _init_context_db()
+    now = _context_now()
+    with _context_conn() as conn:
+        existing = conn.execute(
+            "SELECT acked_at FROM reminders WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if existing and existing["acked_at"]:
+            return
+        conn.execute(
+            """
+            INSERT INTO reminders(
+                event_id, kind, title, body, source_path, created_at, updated_at,
+                acked_at, last_sent_at, next_send_at, send_count, max_sends
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                title=excluded.title,
+                body=excluded.body,
+                source_path=excluded.source_path,
+                updated_at=excluded.updated_at,
+                max_sends=excluded.max_sends
+            """,
+            (
+                event_id,
+                kind,
+                _clip_text(title, 240),
+                _clip_text(body, 1700),
+                source_path,
+                now,
+                now,
+                now,
+                max_sends,
+            ),
+        )
+
+
+def _ack_reminders(selector: str = "all") -> int:
+    _init_context_db()
+    selector = (selector or "all").strip()
+    now = _context_now()
+    with _context_conn() as conn:
+        if selector.lower() in {"all", "*", "全部"}:
+            cur = conn.execute(
+                "UPDATE reminders SET acked_at=?, updated_at=? WHERE acked_at IS NULL",
+                (now, now),
+            )
+            return int(cur.rowcount or 0)
+        like = f"%{selector}%"
+        cur = conn.execute(
+            """
+            UPDATE reminders
+            SET acked_at=?, updated_at=?
+            WHERE acked_at IS NULL AND (event_id LIKE ? OR title LIKE ?)
+            """,
+            (now, now, like, like),
+        )
+        return int(cur.rowcount or 0)
+
+
+def _list_open_reminders(limit: int = 10) -> str:
+    if not REMINDER_ENABLED:
+        return "主动提醒: disabled (WECHAT_REMINDER_ENABLED=0)"
+    _init_context_db()
+    with _context_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT event_id, kind, title, send_count, max_sends, next_send_at
+            FROM reminders
+            WHERE acked_at IS NULL
+            ORDER BY next_send_at ASC, updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return "当前没有待确认提醒。"
+    lines = ["待确认提醒:"]
+    for row in rows:
+        due = time.strftime("%m-%d %H:%M", time.localtime(int(row["next_send_at"])))
+        lines.append(
+            f"- `{_reminder_id_slug(row['event_id'])}` [{row['kind']}] "
+            f"{row['title']} ({row['send_count']}/{row['max_sends']}, next {due})"
+        )
+    lines.append("\n用 `/ack <id>` 停止某条提醒,或 `/ack all` 全部确认。")
+    return "\n".join(lines)
+
+
+def _sync_proposal_reminders() -> None:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        pending = selfevolve.list_pending_proposals(max_age_days=90)
+    except Exception as exc:
+        log.warning("reminder: proposal sync failed: %s", exc)
+        return
+    pending_ids = {str(p.get("id") or "") for p in pending}
+
+    for prop in pending:
+        prop_id = str(prop.get("id") or "").strip()
+        if not prop_id:
+            continue
+        title, body = _format_proposal_reminder(prop)
+        _upsert_reminder(
+            f"proposal:{prop_id}",
+            "proposal",
+            title,
+            body,
+            str(selfevolve.PROPOSALS_DIR / f"{prop_id}.json"),
+            max_sends=REMINDER_MAX_SENDS,
+        )
+
+    _init_context_db()
+    now = _context_now()
+    with _context_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_id FROM reminders WHERE kind='proposal' AND acked_at IS NULL"
+        ).fetchall()
+        for row in rows:
+            prop_id = str(row["event_id"]).split(":", 1)[-1]
+            if prop_id not in pending_ids:
+                conn.execute(
+                    "UPDATE reminders SET acked_at=?, updated_at=? WHERE event_id=?",
+                    (now, now, row["event_id"]),
+                )
+
+
+def _sync_brief_alert_reminders() -> None:
+    reports_dir = Path.home() / "Reports"
+    if not reports_dir.exists():
+        return
+    cutoff = time.time() - REMINDER_BRIEF_LOOKBACK_HOURS * 3600
+    for path in sorted(reports_dir.glob("[0-9]*-[0-9]*-[0-9]*-[0-9]*-brief.md"))[-48:]:
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        section = _extract_markdown_section(text, "🚨 主动提醒")
+        if not section:
+            continue
+        normalized = section.strip()
+        if not normalized or re.fullmatch(r"[\s\-*]*(无|none|no alert|no alerts|n/a)[\s。.]?", normalized, re.I):
+            continue
+        digest = hashlib.sha1(normalized.encode("utf-8", "ignore")).hexdigest()[:10]
+        event_id = f"brief-alert:{path.stem}:{digest}"
+        first_line = next((ln.strip(" -*") for ln in normalized.splitlines() if ln.strip()), "简报特别机会")
+        body = (
+            f"🚨 简报特别提醒: {path.stem}\n"
+            f"{_clip_text(normalized, 1450)}\n\n"
+            f"想展开就直接问 ticker/主题;停止提醒: `/ack {path.stem[-8:]}`"
+        )
+        _upsert_reminder(
+            event_id,
+            "brief_alert",
+            first_line,
+            body,
+            str(path),
+            max_sends=REMINDER_MAX_SENDS,
+        )
+
+
+def _due_reminders(limit: int = 3) -> list[sqlite3.Row]:
+    _init_context_db()
+    now = _context_now()
+    with _context_conn() as conn:
+        return conn.execute(
+            """
+            SELECT event_id, kind, title, body, send_count, max_sends
+            FROM reminders
+            WHERE acked_at IS NULL
+              AND send_count < max_sends
+              AND next_send_at <= ?
+            ORDER BY next_send_at ASC, updated_at DESC
+            LIMIT ?
+            """,
+            (now, limit),
+        ).fetchall()
+
+
+def _mark_reminder_sent(event_id: str) -> None:
+    now = _context_now()
+    with _context_conn() as conn:
+        conn.execute(
+            """
+            UPDATE reminders
+            SET send_count=send_count+1,
+                last_sent_at=?,
+                next_send_at=?,
+                updated_at=?
+            WHERE event_id=?
+            """,
+            (now, now + REMINDER_REPEAT_INTERVAL_S, now, event_id),
+        )
+
+
+async def _send_due_reminders(creds: dict) -> None:
+    if not REMINDER_ENABLED:
+        return
+    _sync_proposal_reminders()
+    _sync_brief_alert_reminders()
+    rows = _due_reminders()
+    if not rows:
+        return
+    chunks: list[str] = ["🔔 待处理提醒"]
+    for row in rows:
+        chunks.append(
+            f"\n第 {row['send_count'] + 1}/{row['max_sends']} 次提醒: {row['title']}\n"
+            f"{row['body']}"
+        )
+    chunks.append("\n回复 `/reminders` 查看全部; `/ack <id>` 停止某条; `/ack all` 全部确认。")
+    await _push_reply(creds, _clip_text("\n".join(chunks), 1900))
+    for row in rows:
+        _mark_reminder_sent(row["event_id"])
+    log.info("reminder: pushed %d due reminder(s)", len(rows))
+
+
+async def _reminder_loop(creds: dict) -> None:
+    if not REMINDER_ENABLED:
+        log.info("reminder: disabled (WECHAT_REMINDER_ENABLED=0)")
+        return
+    log.info(
+        "reminder: checking every %d s, repeat=%d s, max_sends=%d",
+        REMINDER_CHECK_INTERVAL_S,
+        REMINDER_REPEAT_INTERVAL_S,
+        REMINDER_MAX_SENDS,
+    )
+    try:
+        while True:
+            try:
+                await _send_due_reminders(creds)
+            except Exception:
+                log.exception("reminder: check failed")
+            await asyncio.sleep(REMINDER_CHECK_INTERVAL_S)
+    except asyncio.CancelledError:
+        log.info("reminder: cancelled (listener shutting down)")
+        raise
+
+
+# ────────────────────────────────────────────────────────────────────────────
 #  command handlers
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -251,12 +936,17 @@ async def _handle_ping(text: str = "") -> str:
 
 async def _handle_brief(text: str = "") -> str:
     # Pick the right scheduler kick command per platform.
-    # Windows: Task Scheduler  -> powershell Start-ScheduledTask MarketBrief
+    # Windows: direct background run with -Force so explicit /brief bypasses
+    # the auto market-hours token guard.
     # macOS:   launchd         -> launchctl kickstart -k gui/<uid>/com.ouyadi.market-brief
     if sys.platform == "win32":
+        runner = SCRIPTS_DIR / "run.ps1"
+        if not runner.exists():
+            return f"✗ 找不到 runner: {runner}"
         cmd = (
             "powershell.exe", "-NoProfile", "-Command",
-            "Start-ScheduledTask -TaskName MarketBrief",
+            "Start-Process -WindowStyle Hidden -FilePath powershell.exe "
+            f"-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{runner}','-Force')",
         )
     elif sys.platform == "darwin":
         cmd = (
@@ -280,11 +970,45 @@ async def _handle_brief(text: str = "") -> str:
         return f"✗ 触发异常: {exc}"
 
 
+async def _handle_context(text: str = "") -> str:
+    chat_id = _creds().get("home_channel", "")
+    if not chat_id:
+        return "✗ 找不到 WEIXIN_HOME_CHANNEL,无法读取微信短期记忆。"
+    return _context_overview(chat_id)
+
+
+async def _handle_reset_context(text: str = "") -> str:
+    chat_id = _creds().get("home_channel", "")
+    if not chat_id:
+        return "✗ 找不到 WEIXIN_HOME_CHANNEL,无法清空微信短期记忆。"
+    _clear_context(chat_id)
+    return "✓ 已清空本微信会话短期记忆和滚动摘要。"
+
+
+async def _handle_reminders(text: str = "") -> str:
+    _sync_proposal_reminders()
+    _sync_brief_alert_reminders()
+    return _list_open_reminders()
+
+
+async def _handle_ack(text: str = "") -> str:
+    args = text.split(maxsplit=1)
+    selector = args[1].strip() if len(args) > 1 else "all"
+    n = _ack_reminders(selector)
+    if n:
+        return f"✓ 已确认 {n} 条提醒,不会继续重复推送。"
+    return f"未找到匹配的待确认提醒:`{selector}`。可用 `/reminders` 查看。"
+
+
 async def _handle_help(text: str = "") -> str:
     return (
         "可用命令:\n"
         "  /ping              测试 listener 在线\n"
         "  /brief             立刻触发一次 market-brief\n"
+        "  /context           查看微信短期记忆状态和最近几条上下文\n"
+        "  /reset_context     清空微信短期记忆和滚动摘要\n"
+        "  /reminders         查看待确认主动提醒\n"
+        "  /ack [id|all]      停止某条/全部提醒继续重复推送\n"
         "  /dv [handle] [Xh]  大 V 速读 (默认: 全部大 V × 过去 2h)\n"
         "                     例: `/dv 6h` / `/dv cathiedwood` / `/dv cathiedwood 24h`\n"
         "  /xfeed [tab] [N]   X 个人时间线简报 (默认: For You + Following, 各 15 条)\n"
@@ -353,18 +1077,18 @@ async def _handle_dv(text: str = "") -> str:
     else:
         prompt = (
             f"步骤 1: Read 文件 `{PROMPT_MD_PATH}`,定位 '### 大 V X 账号' 节,"
-            f"提取该表格里所有 X handle (列 'X handle (without @)')。"
+            f"提取该表格里所有 X handle (列 'X handle (without @)')和第三列 `[tier · category · signal_type]` 标签。"
             f"步骤 2: 调 `mcp__chatlog__current_time` 拿当前 EDT,计算 since = now - {window}。"
-            f"步骤 3: 对每个 handle 并行调 `mcp__twitter__fetch_user_tweets(username=handle, limit=15)`。"
+            f"步骤 3: 默认只拉 tier1 + local_confirmed;如果窗口是 12h+ 或明确要求'all',再拉 tier2。对选中的 handle 并行调 `mcp__twitter__fetch_user_tweets(username=handle, limit=15)`。"
             f"步骤 4: 过滤掉 posted_at < since 的推。**0 条新推的 handle 在最终输出里跳过**。"
             f"步骤 5: 输出简洁中文 markdown:\n"
             f"## 🎙️ 大 V 速读 — 过去 {window}\n"
             f"按信息量 ×独家性排序,每个 handle 一小段:\n"
-            f"- **@handle** ({{N}} 条新推):\n"
+            f"- **@handle** `[tier/category]` ({{N}} 条新推):\n"
             f"  - `时间(HH:MM)` 原文(<200 字,长则截断) — 一句话解读(提到的 ticker / 立场)\n"
             f"末尾跨大 V 信号(可选):\n"
             f"> ⚡ 跨大 V:\n"
-            f"> - 共识看多/看空: 若 ≥2 大 V 提同 ticker 方向一致\n"
+            f"> - 共识看多/看空: 若 ≥2 大 V 提同 ticker 方向一致;headline relay 重复同一事实只算 1 个源\n"
             f"> - 新出现 ticker: 该窗口首次被任一大 V 提及的\n"
             f"如果所有大 V 都 0 条:回复 '过去 {window} 跟踪的大 V 全员无新推'。\n"
             f"如果 mcp__twitter__ 工具不可用:回复'X-MCP 暂不可用(检查 TwitterMCP scheduled task)'。\n"
@@ -699,13 +1423,13 @@ async def _handle_kol_drift(text: str = "") -> str:
     prompt = (
         f"# KOL 主战场漂移审查\n\n"
         f"**步骤 1**:Read `{PROMPT_MD_PATH}` 的'### 大 V X 账号'表 + Read "
-        f"`{MEMORY_MD_PATH}`的'KOL 真实角度'章节,知道每个大 V 当前**应该**是什么主战场。\n\n"
+        f"`{MEMORY_MD_PATH}`的'KOL 真实角度'和'X 财经大V库 v1 权重机制'章节,知道每个大 V 当前**应该**是什么主战场与 tier/category/signal_type。\n\n"
         f"**步骤 2**:对表里**每个**大 V 并行调 "
         f"`mcp__twitter__fetch_user_tweets(username=handle, limit=30)`。\n\n"
         f"**步骤 3**:对每个大 V 分析最近 30 条推的**主题分布**:\n"
         f"  - 主要谈什么 ticker / sector / 宏观主题\n"
         f"  - 占比最高的 2-3 个 theme 是什么\n"
-        f"  - 跟 prompt.md/memory.md 里描述的'主战场'/'真实角度'比较\n\n"
+        f"  - 跟 prompt.md/memory.md 里描述的'主战场'/'真实角度'比较;第三列开头的 `[tier · category · signal_type]` 是分类标签,只有当最近 30 条主题长期偏离该 category 时才算分类漂移\n\n"
         f"**步骤 4**:判断漂移程度:\n"
         f"  - **无漂移**:主战场跟描述一致,推占比 60%+ 跟描述对得上\n"
         f"  - **轻微**:60%-30% 跟描述对得上 — **不报**\n"
@@ -717,7 +1441,7 @@ async def _handle_kol_drift(text: str = "") -> str:
         f"```\n"
         f"## KOL 漂移审查 ({{日期}})\n\n"
         f"### @handle (drift: 中/重)\n"
-        f"- **当前描述**: <copy from prompt.md / memory.md 一句话>\n"
+        f"- **当前描述**: <copy from prompt.md / memory.md 一句话,含 tier/category 标签>\n"
         f"- **实际最近 30 天主战场**: <具体描述 + 引用 1-2 条最 representative 推作为证据>\n"
         f"- **建议新描述**: <新一句话主战场,反映真实焦点>\n"
         f"- **置信度**: 高/中/低\n"
@@ -728,7 +1452,7 @@ async def _handle_kol_drift(text: str = "") -> str:
         f"- 只列 ≥中等漂移,**不报**轻微漂移(否则信噪比太低)\n"
         f"- 反指 KOL 仍维持 inverse 关系不算漂移\n"
         f"- 必须用具体推作证据,不允许'感觉漂了'这种主观判断\n"
-        f"- 建议描述要可直接 copy 进 prompt.md / memory.md 表里,不要加额外评论"
+        f"- 建议描述要可直接 copy 进 prompt.md / memory.md 表里,不要加额外评论;若只是权重变化,输出 rule suggestion,不要建议改 handle 本身"
         + selfevolve.json_epilogue("kol_drift")
     )
     return await _ask_llm(prompt)
@@ -886,21 +1610,23 @@ async def _handle_score(text: str = "") -> str:
         f"# ⚡ Setup 命中率审查\n\n"
         f"**窗口**:过去 **{lookback_days} 天**的盘前简报;**评估 horizon**:{horizon}\n\n"
         f"**步骤 1**:`ls ~/Reports/` 找最近 {lookback_days} 天的盘前简报。文件名格式 `YYYY-MM-DD-HH-brief.md`,**只取 HH < 09** 的(盘前)。逐份 Read。\n\n"
-        f"**步骤 2**:从每份简报的 `## ⚡ 高优先级关注` section 提取每个 setup 的元组 `(ticker, brief_publish_time, 立场[多/空/观望], target?, source[群/大V/Polymarket])`:\n"
+        f"**步骤 2**:Read 当前 `{PROMPT_MD_PATH}` 的'### 大 V X 账号'表,解析每行第三列开头的 `[tier · category · signal_type]` 标签。建立 handle → `tier/categories/signal_types/is_inverse` 映射;没有标签的本地确认 KOL 仍保留,category=`local_confirmed`。\n\n"
+        f"**步骤 3**:从每份简报的 `## ⚡ 高优先级关注` section 提取每个 setup 的元组 `(ticker, brief_publish_time, 立场[多/空/观望], target?, source[群/大V/Polymarket])`:\n"
         f"  - 立场写在'**可执行**'子节的'立场:多/空/观望'\n"
         f"  - source 从'**消息面/基本面**'子节里 actionable 推/群消息的 @ 或群名提取\n"
         f"  - **观望**不参与命中率统计,跳过\n\n"
-        f"**步骤 3**:对每个 (ticker, brief_time) 调 `mcp__stock-price__check_post_hoc(ticker, at_time=brief_time, horizon='{horizon}')`(可并行)。拿 `net_move_pct`。\n\n"
-        f"**步骤 4**:判 hit:\n"
+        f"**步骤 4**:对每个 (ticker, brief_time) 调 `mcp__stock-price__check_post_hoc(ticker, at_time=brief_time, horizon='{horizon}')`(可并行)。拿 `net_move_pct`。\n\n"
+        f"**步骤 5**:判 hit:\n"
         f"  - 立场=多 且 `net_move >= +1.0%` → **win**\n"
         f"  - 立场=多 且 `net_move <= -1.0%` → **loss**\n"
         f"  - 立场=空 且 `net_move <= -1.0%` → **win**\n"
         f"  - 立场=空 且 `net_move >= +1.0%` → **loss**\n"
         f"  - `-1.0% < net_move < +1.0%` → **flat**(不计入)\n\n"
-        f"**步骤 5**:聚合统计(**多维度交叉看**):\n"
+        f"**步骤 6**:聚合统计(**多维度交叉看**):\n"
         f"  - **整体**:W / L / Flat,胜率 = W / (W + L)\n"
         f"  - **按 ticker**:每个 ticker 的 setup 次数 + W/L/F + 胜率(只列 ≥2 个 setup 的)\n"
-        f"  - **按大 V 关联**:setup 的 source 里跟踪的大 V (查 prompt.md 表),分别统计相关 ticker 的胜率;反指 KOL (Cramer/Schiff) 把方向 flip 后再算\n"
+        f"  - **按大 V 关联**:setup 的 source 里跟踪的大 V (查 prompt.md 表),分别统计相关 ticker 的胜率;反指 KOL (Cramer/Schiff) 把方向 flip 后再算。每个 handle 输出 tier/category/signal_type 标签\n"
+        f"  - **按 KOL tier/category/signal_type**:把每个 setup 关联到 source handle 的标签,分别统计 `tier1/tier2/local_confirmed`、`breaking_news/macro/ai_semis/options_flow/...`、`headline/deep_research/liquidity/gamma/flow/...` 的胜率。headline relay 账号重复同一事实时只算一次,不能多算共识\n"
         f"  - **按 source_kind**(新加,2026-05-18 起):判断每个 setup 的数据来源类型并分别看胜率:\n"
         f"    · `text` — setup 来自群文字/X 推/Polymarket 数字,无 OCR 介入\n"
         f"    · `ocr`  — setup 主要依据是 OCR 解读的图片(实盘校场截图、月哥 broker 截图、郭明錤长图等)\n"
@@ -927,12 +1653,22 @@ async def _handle_score(text: str = "") -> str:
         f"  - 注:cross_validated 胜率应该 ≥ text/ocr 单独;若不是,说明 cross-validation 信号选择有偏差,需 reflect\n"
         f"\n"
         f"### 按大 V 关联\n"
-        f"- **@imnotharsh** (INTC bull):N 个相关 setup,胜率 X%\n"
-        f"- **@Cramer-flipped**:... (注:Cramer 反指后看)\n"
+        f"- **@imnotharsh** `[local_confirmed]` (INTC bull):N 个相关 setup,胜率 X%\n"
+        f"- **@Cramer-flipped** `[tier1 · inverse_signal]`:... (注:Cramer 反指后看)\n"
         f"- ... (只列 ≥2 setup 的)\n"
         f"\n"
+        f"### 按 KOL 分层\n"
+        f"- **tier1**:N setup,W-L-F → 胜率 X%\n"
+        f"- **tier2**:N setup,W-L-F → 胜率 X%\n"
+        f"- **local_confirmed**:N setup,W-L-F → 胜率 X%\n"
+        f"\n"
+        f"### 按 category / signal_type\n"
+        f"- **ai_semis / industry_chain**:N setup,W-L-F → 胜率 X%\n"
+        f"- **macro / liquidity**:N setup,W-L-F → 胜率 X%\n"
+        f"- **headline**:N setup,W-L-F → 胜率 X%(注意去重)\n"
+        f"\n"
         f"### 建议\n"
-        f"一句话:**信号金字塔**应该调整哪些权重?哪些 ticker / KOL 命中率持续低需要重新审视 thesis?source_kind 之间胜率有显著差距吗(暗示某种来源系统性失真)?\n"
+        f"一句话:**信号金字塔 / X 大V权重机制**应该调整哪些权重?哪些 ticker / KOL / tier / category 命中率持续低需要重新审视 thesis?source_kind 之间胜率有显著差距吗(暗示某种来源系统性失真)?\n"
         f"```\n\n"
         f"**数据不足**(N < 5 actionable setup)时:输出 `## 命中率:数据不足({{N}} 个 setup,至少需要 5 个才有统计意义)。继续观察。`\n\n"
         f"**约束**:\n"
@@ -940,6 +1676,7 @@ async def _handle_score(text: str = "") -> str:
         f"- 数字必须真实(从 check_post_hoc 实际返回值算),不允许估算\n"
         f"- 标注 sample size,N < 5 直接说不足而非硬编故事\n"
         f"- 反指 KOL 一定要 flip 后算 — 否则结果会被错误负相关污染\n"
+        f"- 只建议调整**权重规则**,不要自动改大 V 表本身;KOL 表属于 user-owned 配置\n"
         f"- source_kind 判断**只 based on 简报里实际写的内容**,不要根据训练数据脑补「这种 ticker 通常 ocr」"
         + selfevolve.json_epilogue(
             "score",
@@ -949,7 +1686,10 @@ async def _handle_score(text: str = "") -> str:
                 '                "short": {"w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
                 '                "combined": {"n_actionable": 0, "n_flat": 0, "win_rate": 0.0}},\n'
                 '    "by_ticker": [{"ticker": "INTC", "n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "..."],\n'
-                '    "by_kol":    [{"handle": "imnotharsh", "is_inverse": false, "n": 0, "w": 0, "l": 0, "win_rate": 0.0}, "..."],\n'
+                '    "by_kol":    [{"handle": "imnotharsh", "tier": "local_confirmed", "categories": ["local_confirmed"], "signal_types": ["thesis"], "is_inverse": false, "n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "..."],\n'
+                '    "by_kol_tier": {"tier1": {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "tier2": {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "local_confirmed": {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}},\n'
+                '    "by_kol_category": [{"category": "ai_semis", "n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "..."],\n'
+                '    "by_signal_type": [{"signal_type": "industry_chain", "n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}, "..."],\n'
                 '    "by_source_kind": {"text":            {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
                 '                       "ocr":             {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0},\n'
                 '                       "cross_validated": {"n": 0, "w": 0, "l": 0, "f": 0, "win_rate": 0.0}},\n'
@@ -1086,6 +1826,10 @@ async def _handle_rollback(text: str = "") -> str:
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
+    "/context": _handle_context,
+    "/reset_context": _handle_reset_context,
+    "/reminders": _handle_reminders,
+    "/ack": _handle_ack,
     "/dv": _handle_dv,
     "/xfeed": _handle_xfeed,
     "/plan": _handle_plan,
@@ -1114,18 +1858,17 @@ def _llm_backend() -> str:
     return (os.environ.get("MARKET_BRIEF_LLM_BACKEND") or "codex").strip().lower()
 
 
-async def _ask_llm(user_text: str) -> str:
+async def _ask_llm(user_text: str, chat_id: str | None = None) -> str:
     backend = _llm_backend()
     if backend in {"codex", "gpt", "openai"}:
-        return await _ask_codex(user_text)
+        return await _ask_codex(user_text, chat_id=chat_id)
     if backend == "claude":
-        return await _ask_claude(user_text)
+        return await _ask_claude(user_text, chat_id=chat_id)
     return f"❌ 未知 MARKET_BRIEF_LLM_BACKEND={backend!r}; 支持 codex 或 claude"
 
 
-async def _ask_codex(user_text: str) -> str:
-    """Run `codex exec` and return only the model's final message."""
-    prompt = SYSTEM_PROMPT + user_text.strip()
+async def _run_codex_prompt(prompt: str, timeout_s: int = LLM_TIMEOUT_S) -> str:
+    """Run `codex exec` with a fully-built prompt and return the final message."""
     last_message = LOG_DIR / f"codex_last_message_{uuid.uuid4().hex}.txt"
     cmd = [
         os.environ.get("COMSPEC", "cmd.exe"),
@@ -1138,7 +1881,7 @@ async def _ask_codex(user_text: str) -> str:
         "--output-last-message", str(last_message),
         "--color", "never",
     ]
-    model = os.environ.get("MARKET_BRIEF_CODEX_MODEL", "gpt-5.4").strip()
+    model = os.environ.get("MARKET_BRIEF_CODEX_MODEL", "gpt-5.5").strip()
     if model:
         cmd.extend(["--model", model])
     cmd.append("-")
@@ -1152,7 +1895,7 @@ async def _ask_codex(user_text: str) -> str:
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=prompt.encode("utf-8")),
-            timeout=LLM_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except asyncio.TimeoutError:
         try:
@@ -1160,7 +1903,7 @@ async def _ask_codex(user_text: str) -> str:
         except ProcessLookupError:
             pass
         last_message.unlink(missing_ok=True)
-        return f"❌ Codex/GPT 超时 ({LLM_TIMEOUT_S}s 无回应)"
+        return f"❌ Codex/GPT 超时 ({timeout_s}s 无回应)"
 
     stdout_text = stdout.decode("utf-8", "replace").strip()
     stderr_text = stderr.decode("utf-8", "replace").strip()
@@ -1178,13 +1921,19 @@ async def _ask_codex(user_text: str) -> str:
     return reply or stdout_text or "(Codex/GPT 返回空)"
 
 
-async def _ask_claude(user_text: str) -> str:
+async def _ask_codex(user_text: str, chat_id: str | None = None) -> str:
+    """Run `codex exec` and return only the model's final message."""
+    prompt = SYSTEM_PROMPT + _load_wechat_context(chat_id) + user_text.strip()
+    return await _run_codex_prompt(prompt)
+
+
+async def _ask_claude(user_text: str, chat_id: str | None = None) -> str:
     """Run `claude --print --dangerously-skip-permissions` with the user text.
 
     `claude` on Windows is `claude.CMD`, which asyncio's CreateProcess can't
     launch directly. Always go through cmd.exe so PATHEXT resolution happens.
     """
-    prompt = SYSTEM_PROMPT + user_text.strip()
+    prompt = SYSTEM_PROMPT + _load_wechat_context(chat_id) + user_text.strip()
 
     proc = await asyncio.create_subprocess_exec(
         os.environ.get("COMSPEC", "cmd.exe"),
@@ -1236,6 +1985,31 @@ async def _push_reply(creds: dict, reply: str) -> None:
         log.error("push back failed: %s", result.get("error"))
 
 
+def _working_ack_text(user_text: str) -> str:
+    lower = user_text.lower()
+    if any(token in lower for token in ("期权", "option", "greeks", "iv", "straddle")):
+        return "收到,我在拉股价/期权链并整理策略,可能需要 1-3 分钟。"
+    if any(token in lower for token in ("x上", "twitter", "discord", "群里", "微信", "thesis", "讨论")):
+        return "收到,我在查 X/微信群/Discord 相关讨论并整理结论,可能需要几分钟。"
+    return "收到,我在处理。这个请求需要调用工具,完成后会直接回复。"
+
+
+async def _await_with_working_ack(awaitable, creds: dict, user_text: str) -> str:
+    """Send a quick acknowledgement if an LLM/tool-heavy request is slow."""
+    task = asyncio.create_task(awaitable)
+    if WORKING_ACK_AFTER_S <= 0:
+        return await task
+    done, _ = await asyncio.wait({task}, timeout=WORKING_ACK_AFTER_S)
+    if task in done:
+        return task.result()
+    try:
+        await _push_reply(creds, _working_ack_text(user_text))
+        log.info("working-ack sent for slow request")
+    except Exception:
+        log.exception("working-ack failed")
+    return await task
+
+
 async def _handle_message(creds: dict, message: dict) -> None:
     sender_id = str(message.get("from_user_id") or "").strip()
     if not sender_id:
@@ -1259,7 +2033,7 @@ async def _handle_message(creds: dict, message: dict) -> None:
     cmd_key = text.split()[0].lower()
     handler = COMMANDS.get(cmd_key)
     if handler is not None:
-        reply = await handler(text)
+        reply = await _await_with_working_ack(handler(text), creds, text)
         # Phase 2b: self-evolve commands also emit a <proposals>JSON</proposals>
         # block. Extract + persist proposals; strip the block from the reply
         # so the WeChat user only sees the markdown. Non-self-evolve commands
@@ -1279,10 +2053,9 @@ async def _handle_message(creds: dict, message: dict) -> None:
                 reply = cleaned
             except Exception:
                 log.exception("selfevolve: extraction/persist failed for %s", cmd_key)
-        # Persist the output so a follow-up free-form message ("按你建议加",
-        # "刚才你说什么", etc.) can reconstruct what the previous slash
-        # command actually said. Each message spawns a fresh LLM session
-        # session with no shared memory; on-disk persistence is the bridge.
+        # Persist slash-command output as a direct file fallback. The SQLite
+        # context stores the short chat state; last_<cmd>.md keeps full bulky
+        # command replies available for "按你刚才那份 /heat 继续" follow-ups.
         try:
             stamp = time.strftime("%Y-%m-%d %H:%M:%S EDT", time.localtime())
             out_path = SCRIPTS_DIR / f"last_{cmd_key.lstrip('/')}.md"
@@ -1295,9 +2068,21 @@ async def _handle_message(creds: dict, message: dict) -> None:
         except Exception:
             log.exception("could not persist %s output", cmd_key)
     else:
-        reply = await _ask_llm(text)
+        reply = await _await_with_working_ack(_ask_llm(text, chat_id=sender_id), creds, text)
+
+    if cmd_key not in {"/context", "/reset_context", "/reminders", "/ack"}:
+        try:
+            source = cmd_key if handler is not None else "chat"
+            _record_context_message(sender_id, "user", text, source=source)
+            _record_context_message(sender_id, "assistant", reply, source=source)
+        except Exception:
+            log.exception("context: failed to persist message pair")
 
     await _push_reply(creds, reply)
+    try:
+        await _refresh_context_summary_if_needed(sender_id)
+    except Exception:
+        log.exception("context: summary refresh failed")
     log.info("replied: %r", reply[:120])
 
 
@@ -1376,6 +2161,7 @@ async def main_loop() -> int:
 
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
         keepalive_task = asyncio.create_task(_keepalive_loop(creds, session))
+        reminder_task = asyncio.create_task(_reminder_loop(creds))
         try:
             while True:
                 try:
@@ -1414,8 +2200,13 @@ async def main_loop() -> int:
                         log.exception("handler crashed on message")
         finally:
             keepalive_task.cancel()
+            reminder_task.cancel()
             try:
                 await keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                await reminder_task
             except (asyncio.CancelledError, Exception):
                 pass
 
