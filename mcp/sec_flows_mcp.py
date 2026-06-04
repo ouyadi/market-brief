@@ -580,4 +580,5 @@ async def health() -> dict[str, Any]:
 
 if __name__ == "__main__":
     log.info("sec-flows MCP starting on port %s", os.environ.get("SEC_FLOWS_MCP_PORT", "3038"))
-    mcp.run(transport="streamable-http")
+    from _mcp_auth import serve  # audit I1: opt-in MCP_SHARED_SECRET bearer gate
+    serve(mcp)

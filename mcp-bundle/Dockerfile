@@ -50,6 +50,7 @@ EXPOSE 3032 3033 3034 3035 3036 3037 3038 7050
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS -o /dev/null -X POST -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
+      -H "Authorization: Bearer $MCP_SHARED_SECRET" \
       --data-raw '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1"}}}' \
       http://127.0.0.1:3035/mcp || exit 1
 

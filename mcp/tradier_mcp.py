@@ -573,4 +573,5 @@ if __name__ == "__main__":
     # the `ensure_stream_running` MCP tool once from any client (e.g.
     # alphalens does this on first /api/stream/quotes hit) and the
     # consumer keeps running for the lifetime of this process.
-    mcp.run(transport="streamable-http")
+    from _mcp_auth import serve  # audit I1: opt-in MCP_SHARED_SECRET bearer gate
+    serve(mcp)

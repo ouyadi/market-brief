@@ -720,4 +720,5 @@ if __name__ == "__main__":
     log.info(
         "polymarket MCP starting on http://127.0.0.1:%s/mcp", mcp.settings.port
     )
-    mcp.run(transport="streamable-http")
+    from _mcp_auth import serve  # audit I1: opt-in MCP_SHARED_SECRET bearer gate
+    serve(mcp)

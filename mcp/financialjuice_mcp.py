@@ -420,4 +420,5 @@ if __name__ == "__main__":
         asyncio.run(_poll_loop())
 
     threading.Thread(target=_bg_poll, daemon=True).start()
-    mcp.run(transport="streamable-http")
+    from _mcp_auth import serve  # audit I1: opt-in MCP_SHARED_SECRET bearer gate
+    serve(mcp)

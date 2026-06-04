@@ -636,4 +636,5 @@ if __name__ == "__main__":
         f"sec-edgar MCP listening on "
         f"http://{mcp.settings.host}:{mcp.settings.port}/mcp  (UA={SEC_UA})"
     )
-    mcp.run(transport="streamable-http")
+    from _mcp_auth import serve  # audit I1: opt-in MCP_SHARED_SECRET bearer gate
+    serve(mcp)

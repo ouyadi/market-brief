@@ -2,6 +2,7 @@
 # financialjuice MCP servers. Pinned upper bounds intentionally loose
 # (these are stable APIs); rebuild bundle quarterly to refresh.
 mcp>=1.0,<2
+uvicorn>=0.30,<1   # _mcp_auth.serve() imports uvicorn directly (mcp pulls it too)
 aiohttp>=3.9,<4
 redis>=5.0,<6
 yfinance>=0.2,<1
