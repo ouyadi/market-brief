@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import html
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,7 @@ logging.basicConfig(
 log = logging.getLogger("fred")
 
 BASE = "https://api.stlouisfed.org/fred"
+FED_FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 HTTP_TIMEOUT_S = 15
 FRED_KEY = os.environ.get("FRED_API_KEY", "")
 
@@ -96,6 +99,89 @@ async def _fetch(path: str, params: dict | None = None) -> dict:
             if r.status != 200:
                 raise RuntimeError(f"FRED {path} -> {r.status} {text[:200]}")
             return json.loads(text)
+
+
+async def _fetch_text(url: str) -> str:
+    """GET a non-FRED page, returning text. Used for official calendar pages."""
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers={"User-Agent": "alphalens-fred-mcp/1.0"}) as r:
+            text = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"GET {url} -> {r.status} {text[:200]}")
+            return text
+
+
+MONTHS: dict[str, int] = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime.date:
+    d = datetime.date(year, month, 1)
+    while d.weekday() != weekday:
+        d += datetime.timedelta(days=1)
+    return d + datetime.timedelta(days=7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> datetime.date:
+    if month == 12:
+        d = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+    else:
+        d = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+    while d.weekday() != weekday:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def _observed(d: datetime.date) -> datetime.date:
+    if d.weekday() == 5:  # Saturday
+        return d - datetime.timedelta(days=1)
+    if d.weekday() == 6:  # Sunday
+        return d + datetime.timedelta(days=1)
+    return d
+
+
+def _us_federal_holidays(year: int) -> set[datetime.date]:
+    return {
+        _observed(datetime.date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),   # MLK
+        _nth_weekday(year, 2, 0, 3),   # Presidents' Day
+        _last_weekday(year, 5, 0),     # Memorial Day
+        _observed(datetime.date(year, 6, 19)),
+        _observed(datetime.date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),   # Labor Day
+        _nth_weekday(year, 10, 0, 2),  # Columbus Day
+        _observed(datetime.date(year, 11, 11)),
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed(datetime.date(year, 12, 25)),
+    }
+
+
+def _is_business_day(d: datetime.date) -> bool:
+    return d.weekday() < 5 and d not in _us_federal_holidays(d.year)
+
+
+def _nth_business_day(year: int, month: int, n: int) -> datetime.date:
+    d = datetime.date(year, month, 1)
+    seen = 0
+    while True:
+        if _is_business_day(d):
+            seen += 1
+            if seen == n:
+                return d
+        d += datetime.timedelta(days=1)
 
 
 # ── Date parsing for `since` arg ───────────────────────────────────────────
@@ -280,23 +366,139 @@ async def economic_dashboard() -> dict:
     }
 
 
-# Curated high-impact releases. release_id from FRED /releases.
-HIGH_IMPACT_RELEASES: list[tuple[int, str]] = [
-    (10, "CPI"),
-    (50, "Employment Situation (NFP)"),
-    (51, "PPI"),
-    (53, "GDP"),
-    (84, "FOMC Statement"),
-    (246, "Initial Claims"),
-    (116, "Retail Sales"),
-    (21, "Industrial Production"),
-    (110, "Personal Income & Outlays (PCE)"),
-    (192, "U Michigan Sentiment (final)"),
-    (175, "ADP Employment"),
-    (151, "JOLTS"),
-    (16, "ISM Manufacturing"),
-    (17, "ISM Services"),
+# Curated high-impact releases. release_id from FRED /releases. FRED gives the
+# calendar date, but not the intraday release time; time_et is the standard
+# scheduled release time used by the publishing agency.
+HIGH_IMPACT_RELEASES: list[tuple[int, str, str]] = [
+    (10, "CPI", "08:30"),
+    (50, "Employment Situation (NFP)", "08:30"),
+    (46, "PPI", "08:30"),
+    (53, "GDP", "08:30"),
+    (101, "FOMC Statement", "14:00"),
+    (180, "Initial Claims", "08:30"),
+    (9, "Retail Sales", "08:30"),
+    (13, "Industrial Production", "09:15"),
+    (54, "Personal Income & Outlays (PCE)", "08:30"),
+    (91, "U Michigan Sentiment", "10:00"),
+    (194, "ADP Employment", "08:15"),
+    (192, "JOLTS", "10:00"),
+    # ISM Manufacturing / Services do not have FRED release IDs. Do not map
+    # them to unrelated releases; use a separate calendar source if needed.
 ]
+
+
+def _release(
+    *,
+    name: str,
+    date: datetime.date,
+    time_et: str,
+    source: str,
+    release_id: int | None = None,
+    url: str | None = None,
+) -> dict:
+    return {
+        "release_id": release_id,
+        "name": name,
+        "date": date.isoformat(),
+        "time_et": time_et,
+        "timezone": "America/New_York",
+        "source": source,
+        **({"url": url} if url else {}),
+    }
+
+
+async def _fed_fomc_releases(today: datetime.date, end: datetime.date) -> list[dict]:
+    """FOMC statement dates from the official Federal Reserve calendar page."""
+    try:
+        page = await _fetch_text(FED_FOMC_CALENDAR_URL)
+    except Exception as e:
+        log.warning("fed fomc calendar failed: %s", e)
+        return []
+
+    out: list[dict] = []
+    year_pat = re.compile(
+        r"<h4>\s*<a id=\"\d+\">(?P<year>\d{4})\s+FOMC Meetings</a></h4>.*?"
+        r"(?=<h4>\s*<a id=\"\d+\">\d{4}\s+FOMC Meetings</a></h4>|$)",
+        re.I | re.S,
+    )
+    meeting_pat = re.compile(
+        r"fomc-meeting__month[^>]*>\s*<strong>(?P<month>[A-Za-z]+)</strong>.*?"
+        r"fomc-meeting__date[^>]*>\s*(?P<date>[^<]+)",
+        re.I | re.S,
+    )
+    for ymatch in year_pat.finditer(page):
+        year = int(ymatch.group("year"))
+        if year < today.year or year > end.year + 1:
+            continue
+        section = ymatch.group(0)
+        for mm in meeting_pat.finditer(section):
+            month = MONTHS.get(mmatch_month := mm.group("month").lower())
+            if not month:
+                log.warning("unknown FOMC month %s", mmatch_month)
+                continue
+            raw_date = html.unescape(mm.group("date"))
+            nums = re.findall(r"\d{1,2}", raw_date)
+            if not nums:
+                continue
+            # A two-day meeting releases the statement on the final listed day.
+            day = int(nums[-1])
+            try:
+                d = datetime.date(year, month, day)
+            except ValueError:
+                continue
+            if today <= d <= end:
+                out.append(
+                    _release(
+                        release_id=101,
+                        name="FOMC Statement",
+                        date=d,
+                        time_et="14:00",
+                        source="fed:fomc_calendar",
+                        url=FED_FOMC_CALENDAR_URL,
+                    )
+                )
+    return out
+
+
+def _ism_releases(today: datetime.date, end: datetime.date) -> list[dict]:
+    """ISM PMI report dates from ISM's stated monthly release cadence.
+
+    Manufacturing PMI is released on the first business day at 10:00 ET,
+    except January, when it is released on the second business day. Services
+    PMI is released on the third business day at 10:00 ET.
+    """
+    out: list[dict] = []
+    cursor = datetime.date(today.year, today.month, 1)
+    last = datetime.date(end.year, end.month, 1)
+    while cursor <= last:
+        year, month = cursor.year, cursor.month
+        mfg_day = _nth_business_day(year, month, 2 if month == 1 else 1)
+        svc_day = _nth_business_day(year, month, 3)
+        if today <= mfg_day <= end:
+            out.append(
+                _release(
+                    name="ISM Manufacturing PMI",
+                    date=mfg_day,
+                    time_et="10:00",
+                    source="ism:release_cadence",
+                    url="https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/",
+                )
+            )
+        if today <= svc_day <= end:
+            out.append(
+                _release(
+                    name="ISM Services PMI",
+                    date=svc_day,
+                    time_et="10:00",
+                    source="ism:release_cadence",
+                    url="https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/",
+                )
+            )
+        if month == 12:
+            cursor = datetime.date(year + 1, 1, 1)
+        else:
+            cursor = datetime.date(year, month + 1, 1)
+    return out
 
 
 @mcp.tool()
@@ -304,7 +506,7 @@ async def upcoming_releases(days_ahead: int = 14) -> dict:
     """Calendar of high-impact economic data releases in the next N days.
 
     Iterates the curated HIGH_IMPACT_RELEASES list and returns each scheduled
-    release date that falls in [today, today+days_ahead]. Use for L3 daily
+    release date/time that falls in [today, today+days_ahead]. Use for L3 daily
     brief 'what to watch this week' / FOMC week flagging.
     """
     cache_key = f"calendar:{days_ahead}"
@@ -317,7 +519,7 @@ async def upcoming_releases(days_ahead: int = 14) -> dict:
     upcoming: list[dict] = []
     sem = asyncio.Semaphore(5)
 
-    async def one(rid: int, name: str) -> None:
+    async def one(rid: int, name: str, time_et: str) -> None:
         async with sem:
             try:
                 # Pull most recent 60 dates (desc); FRED publishes future dates
@@ -338,12 +540,30 @@ async def upcoming_releases(days_ahead: int = 14) -> dict:
                     except (KeyError, ValueError):
                         continue
                     if today <= date <= end:
-                        upcoming.append({"release_id": rid, "name": name, "date": r["date"]})
+                        upcoming.append(
+                            _release(
+                                release_id=rid,
+                                name=name,
+                                date=date,
+                                time_et=time_et,
+                                source="fred:release_dates",
+                            )
+                        )
             except Exception as e:
                 log.warning("release_dates %d failed: %s", rid, e)
 
-    await asyncio.gather(*[one(rid, name) for rid, name in HIGH_IMPACT_RELEASES])
-    upcoming.sort(key=lambda r: r["date"])
+    await asyncio.gather(*[one(rid, name, time_et) for rid, name, time_et in HIGH_IMPACT_RELEASES])
+    upcoming.extend(await _fed_fomc_releases(today, end))
+    upcoming.extend(_ism_releases(today, end))
+    # Dedupe by event family/date/time/source class. FRED and Fed can both
+    # surface FOMC in some years; prefer the official Fed calendar row.
+    deduped: dict[tuple[str, str, str], dict] = {}
+    for r in upcoming:
+        key = (r["name"], r["date"], r["time_et"])
+        prev = deduped.get(key)
+        if not prev or str(r.get("source", "")).startswith("fed:"):
+            deduped[key] = r
+    upcoming = sorted(deduped.values(), key=lambda r: (r["date"], r["time_et"], r["name"]))
     result = {
         "today": today.isoformat(),
         "window_days": days_ahead,
