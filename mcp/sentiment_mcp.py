@@ -250,16 +250,45 @@ async def naaim_exposure() -> str:
 
 
 # ── AAII Investor Sentiment Survey (best-effort, see module docstring) ─────────
-def parse_aaii(html: str) -> dict | None:
-    """Pure parser: pull bull/neutral/bear % from the AAII public page.
+def _aaii_plausible(bull: float, neutral: float, bear: float) -> bool:
+    """Reject degenerate triplets. The page carries per-STATE breakdowns in JS
+    vars (tiny samples like Alaska -> 100/0/0) — a naive first-match grabbed
+    Alaska's 100/0/0 in prod (2026-06-12). Historical national extremes stay
+    well inside (4, 82) for every component and the three always sum to ~100."""
+    vals = (bull, neutral, bear)
+    return all(4.0 <= v <= 82.0 for v in vals) and 97.0 <= sum(vals) <= 103.0
 
-    Returns None when the structure isn't found. AAII frequently bot-blocks
-    (403/503) so callers must tolerate a None / error result (design ruling #4).
+
+def parse_aaii(html: str) -> dict | None:
+    """Pure parser: pull the NATIONAL weekly bull/neutral/bear % from the AAII
+    public page.
+
+    Returns None when no plausible national triplet is found. AAII frequently
+    bot-blocks (403 / stub page) so callers must tolerate a None / error
+    result (design ruling #4).
     """
-    pcts: dict[str, float] = {}
-    # Match "Bullish" / "Neutral" / "Bearish" near a percentage figure. AAII has
-    # historically rendered these as <label>Bullish</label> ... 41.2% — be
-    # lenient about intervening markup, cap the gap so we don't cross sections.
+    candidates: list[tuple[int, float, float, float]] = []  # (pos, bull, neutral, bear)
+
+    # Primary: the survey renders as bar charts —
+    #   <div class="bar bullish" style="width:41.2%">
+    # Group bars into consecutive triplets in document order. The historical-
+    # averages block uses the same markup, so candidates are also filtered on
+    # nearby context below.
+    bars = [
+        (m.start(), m.group(1).lower(), float(m.group(2)))
+        for m in re.finditer(
+            r"class=\"bar (bullish|neutral|bearish)\"\s*style=\"width:\s*([0-9.]+)%",
+            html,
+            re.I,
+        )
+    ]
+    for i in range(0, len(bars) - 2):
+        trio = {label: v for _, label, v in bars[i : i + 3]}
+        if set(trio) == {"bullish", "neutral", "bearish"}:
+            candidates.append((bars[i][0], trio["bullish"], trio["neutral"], trio["bearish"]))
+
+    # Fallback: label-near-percentage prose (legacy markup).
+    pcts: dict[str, tuple[int, float]] = {}
     for label in ("bullish", "neutral", "bearish"):
         m = re.search(
             rf"{label}[^0-9%]{{0,80}}?([0-9]{{1,3}}(?:\.[0-9]+)?)\s*%",
@@ -268,16 +297,24 @@ def parse_aaii(html: str) -> dict | None:
         )
         if m:
             try:
-                pcts[label[:-3] if label.endswith("ish") else label] = float(m.group(1))
+                pcts[label] = (m.start(), float(m.group(1)))
             except ValueError:
                 pass
-    # normalize keys -> bull / neutral / bear
-    bull = pcts.get("bull")
-    neutral = pcts.get("neutral")
-    bear = pcts.get("bear")
-    if bull is None or bear is None or neutral is None:
-        return None
-    return {"bull": bull, "neutral": neutral, "bear": bear, "spread": round(bull - bear, 2)}
+    if len(pcts) == 3:
+        candidates.append(
+            (pcts["bullish"][0], pcts["bullish"][1], pcts["neutral"][1], pcts["bearish"][1])
+        )
+
+    for pos, bull, neutral, bear in candidates:
+        if not _aaii_plausible(bull, neutral, bear):
+            continue
+        # Skip the long-run averages block — its heading sits directly above
+        # its bars (~120 chars observed). Keep the lookback tight so it does
+        # not bleed into a preceding sibling block.
+        if re.search(r"(?i)average", html[max(0, pos - 200) : pos]):
+            continue
+        return {"bull": bull, "neutral": neutral, "bear": bear, "spread": round(bull - bear, 2)}
+    return None
 
 
 async def _aaii() -> dict:

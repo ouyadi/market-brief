@@ -66,7 +66,12 @@ mcp = FastMCP(
 _CACHE: dict[str, tuple[float, Any]] = {}
 TTL_VOL = 60 * 60       # 1h
 TTL_ART = 30 * 60       # 30min
-_MIN_GAP_S = 1.1        # <= ~1 rps
+# 2026-06-12 prod smoke: GDELT 429s datacenter IPs (OCI) far below 1 rps —
+# the throttle is reputation-based, not strictly rate-based. A wide gap plus
+# one long-backoff retry recovers intermittent throttling; a hard-blocked IP
+# still fails fast after the single retry.
+_MIN_GAP_S = 6.0
+_RETRY_429_BACKOFF_S = 30.0
 _rate_lock = asyncio.Lock()
 _last_call = {"t": 0.0}
 
@@ -104,24 +109,31 @@ async def _fetch(params: dict) -> Any:
     sometimes returns non-JSON error text -> raise a clear error."""
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)
     async with _rate_lock:
-        gap = time.time() - _last_call["t"]
-        if gap < _MIN_GAP_S:
-            await asyncio.sleep(_MIN_GAP_S - gap)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(BASE, params=params, headers={"User-Agent": UA}) as r:
-                text = await r.text()
-                _last_call["t"] = time.time()
-                if r.status == 429:
-                    raise RuntimeError("GDELT rate limit (429) -- back off")
-                if r.status != 200:
-                    raise RuntimeError(f"GDELT -> {r.status} {text[:160]}")
-                stripped = text.strip()
-                if not stripped:
-                    return {}
-                if not stripped.startswith("{"):
-                    # GDELT returns plain-text errors (e.g. malformed query) as 200
-                    raise RuntimeError(f"GDELT non-JSON: {stripped[:160]}")
-                return json.loads(stripped)
+        for attempt in (0, 1):
+            gap = time.time() - _last_call["t"]
+            if gap < _MIN_GAP_S:
+                await asyncio.sleep(_MIN_GAP_S - gap)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(BASE, params=params, headers={"User-Agent": UA}) as r:
+                    text = await r.text()
+                    _last_call["t"] = time.time()
+                    if r.status == 429:
+                        if attempt == 0:
+                            # Hold the lock through the backoff on purpose: when the
+                            # IP is throttled, letting other calls through only digs
+                            # the reputation hole deeper.
+                            await asyncio.sleep(_RETRY_429_BACKOFF_S)
+                            continue
+                        raise RuntimeError("GDELT rate limit (429) -- back off")
+                    if r.status != 200:
+                        raise RuntimeError(f"GDELT -> {r.status} {text[:160]}")
+                    stripped = text.strip()
+                    if not stripped:
+                        return {}
+                    if not stripped.startswith("{"):
+                        # GDELT returns plain-text errors (e.g. malformed query) as 200
+                        raise RuntimeError(f"GDELT non-JSON: {stripped[:160]}")
+                    return json.loads(stripped)
 
 
 def _timeline_points(payload: dict, value_key: str) -> list[dict]:
