@@ -42,6 +42,7 @@ from typing import Any
 
 import aiohttp
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 LOG_DIR = (
     Path(os.environ.get("GDELT_MCP_DIR") or (Path.home() / "gdelt-mcp")) / "logs"
@@ -66,6 +67,11 @@ mcp = FastMCP(
     "gdelt",
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
     port=int(os.environ.get("GDELT_MCP_PORT", "3043")),
+    # Desktop runs behind a Cloudflare tunnel, so requests arrive with
+    # Host: gdelt-int.<domain> — the SDK's DNS-rebinding protection rejects
+    # that ("Invalid Host header"). CF Access service tokens are the real
+    # gate; disable like themarketear_mcp.py does.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 # ── caches + ~1 rps single-concurrency floor ────────────────────────────────
