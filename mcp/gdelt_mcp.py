@@ -76,7 +76,11 @@ mcp = FastMCP(
 
 # ── caches + ~1 rps single-concurrency floor ────────────────────────────────
 _CACHE: dict[str, tuple[float, Any]] = {}
-TTL_VOL = 60 * 60       # 1h
+# TTL_VOL must outlive the consumer's 4h cron interval: GDELT 429s this IP
+# erratically (2026-06-12: 200 after 4min quiet, 429 after 27min quiet), so a
+# sweep rarely lands all themes in one run. Themes that DID land must not be
+# refetched next run — successful results accumulate across runs instead.
+TTL_VOL = 5 * 60 * 60   # 5h
 TTL_ART = 30 * 60       # 30min
 _MIN_GAP_S = 6.0
 # 2026-06-12 desktop testing: once GDELT 429s, a 40s-interval retry still 429s
@@ -181,7 +185,14 @@ async def _news_volume(query: str, timespan: str) -> dict:
         return cached
     common = {"query": query, "format": "json", "timespan": timespan}
     vol = await _fetch({**common, "mode": "timelinevol"})
-    tone = await _fetch({**common, "mode": "timelinetone"})
+    # Tone is decorative (volume is the signal) — best-effort. A tone 429 still
+    # arms the global cooldown (protecting later calls) but must not discard
+    # the volume data we already paid a request for.
+    try:
+        tone = await _fetch({**common, "mode": "timelinetone"})
+    except Exception as e:
+        log.warning("timelinetone %r failed (kept vol): %s", query, e)
+        tone = {}
     result = {
         "success": True,
         "query": query,
