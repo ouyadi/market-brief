@@ -1,4 +1,4 @@
-"""shorts_mcp.py -- HTTP MCP server exposing short-sale data (FINRA + IBKR).
+"""shorts_mcp.py -- HTTP MCP server exposing short-sale data (FINRA + iBorrowDesk).
 
 Two free short-side sources:
 
@@ -17,10 +17,14 @@ Two free short-side sources:
     env, and fall back to anonymous when they aren't. Credentials are read ONLY
     from the environment -- never hardcoded.
 
-  IBKR borrow (ftp3.interactivebrokers.com, login "shortstock", no password):
-    /usa.txt pipe-delimited shortable-shares file
-    (#SYM|CUR|NAME|CON|ISIN|REBATERATE|FEERATE|AVAILABLE). Parsed once and
-    indexed by ticker; file-level cache 4h.
+  iBorrowDesk borrow (www.iborrowdesk.com/api/ticker/{T}, browser UA required):
+    a per-ticker JSON mirror of IBKR's shortstock feed. Returns latest_fee
+    (annualized %, same unit as IBKR usa.txt -> no conversion downstream),
+    latest_available, and a daily[] series carrying the rebate rate. There is
+    NO bulk file -- it's per-ticker, so tickers are REQUIRED (no whole-market
+    pull). The retired IBKR FTP path (ftp3.interactivebrokers.com login
+    "shortstock") was server-side blocked/down as of 2026-06-12. Each ticker
+    is cached 4h; client-side pacing 1.8s/call with a 3-fail circuit breaker.
 
 short_volume != short_interest: volume is shares shorted *that day* (a flow);
 interest is total open short shares at the settlement snapshot (a stock).
@@ -28,10 +32,10 @@ interest is total open short shares at the settlement snapshot (a stock).
 Tools (per-ticker + bulk):
   short_interest(ticker, periods=6)          SI snapshots (OTC-only, see above)
   short_volume(ticker, days=30)              daily short volume + ratio
-  borrow(ticker)                             IBKR fee/rebate/available
+  borrow(ticker)                             iBorrowDesk fee/rebate/available
   short_volume_day(date="", tickers=[])      one day, optional ticker filter
   short_interest_latest(tickers=[])          latest SI snapshot, ticker filter
-  borrow_snapshot(tickers=[])                IBKR fee/available, ticker filter
+  borrow_snapshot(tickers=[])                iBorrowDesk fee/available (tickers REQUIRED)
 
 Run as HTTP MCP on 127.0.0.1:3040/mcp by default. Override port via
 SHORTS_MCP_PORT env var.
@@ -41,13 +45,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import io
 import json
 import logging
 import os
 import sys
 import time
-from ftplib import FTP
 from pathlib import Path
 from typing import Any
 
@@ -81,9 +83,17 @@ FINRA_CLIENT_SECRET = os.environ.get("FINRA_API_CLIENT_SECRET", "")
 DS_REG_SHO = "regShoDaily"
 DS_SHORT_INTEREST = "equityShortInterest"
 
-IBKR_FTP_HOST = "ftp3.interactivebrokers.com"
-IBKR_FTP_USER = "shortstock"
-IBKR_FTP_FILE = "usa.txt"
+# iBorrowDesk: per-ticker JSON mirror of IBKR shortstock. 403s on a non-browser
+# UA (UA filter, not IP filter -- so OCI/datacenter should pass). aiohttp follows
+# the www redirect by default; we hit www directly to save a hop.
+IBD_URL = "https://www.iborrowdesk.com/api/ticker/{ticker}"
+IBD_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_IBD_GAP_S = 1.8             # client-side pacing between iBorrowDesk calls
+_IBD_MAX_TICKERS = 80        # per-ticker API; cap a snapshot request
+_IBD_FAIL_STREAK_LIMIT = 3   # consecutive hard failures -> open the circuit
 
 mcp = FastMCP(
     "shorts",
@@ -94,8 +104,11 @@ mcp = FastMCP(
 # ── caches ────────────────────────────────────────────────────────────────
 _CACHE: dict[str, tuple[float, Any]] = {}
 TTL_FINRA = 60 * 60          # 1h (FINRA data updates daily/bi-monthly)
-TTL_BORROW = 4 * 60 * 60     # 4h (IBKR refreshes intraday but slow)
+TTL_BORROW = 4 * 60 * 60     # 4h (iBorrowDesk refreshes intraday but slow)
 _TOKEN: dict[str, Any] = {"value": None, "exp": 0.0}
+# iBorrowDesk pacing -- its own lock/last-call, NOT shared with FINRA.
+_ibd_lock = asyncio.Lock()
+_ibd_last_call = {"t": 0.0}
 
 
 def _cache_get(key: str, ttl: float) -> Any | None:
@@ -485,82 +498,72 @@ async def short_interest_latest(tickers: list[str] | None = None) -> str:
         return json.dumps({"success": False, "error": str(e)})
 
 
-# ── IBKR borrow (FTP usa.txt) ─────────────────────────────────────────────────
-def parse_ibkr_usa(text: str) -> tuple[str | None, dict[str, dict]]:
-    """Pure parser: IBKR usa.txt -> (as_of_iso, {TICKER: {fee_rate, rebate_rate,
-    available}}). First line is #BOF|date|time; header line #SYM|...; trailer
-    #EOF|count. AVAILABLE may be a number or '>10000000'."""
-    as_of: str | None = None
-    index: dict[str, dict] = {}
-    for raw in text.replace("\r\n", "\n").split("\n"):
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#BOF"):
-            parts = line.split("|")
-            if len(parts) >= 3:
-                as_of = f"{parts[1]}T{parts[2]}"
-            continue
-        if line.startswith("#SYM") or line.startswith("#EOF") or line.startswith("#"):
-            continue
-        parts = line.split("|")
-        if len(parts) < 8:
-            continue
-        sym = parts[0].strip().upper()
-        rebate = _to_float(parts[5])
-        fee = _to_float(parts[6])
-        avail_raw = parts[7].strip()
-        avail = _to_int(avail_raw.lstrip(">").replace(",", "")) if avail_raw not in ("", "NA") else None
-        index[sym] = {"fee_rate": fee, "rebate_rate": rebate, "available": avail}
-    return as_of, index
-
-
-def _fetch_ibkr_blocking() -> tuple[str | None, dict[str, dict]]:
-    """Blocking FTP fetch (run in a thread). login 'shortstock', passive."""
-    buf = io.BytesIO()
-    ftp = FTP(IBKR_FTP_HOST, timeout=HTTP_TIMEOUT_S)
-    try:
-        ftp.login(IBKR_FTP_USER, "")
-        ftp.set_pasv(True)
-        ftp.retrbinary(f"RETR {IBKR_FTP_FILE}", buf.write)
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
-    return parse_ibkr_usa(buf.getvalue().decode("utf-8", "replace"))
-
-
-async def _ibkr_index() -> tuple[str | None, dict[str, dict]]:
-    cached = _cache_get("ibkr", TTL_BORROW)
-    if cached is not None:
-        return cached
-    as_of, index = await asyncio.to_thread(_fetch_ibkr_blocking)
-    _cache_put("ibkr", (as_of, index))
-    return as_of, index
+# ── iBorrowDesk borrow (per-ticker JSON) ──────────────────────────────────────
+async def _ibd_fetch(ticker: str) -> dict | None:
+    """Fetch one ticker from iBorrowDesk. Returns a parsed dict on success,
+    None when the ticker simply isn't there (404 / non-dict JSON -- a normal
+    miss that must NOT count toward the circuit breaker). 403/429/5xx/timeout
+    raise (these DO count toward the breaker)."""
+    ticker = ticker.strip().upper()
+    url = IBD_URL.format(ticker=ticker)
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)
+    async with _ibd_lock:
+        gap = time.time() - _ibd_last_call["t"]
+        if gap < _IBD_GAP_S:
+            await asyncio.sleep(_IBD_GAP_S - gap)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, headers={"User-Agent": IBD_UA}) as r:
+                text = await r.text()
+                _ibd_last_call["t"] = time.time()
+                if r.status == 404:
+                    return None  # not on iBorrowDesk -- not a breaker failure
+                if r.status != 200:
+                    raise RuntimeError(f"iBorrowDesk {ticker} -> {r.status} {text[:160]}")
+                stripped = text.strip()
+                if not stripped:
+                    return None
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"iBorrowDesk {ticker} non-JSON: {e}") from e
+                if not isinstance(data, dict) or not data:
+                    return None  # empty / unexpected shape -> treat as a miss
+    daily = data.get("daily") or []
+    rebate = _to_float(daily[-1].get("rebate")) if daily and isinstance(daily[-1], dict) else None
+    return {
+        "fee_rate": _to_float(data.get("latest_fee")),
+        "available": _to_int(data.get("latest_available")),
+        "rebate_rate": rebate,
+        "updated": data.get("updated"),
+    }
 
 
 async def _borrow(ticker: str) -> dict:
     ticker = ticker.strip().upper()
-    as_of, index = await _ibkr_index()
-    row = index.get(ticker)
-    if not row:
-        return {"success": False, "ticker": ticker, "error": "not in IBKR shortable list"}
+    cache_key = f"ibd:{ticker}"
+    parsed = _cache_get(cache_key, TTL_BORROW)
+    if parsed is None:
+        parsed = await _ibd_fetch(ticker)
+        if parsed is not None:
+            _cache_put(cache_key, parsed)
+    if parsed is None:
+        return {"success": False, "ticker": ticker, "error": "not on iBorrowDesk"}
     return {
         "success": True,
         "ticker": ticker,
-        "as_of": as_of,
-        "fee_rate": row["fee_rate"],
-        "rebate_rate": row["rebate_rate"],
-        "available": row["available"],
+        "as_of": parsed.get("updated"),
+        "fee_rate": parsed.get("fee_rate"),
+        "rebate_rate": parsed.get("rebate_rate"),
+        "available": parsed.get("available"),
     }
 
 
 @mcp.tool()
 async def borrow(ticker: str) -> str:
-    """IBKR borrow snapshot for a ticker: fee_rate (annualized % to short),
+    """iBorrowDesk borrow snapshot for a ticker: fee_rate (annualized % to short),
     rebate_rate, and available shares. High fee_rate + low available = hard to
-    borrow / squeeze risk. Cached 4h.
+    borrow / squeeze risk. Cached 4h. Ticker absent from iBorrowDesk -> success
+    false, error "not on iBorrowDesk".
     """
     try:
         return json.dumps(await _borrow(ticker))
@@ -571,22 +574,64 @@ async def borrow(ticker: str) -> str:
 
 async def _borrow_snapshot(tickers: list[str]) -> dict:
     tickers = [t.strip().upper() for t in (tickers or []) if t and t.strip()]
-    as_of, index = await _ibkr_index()
-    rows = []
-    keys = tickers if tickers else list(index.keys())
-    for sym in keys:
-        row = index.get(sym)
-        if not row:
-            continue
-        rows.append({"ticker": sym, "fee_rate": row["fee_rate"], "available": row["available"]})
-    return {"success": True, "as_of": as_of, "rows": rows}
+    if not tickers:
+        return {
+            "success": False,
+            "error": "tickers required — iBorrowDesk is per-ticker (IBKR FTP bulk feed retired)",
+        }
+    if len(tickers) > _IBD_MAX_TICKERS:
+        log.warning("borrow_snapshot: %d tickers > cap %d, truncating", len(tickers), _IBD_MAX_TICKERS)
+        tickers = tickers[:_IBD_MAX_TICKERS]
+
+    rows: list[dict] = []
+    latest_updated: str | None = None
+    fail_streak = 0
+    partial = False
+    done = 0
+    for sym in tickers:
+        cache_key = f"ibd:{sym}"
+        parsed = _cache_get(cache_key, TTL_BORROW)
+        if parsed is None:
+            try:
+                parsed = await _ibd_fetch(sym)
+            except Exception as e:
+                fail_streak += 1
+                log.warning("borrow_snapshot %s leg failed (%d/%d): %s",
+                            sym, fail_streak, _IBD_FAIL_STREAK_LIMIT, e)
+                if fail_streak >= _IBD_FAIL_STREAK_LIMIT:
+                    partial = True
+                    log.warning("iBorrowDesk circuit open — %d/%d done", done, len(tickers))
+                    break
+                continue
+            if parsed is not None:
+                _cache_put(cache_key, parsed)
+        done += 1
+        if parsed is None:
+            continue  # 404 / miss -- skip, does NOT count toward the breaker
+        fail_streak = 0  # any success clears the streak
+        rows.append({
+            "ticker": sym,
+            "fee_rate": parsed.get("fee_rate"),
+            "available": parsed.get("available"),
+        })
+        upd = parsed.get("updated")
+        if upd and (latest_updated is None or str(upd) > latest_updated):
+            latest_updated = str(upd)
+
+    as_of = latest_updated or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    out = {"success": True, "as_of": as_of, "rows": rows}
+    if partial:
+        out["partial"] = True
+    return out
 
 
 @mcp.tool()
 async def borrow_snapshot(tickers: list[str] | None = None) -> str:
-    """IBKR borrow snapshot across symbols (bulk). tickers: optional filter
-    (empty returns the full list -- large). Each row: {ticker, fee_rate,
-    available}. Cached 4h.
+    """iBorrowDesk borrow snapshot across symbols (bulk). tickers REQUIRED
+    (per-ticker API), max 80 -- excess is truncated. Each row: {ticker, fee_rate,
+    available}. Cached 4h per ticker. Empty list -> success false. Tickers not on
+    iBorrowDesk are skipped. On 3 consecutive hard failures the circuit opens and
+    the response carries partial=true with the rows collected so far.
     """
     try:
         return json.dumps(await _borrow_snapshot(tickers or []))
