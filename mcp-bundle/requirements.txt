@@ -1,9 +1,14 @@
-# Aggregated runtime deps for fred / tradier / polymarket / stock-price /
-# financialjuice MCP servers. Pinned upper bounds intentionally loose
-# (these are stable APIs); rebuild bundle quarterly to refresh.
+# Aggregated runtime deps for the bundled MCP servers. Pinned upper bounds
+# intentionally loose (these are stable APIs); rebuild bundle quarterly to
+# refresh. aiohttp also serves the P1 sentiment/shorts/finnhub/gdelt servers
+# (no extra deps beyond ftplib stdlib for IBKR borrow).
 mcp>=1.0,<2
 uvicorn>=0.30,<1   # _mcp_auth.serve() imports uvicorn directly (mcp pulls it too)
 aiohttp>=3.9,<4
 redis>=5.0,<6
 yfinance>=0.2,<1
 supervisor>=4.2,<5
+# P1 B5 defeatbeta: pulls duckdb + pandas + huggingface_hub transitively.
+# API surface verified against 0.0.60 (Ticker.earning_call_transcripts /
+# {annual,quarterly}_{income_statement,balance_sheet,cash_flow}).
+defeatbeta-api>=0.0.40

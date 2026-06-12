@@ -1,6 +1,6 @@
-# Bundle of six Python FastMCP servers for OCI Coolify deploy.
-# One container, one supervisord, six processes — keeps Coolify dashboard
-# tidy and shares the Python runtime / pip cache.
+# Bundle of Python FastMCP servers for OCI Coolify deploy.
+# One container, one supervisord, one process per MCP — keeps Coolify
+# dashboard tidy and shares the Python runtime / pip cache.
 #
 # Contains the API-only MCPs that don't need a desktop client:
 #   - fred (3035)            St. Louis Fed REST + cache
@@ -11,6 +11,11 @@
 #   - sa-rss (7050)          SeekingAlpha public RSS feeds (Phase A SA integration)
 #   - sec-edgar (3037)       SEC EDGAR — filings, XBRL facts, full-text search
 #   - sec-flows (3038)       SEC ownership flows — Form 4 (insider) + 13F-HR (institutional)
+#   - sentiment (3039)       CNN F&G / NAAIM / AAII / ApeWisdom (P1)
+#   - shorts (3040)          FINRA short vol/interest + IBKR borrow (P1)
+#   - finnhub (3041)         Finnhub company news / rec trends / earnings cal (P1)
+#   - defeatbeta (3042)      defeatbeta-api transcripts + financials (P1)
+#   - gdelt (3043)           GDELT DOC 2.0 news volume/tone/search (P1)
 #
 # NOT bundled (kept on Windows desktop): chatlog/wxstore (need WeChat
 # client), twitter (Playwright + browser cookies), discord-selfbot
@@ -44,7 +49,7 @@ COPY mcp-bundle/supervisord.conf /etc/supervisord.conf
 # Document which ports this container exposes. Coolify maps them
 # internally via the coolify network so sibling containers can reach
 # alphalens-mcp-bundle:3032 etc.
-EXPOSE 3032 3033 3034 3035 3036 3037 3038 7050
+EXPOSE 3032 3033 3034 3035 3036 3037 3038 3039 3040 3041 3042 3043 7050
 
 # Tiny TCP healthcheck against fred (lightest MCP).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
