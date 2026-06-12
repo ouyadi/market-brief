@@ -9,6 +9,12 @@ spiking, and is its tone turning negative.
 No auth. GDELT rate-limits aggressively per IP, so we enforce ~1 rps with
 single concurrency (a global lock + min-gap). Queries are English.
 
+DESKTOP-RUN BY DESIGN: this server is meant to run on the desktop (residential
+IP). 2026-06-12 testing showed GDELT reputation-throttles datacenter IPs (OCI)
+regardless of frequency, while the same residential IP recovers from a burst
+cooldown within ~5min. The bundle keeps a copy of this process as a roll-back
+safety net, but the live GDELT MCP is the desktop one (CF Access, like tme/wsj).
+
 Endpoint: https://api.gdeltproject.org/api/v2/doc/doc
   mode=timelinevol|timelinetone -> {"timeline":[{"series","data":[{date,value}]}]}
   mode=artlist                  -> {"articles":[{url,title,seendate,domain,language,...}]}
@@ -66,14 +72,17 @@ mcp = FastMCP(
 _CACHE: dict[str, tuple[float, Any]] = {}
 TTL_VOL = 60 * 60       # 1h
 TTL_ART = 30 * 60       # 30min
-# 2026-06-12 prod smoke: GDELT 429s datacenter IPs (OCI) far below 1 rps —
-# the throttle is reputation-based, not strictly rate-based. A wide gap plus
-# one long-backoff retry recovers intermittent throttling; a hard-blocked IP
-# still fails fast after the single retry.
 _MIN_GAP_S = 6.0
-_RETRY_429_BACKOFF_S = 30.0
+# 2026-06-12 desktop testing: once GDELT 429s, a 40s-interval retry still 429s
+# and the IP self-heals only after ~5min. So we DON'T back off in-process —
+# holding the rate lock through a multi-minute sleep wedges the MCP client (the
+# P1 smoke russia_ukraine case). Instead a 429 trips a process-level cooldown
+# gate: every call inside the window fails fast with the remaining seconds, no
+# lock held, no extra requests that would only dig the reputation hole deeper.
+_COOLDOWN_S = 300.0
 _rate_lock = asyncio.Lock()
 _last_call = {"t": 0.0}
+_cooldown_until = {"t": 0.0}
 
 
 def _cache_get(key: str, ttl: float) -> Any | None:
@@ -104,36 +113,44 @@ def _parse_ts(s: Any) -> str | None:
     return str(s)
 
 
+def _check_cooldown() -> None:
+    """Fail fast if a prior 429 tripped the cooldown gate. Checked both before
+    acquiring the rate lock (so blocked calls never queue behind it) and again
+    after, in case the window opened while we were waiting on the lock."""
+    left = _cooldown_until["t"] - time.time()
+    if left > 0:
+        raise RuntimeError(f"GDELT cooldown {int(left)}s left")
+
+
 async def _fetch(params: dict) -> Any:
     """GET the GDELT DOC API with ~1 rps single-concurrency pacing. GDELT
-    sometimes returns non-JSON error text -> raise a clear error."""
+    sometimes returns non-JSON error text -> raise a clear error. A 429 trips
+    a process-level cooldown (no in-process retry/backoff)."""
+    _check_cooldown()
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)
     async with _rate_lock:
-        for attempt in (0, 1):
-            gap = time.time() - _last_call["t"]
-            if gap < _MIN_GAP_S:
-                await asyncio.sleep(_MIN_GAP_S - gap)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(BASE, params=params, headers={"User-Agent": UA}) as r:
-                    text = await r.text()
-                    _last_call["t"] = time.time()
-                    if r.status == 429:
-                        if attempt == 0:
-                            # Hold the lock through the backoff on purpose: when the
-                            # IP is throttled, letting other calls through only digs
-                            # the reputation hole deeper.
-                            await asyncio.sleep(_RETRY_429_BACKOFF_S)
-                            continue
-                        raise RuntimeError("GDELT rate limit (429) -- back off")
-                    if r.status != 200:
-                        raise RuntimeError(f"GDELT -> {r.status} {text[:160]}")
-                    stripped = text.strip()
-                    if not stripped:
-                        return {}
-                    if not stripped.startswith("{"):
-                        # GDELT returns plain-text errors (e.g. malformed query) as 200
-                        raise RuntimeError(f"GDELT non-JSON: {stripped[:160]}")
-                    return json.loads(stripped)
+        _check_cooldown()
+        gap = time.time() - _last_call["t"]
+        if gap < _MIN_GAP_S:
+            await asyncio.sleep(_MIN_GAP_S - gap)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(BASE, params=params, headers={"User-Agent": UA}) as r:
+                text = await r.text()
+                _last_call["t"] = time.time()
+                if r.status == 429:
+                    # Trip the cooldown and bail immediately — no backoff. 40s
+                    # retries still 429; the IP self-heals after ~5min.
+                    _cooldown_until["t"] = time.time() + _COOLDOWN_S
+                    raise RuntimeError(f"GDELT cooldown {int(_COOLDOWN_S)}s left")
+                if r.status != 200:
+                    raise RuntimeError(f"GDELT -> {r.status} {text[:160]}")
+                stripped = text.strip()
+                if not stripped:
+                    return {}
+                if not stripped.startswith("{"):
+                    # GDELT returns plain-text errors (e.g. malformed query) as 200
+                    raise RuntimeError(f"GDELT non-JSON: {stripped[:160]}")
+                return json.loads(stripped)
 
 
 def _timeline_points(payload: dict, value_key: str) -> list[dict]:
@@ -237,6 +254,11 @@ async def news_search(query: str, timespan: str = "24h", max: int = 20) -> str:
 
 # ── --probe CLI ────────────────────────────────────────────────────────────
 async def _probe(args: list[str]) -> None:
+    # Pacing state (_last_call) is per-process: a --probe runs in its own
+    # process and can't see the resident service's last call, so it might fire
+    # <5s after it (or after a previous probe). This sleep is the only place
+    # that could otherwise violate GDELT's ~1-per-5s rule from a fresh process.
+    await asyncio.sleep(_MIN_GAP_S)
     query = args[0] if args else "Federal Reserve interest rate"
     out: dict[str, Any] = {}
     try:
