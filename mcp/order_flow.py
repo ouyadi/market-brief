@@ -45,3 +45,84 @@ def classify_timesale(
         if last < prev_last:
             return "sell"
     return None
+
+
+def et_date_from_ms(ms: int) -> str:
+    """Epoch milliseconds → 'YYYY-MM-DD' in US/Eastern."""
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=_ET).strftime("%Y-%m-%d")
+
+
+@dataclass
+class _Row:
+    buy_dollars: float = 0.0
+    sell_dollars: float = 0.0
+    buy_ct: int = 0
+    sell_ct: int = 0
+    unclassified_ct: int = 0
+    prev_last: float | None = None
+    session_date: str | None = None
+
+
+class OrderFlowState:
+    """Per-symbol signed-dollar accumulator with start-of-ET-day reset.
+
+    In-memory only; lives for the lifetime of the MCP process. record() is
+    called from _publish_event for each timesale event; snapshot() is read by
+    the get_order_flow tool (and stream_status). Never raises on bad input —
+    bad fields just yield an unclassified tick.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, _Row] = {}
+
+    def record(
+        self,
+        symbol: str,
+        last: float | None,
+        bid: float | None,
+        ask: float | None,
+        size: float | None,
+        date_ms: int | None,
+    ) -> None:
+        if not symbol:
+            return
+        row = self.rows.get(symbol)
+        day = et_date_from_ms(date_ms) if date_ms else (row.session_date if row else None)
+        if row is None or (day is not None and day != row.session_date):
+            row = _Row(session_date=day)  # fresh day (or first event) → reset
+            self.rows[symbol] = row
+        side = classify_timesale(last, bid, ask, row.prev_last)
+        dollar = (last or 0.0) * (size or 0.0)
+        if side == "buy":
+            row.buy_dollars += dollar
+            row.buy_ct += 1
+        elif side == "sell":
+            row.sell_dollars += dollar
+            row.sell_ct += 1
+        else:
+            row.unclassified_ct += 1
+        if last is not None and last > 0:
+            row.prev_last = last
+
+    def snapshot(self, symbols: list[str] | None = None) -> dict[str, dict]:
+        keys = symbols if symbols is not None else list(self.rows.keys())
+        out: dict[str, dict] = {}
+        for sym in keys:
+            row = self.rows.get(sym)
+            if row is None:
+                continue
+            classified = row.buy_ct + row.sell_ct
+            total = classified + row.unclassified_ct
+            denom = row.buy_dollars + row.sell_dollars
+            out[sym] = {
+                "buy_dollars": round(row.buy_dollars, 2),
+                "sell_dollars": round(row.sell_dollars, 2),
+                "ofi": (row.buy_dollars - row.sell_dollars) / denom if denom > 0 else None,
+                "buy_ct": row.buy_ct,
+                "sell_ct": row.sell_ct,
+                "classified_ct": classified,
+                "unclassified_ct": row.unclassified_ct,
+                "coverage": round(classified / total, 4) if total > 0 else 0.0,
+                "session_date": row.session_date,
+            }
+        return out
