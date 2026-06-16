@@ -41,6 +41,7 @@ from typing import Any
 import aiohttp
 import redis.asyncio as aioredis
 from mcp.server.fastmcp import FastMCP
+from order_flow import OrderFlowState, classify_timesale  # noqa: F401  (Phase 2 order-flow)
 
 # ── Logging + dirs ────────────────────────────────────────────────────────
 LOG_DIR = (
@@ -64,6 +65,16 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 DEFAULT_STREAM_SYMBOLS = os.environ.get(
     "TRADIER_STREAM_SYMBOLS", "SPY,QQQ,IWM,DIA,TLT,HYG,VIX"
 ).split(",")
+
+# Phase 2 — 受保护基集:rotation 的 ~26 个 ETF 恒在订(否则 heatmap 缩集时它们的
+# timesale 断流,订单流累计出现 gap)。与 alphalens src/lib/rotation/universe.ts 的
+# 成员手动保持同步(跨语言无干净共享;列表稳定)。
+ROTATION_BASE = {
+    "XLK", "XLE", "XLF", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
+    "IWF", "IWD", "IWM", "MTUM", "QUAL", "USMV", "SPHB",
+    "SPY", "TLT", "IEF", "GLD", "DBC", "HYG", "UUP", "IBIT",
+}
+
 STREAM_FILTER = os.environ.get("TRADIER_STREAM_FILTER", "trade,quote,summary,timesale")
 
 HTTP_TIMEOUT_S = 15
@@ -82,7 +93,9 @@ class StreamState:
     """Mutable shared state for the background stream consumer."""
 
     def __init__(self) -> None:
-        self.symbols: set[str] = set(s.strip().upper() for s in DEFAULT_STREAM_SYMBOLS if s.strip())
+        self.symbols: set[str] = (
+            set(s.strip().upper() for s in DEFAULT_STREAM_SYMBOLS if s.strip()) | ROTATION_BASE
+        )
         self.connected: bool = False
         self.sessionid: str | None = None
         self.last_event_ts: float = 0.0
@@ -103,10 +116,12 @@ class StreamState:
             "last_event_age_sec": (time.time() - self.last_event_ts) if self.last_event_ts else None,
             "last_connect_age_sec": (time.time() - self.last_connect_ts) if self.last_connect_ts else None,
             "last_error": self.last_error,
+            "order_flow_symbols": len(ORDER_FLOW.rows),
         }
 
 
 STATE = StreamState()
+ORDER_FLOW = OrderFlowState()  # Phase 2 — per-symbol signed-dollar accumulator
 _redis: aioredis.Redis | None = None
 
 
@@ -425,6 +440,7 @@ async def set_stream_symbols(symbols: str) -> dict:
     new_set = {s.strip().upper() for s in symbols.split(",") if s.strip()}
     if not new_set:
         return {"success": False, "error": "empty symbol list ignored"}
+    new_set |= ROTATION_BASE  # 受保护基集恒在订
     old = sorted(STATE.symbols)
     STATE.symbols = new_set
     STATE.reconnect_event.set()
@@ -434,6 +450,26 @@ async def set_stream_symbols(symbols: str) -> dict:
         "old_count": len(old),
         "new_count": len(new_set),
         "symbols": sorted(new_set),
+    }
+
+
+@mcp.tool()
+async def get_order_flow(symbols: str) -> dict:
+    """Per-symbol intraday order-flow (Lee-Ready signed dollar volume).
+
+    `symbols`: comma-separated, e.g. 'SPY,XLK,XLE'. Returns, per symbol:
+    {buy_dollars, sell_dollars, ofi=(buy-sell)/(buy+sell), buy_ct, sell_ct,
+     classified_ct, unclassified_ct, coverage, session_date}. In-memory,
+     resets at the start of each ET trading day. Symbols with no accumulated
+     ticks (consumer offline / not subscribed) are absent from the result.
+    """
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    snap = ORDER_FLOW.snapshot(syms or None)
+    return {
+        "success": True,
+        "count": len(snap),
+        "order_flow": snap,
+        "last_event_age_sec": (time.time() - STATE.last_event_ts) if STATE.last_event_ts else None,
     }
 
 
@@ -463,6 +499,20 @@ async def _create_session() -> tuple[str, str]:
             return sid, url_from_resp
 
 
+def _safe_float(v) -> float | None:
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(v) -> int | None:
+    try:
+        return int(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 async def _publish_event(redis: aioredis.Redis, evt: dict) -> None:
     """Map a Tradier stream event to a Redis pub channel + counter."""
     etype = evt.get("type", "unknown")
@@ -476,6 +526,19 @@ async def _publish_event(redis: aioredis.Redis, evt: dict) -> None:
     STATE.events_total += 1
     STATE.events_by_type[etype] = STATE.events_by_type.get(etype, 0) + 1
     STATE.last_event_ts = time.time()
+    # Phase 2 — order-flow accumulation on timesale (carries bid/ask/last/size)
+    if etype == "timesale":
+        try:
+            ORDER_FLOW.record(
+                sym,
+                _safe_float(evt.get("last")),
+                _safe_float(evt.get("bid")),
+                _safe_float(evt.get("ask")),
+                _safe_float(evt.get("size")),
+                _safe_int(evt.get("date")),
+            )
+        except Exception:
+            pass  # never let accumulation break the stream pump
 
 
 async def _stream_once(redis: aioredis.Redis) -> None:
