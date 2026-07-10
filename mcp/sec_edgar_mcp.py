@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import time
+from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any
 
@@ -544,7 +545,11 @@ async def get_filing_document(
     # Strip HTML for text mode. SEC docs are highly tabular so the result is
     # imperfect but adequate for keyword search / LLM grounding. Callers who
     # need the raw HTML / iXBRL should hit doc_url directly.
+    # Unescape entities BEFORE whitespace collapse: filings routinely encode
+    # nbsp/apostrophes as &#160;/&#8217; etc., which otherwise leak into the
+    # text verbatim and defeat downstream regex parsing (e.g. "Item&#160;1A.").
     text = _HTML_TAG_RE.sub(" ", html)
+    text = html_unescape(text)
     text = _WS_RUN_RE.sub("\n", text).strip()
     original_chars = len(text)
     cap = max(1_000, min(int(max_chars), 1_000_000))
