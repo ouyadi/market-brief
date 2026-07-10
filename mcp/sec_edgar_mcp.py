@@ -388,6 +388,34 @@ async def get_filing_metadata(
             "url": f"{base}/{name}" if name else None,
         })
 
+    # index.json's `type` is the ICON filename (text.gif / image2.gif) — it
+    # says nothing about the document. Real SEC document types (8-K, EX-99.1,
+    # GRAPHIC, …) live only in the -index.htm table's Type column; parse it
+    # and overlay. Non-fatal: on any failure `type` becomes None (never the
+    # icon junk — downstream matches types like "EX-99.1" and must not be
+    # fed decoys).
+    dashed = f"{acc_clean[:10]}-{acc_clean[10:12]}-{acc_clean[12:]}"
+    real_types: dict[str, str] = {}
+    try:
+        idx_html = await _get_text(f"{base}/{dashed}-index.htm")
+        # Row shape: <tr><td>Seq</td><td>Desc</td><td><a href=".../name.htm">…</a></td><td>EX-99.1</td><td>Size</td>
+        # (iXBRL hrefs look like /ix?doc=/Archives/…/name.htm — take the last
+        # path segment, dropping any query string.)
+        for m in re.finditer(
+            r"<tr[^>]*>\s*<td[^>]*>\s*\d+\s*</td>\s*<td[^>]*>.*?</td>\s*"
+            r"<td[^>]*>\s*<a[^>]+href=\"([^\"]+)\"[^>]*>.*?</td>\s*<td[^>]*>([^<]*)</td>",
+            idx_html,
+            re.I | re.S,
+        ):
+            fname = m.group(1).split("?")[-1].rstrip("/").rsplit("/", 1)[-1].strip()
+            dtype = m.group(2).strip()
+            if fname and dtype:
+                real_types[fname] = dtype
+    except Exception:  # noqa: BLE001
+        pass
+    for d in documents:
+        d["type"] = real_types.get(d["name"])
+
     # Pick the primary doc — largest non-exhibit, non-iXBRL-fragment .htm.
     # (See _pick_primary_doc for why size, not the unreliable `type`, drives this.)
     primary = _pick_primary_doc(documents)
