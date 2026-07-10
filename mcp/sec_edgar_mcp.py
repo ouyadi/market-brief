@@ -496,6 +496,8 @@ async def get_filing_document(
     ticker_or_cik: str,
     accession: str,
     doc: str | None = None,
+    max_chars: int = _DOC_MAX_CHARS,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Fetch a filing document, strip HTML, return plain text.
 
@@ -504,13 +506,20 @@ async def get_filing_document(
       accession: '0001045810-25-000123'
       doc: specific document name (e.g. 'nvda-20250126.htm'). If omitted,
         we auto-pick the primary document (largest non-exhibit .htm).
+      max_chars: cap on returned text (default 60K to keep interactive MCP
+        payloads sane; clamped to [1_000, 1_000_000]). Batch callers like
+        alphalens' 10-K/10-Q section ingest pass 1_000_000 to get the whole
+        document in one call.
+      offset: start position into the stripped text (paging for callers that
+        keep the small default cap).
 
     Returns:
       {
         success, cik, accession, doc_name, doc_url,
-        text: <plain text, capped at 60K chars>,
-        truncated: bool,
+        text: <plain text window [offset, offset+max_chars)>,
+        truncated: bool  (true when text continues past the window),
         original_chars: int,
+        offset: int,
       }
     """
     out: dict[str, Any] = {"success": False, "accession": accession}
@@ -538,16 +547,19 @@ async def get_filing_document(
     text = _HTML_TAG_RE.sub(" ", html)
     text = _WS_RUN_RE.sub("\n", text).strip()
     original_chars = len(text)
-    truncated = original_chars > _DOC_MAX_CHARS
+    cap = max(1_000, min(int(max_chars), 1_000_000))
+    start = max(0, int(offset))
+    truncated = original_chars > start + cap
 
     out.update({
         "success": True,
         "cik": cik,
         "doc_name": doc_name,
         "doc_url": url,
-        "text": text[:_DOC_MAX_CHARS] + ("\n\n[truncated]" if truncated else ""),
+        "text": text[start:start + cap] + ("\n\n[truncated]" if truncated else ""),
         "truncated": truncated,
         "original_chars": original_chars,
+        "offset": start,
     })
     return out
 
