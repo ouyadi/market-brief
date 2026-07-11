@@ -567,8 +567,33 @@ async def get_filing_document(
     try:
         html = await _get_text(url)
     except Exception as e:  # noqa: BLE001
-        out["error"] = f"doc fetch failed: {e!r}"
-        return out
+        # Multi-filer quirk: for co-filed filings (e.g. a merger 8-K filed
+        # under both the new holdco and the legacy issuer) the co-filer's
+        # directory index LISTS the documents but the files physically live
+        # only under the PRIMARY filer's CIK path — direct GET 404s. The
+        # co-filer's -index.htm hrefs point at the real path
+        # ("/Archives/edgar/data/<primary-cik>/<acc>/<doc>"); follow them.
+        real = None
+        try:
+            dashed = f"{acc_clean[:10]}-{acc_clean[10:12]}-{acc_clean[12:]}"
+            idx_html = await _get_text(
+                f"{SEC_WWW}/Archives/edgar/data/{int(cik)}/{acc_clean}/{dashed}-index.htm"
+            )
+            m = re.search(
+                r"href=\"(?:/ix\?doc=)?(/Archives/edgar/data/[^\"]+/"
+                + re.escape(doc_name) + r")\"",
+                idx_html,
+                re.I,
+            )
+            if m:
+                real = f"{SEC_WWW}{m.group(1)}"
+                html = await _get_text(real)
+        except Exception:  # noqa: BLE001
+            real = None
+        if real is None:
+            out["error"] = f"doc fetch failed: {e!r}"
+            return out
+        url = real
 
     # Strip HTML for text mode. SEC docs are highly tabular so the result is
     # imperfect but adequate for keyword search / LLM grounding. Callers who
