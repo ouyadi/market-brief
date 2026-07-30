@@ -313,6 +313,44 @@ if ($alphaBriefConfigured -and (Test-Path $venvPy) -and (Test-Path $alphaBriefTo
     Log "[WARN] AlphaLens Brief helper or Python runtime missing; the regular brief will continue"
 }
 
+# P1: extract the previous run's WeChat speed-read so the LLM can tag each
+# setup [新/更新/延续] against it instead of rewriting from scratch. Warn-only:
+# when unavailable the prompt rules make the LLM tag everything [新].
+# Section needle built from UTF-8 bytes (same pattern as the push needle
+# below): this .ps1 is BOM-less, so PS 5.1 would mojibake a literal Chinese
+# string at parse time and the section would never match.
+$prevDigestContext = ""
+$extractTool = Join-Path $here 'extract_section.py'
+if ((Test-Path $venvPy) -and (Test-Path $extractTool)) {
+    $secDigest = [System.Text.Encoding]::UTF8.GetString([byte[]](0xE5,0xBE,0xAE,0xE4,0xBF,0xA1,0xE9,0x80,0x9F,0xE8,0xAF,0xBB)) # 微信速读
+    $prevContextFile = Join-Path $logDir "prev-digest-context-$date-$hour-$PID.md"
+    $prevEAPx = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $prevOut = & $venvPy $extractTool `
+            --reports-dir $reportsDir `
+            --section $secDigest `
+            --pick latest `
+            --exclude (Split-Path -Leaf $reportFile) `
+            --wrap previous-digest `
+            --output $prevContextFile 2>&1
+        $prevExit = $LASTEXITCODE
+    } catch {
+        $prevOut = @("EXTRACT_SECTION_UNAVAILABLE: helper invocation failed")
+        $prevExit = 4
+    } finally {
+        $ErrorActionPreference = $prevEAPx
+    }
+    if ($prevExit -eq 0 -and (Test-Path $prevContextFile)) {
+        $prevDigestContext = Get-Content -Raw -Encoding UTF8 $prevContextFile
+        Log "[$([DateTime]::Now)] previous digest context ready ($($prevDigestContext.Length) chars)"
+    } else {
+        foreach ($line in @($prevOut)) { Log "    [prev-digest] $line" }
+        Log "[WARN] previous digest unavailable; setups will all be tagged as new"
+    }
+    Remove-Item $prevContextFile -ErrorAction SilentlyContinue
+}
+
 if ($backend -eq "claude") {
     if (-not $secrets.claudeCodeOauthToken) {
         Log "[ERROR] secrets.json missing claudeCodeOauthToken. Generate one with: claude setup-token"
@@ -351,6 +389,10 @@ AlphaLens /brief was configured but unavailable this run. Mention
 Do not invent an AlphaLens section or facts.
 <!-- END_ALPHALENS_BRIEF_STATUS -->
 '@
+}
+if ($prevDigestContext) {
+    $prompt += "`n`n" + $prevDigestContext
+    Log "[$([DateTime]::Now)] appended previous digest context"
 }
 Log "[$([DateTime]::Now)] launching $backend (this may take a few minutes)..."
 
@@ -426,6 +468,27 @@ if (-not (Test-Path $reportFile)) {
     exit 3
 }
 Log "[$([DateTime]::Now)] report ready: $reportFile"
+
+# P1c: deterministic speed-read lint. WARN-ONLY - problems are logged and the
+# push always continues. Revisit as a hard gate after ~1 week of observation.
+# EAP locally relaxed like every other native call here: under Stop, any
+# stray stderr line would kill the run before the WeChat push.
+$lintTool = Join-Path $here 'digest_lint.py'
+if ((Test-Path $venvPy) -and (Test-Path $lintTool)) {
+    $prevEAPl = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lintOut = & $venvPy $lintTool $reportFile 2>&1
+        $lintExit = $LASTEXITCODE
+    } catch {
+        $lintOut = @("digest lint invocation failed: $($_.Exception.Message)")
+        $lintExit = 1
+    } finally {
+        $ErrorActionPreference = $prevEAPl
+    }
+    foreach ($line in @($lintOut)) { Log "    [digest-lint] $line" }
+    if ($lintExit -ne 0) { Log "[WARN] digest lint reported problems (push continues)" }
+}
 
 # --- 5. Push to WeChat via Hermes Agent iLink (primary channel) --------
 $pushTool = Join-Path $here 'push_weixin.py'

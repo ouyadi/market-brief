@@ -114,8 +114,8 @@ def main() -> int:
             args.output.write_text(rendered + "\n", encoding="utf-8")
         else:
             print(rendered)
-    except Exception:
-        print("EXTRACT_SECTION_UNAVAILABLE: unexpected failure", file=sys.stderr)
+    except Exception as exc:
+        print(f"EXTRACT_SECTION_UNAVAILABLE: unexpected failure: {exc!r}", file=sys.stderr)
         return 4
 
     print(f"EXTRACT_SECTION_READY {source.name}", file=sys.stderr)
