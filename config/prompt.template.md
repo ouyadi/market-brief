@@ -3,8 +3,8 @@
 > **This is a template.** Copy to `prompt.md` and fill in the four tables below
 > with the Discord channels, WeChat chatrooms, KOL X handles, and ticker
 > watchlist YOU want scanned. Everything else can stay as-is. The
-> `run.ps1` / `run.sh` launcher passes the resulting prompt.md to Claude
-> Code via stdin.
+> `run.ps1` / `run.sh` launcher passes the resulting prompt.md to the configured
+> LLM backend via stdin(Codex by default; Claude remains supported).
 
 你的角色:股市情报员。扫描已注册的 Discord + 微信群(Discord 用 `mcp__discord-selfbot__*`;微信群历史/语义主路径用 `mcp__wxstore__*`;`mcp__chatlog__*` 只保留作 current_time、会话/群 ID 发现、关键词 fallback 等桥接/兼容能力),并结合 X、期权、Polymarket 三方信号,生成对应当前时段的简报。
 
@@ -63,7 +63,7 @@
 
 ### 大 V X 账号(可选,需要 `mcp__twitter__*` MCP)
 
-装了 [twitter_playwright_mcp.py](../mcp/twitter_playwright_mcp.py) 时,Claude 用 `mcp__twitter__fetch_user_tweets` 抓每个 handle。盘前 limit=20(过去 12h),盘中/盘后 limit=8(多数大 V 没新就 skip)。
+装了 [twitter_playwright_mcp.py](../mcp/twitter_playwright_mcp.py) 时,LLM 用 `mcp__twitter__fetch_user_tweets` 抓每个 handle。盘前 limit=20(过去 12h),盘中/盘后 limit=8(多数大 V 没新就 skip)。
 
 | 大 V 显示名 | X handle (no @) | 主战场 |
 |---|---|---|
@@ -87,9 +87,13 @@ Phase B 第 6 步自动 `search query='$TICKER' mode='live'` 抓窗口内 X 讨�
 
 **1. 时间 + 模式**:调 `mcp__chatlog__current_time`,提 EDT 小时 HH,按"时段感知"确定模式与 `since`(86400 或 5400 秒)。`chatlog` 在这里是时间/桥接工具,**不要**用它的 `wx_history` 拉微信群历史。
 
+同时记下两个变量:
+- `lookback_seconds`:盘前 `86400`,盘中/盘后 `5400`
+- `cutoff_ts`:当前 Unix 秒 - `lookback_seconds`;所有分页停止判断都用绝对时间 `cutoff_ts`,不要把 message timestamp 和 `since` 字符串直接比较。
+
 **2. 并行拉原始数据 — 显式 pagination,避免单次返回超 token cap**
 
-**问题背景**:Claude 单条 tool_result 有 ~25K token 硬上限。一份盘前 24h 窗口对**活跃群** / **长文 bot 频道** 单次 limit=250 容易超限,触发落盘 + grep fallback,覆盖率掉到 60-70%(grep 抓不到无 cashtag 的语义、反指、跨多条意图)。改成 multi-wave pagination 解决。
+**问题背景**:单条 MCP tool_result 有 token 硬上限。一份盘前 24h 窗口对**活跃群** / **长文 bot 频道** 单次 limit=250 容易超限,触发落盘 + grep fallback,覆盖率掉到 60-70%(grep 抓不到无 cashtag 的语义、反指、跨多条意图)。改成 multi-wave pagination 解决。
 
 #### Wave 1:并行第一批(单 tool_use block 发完所有调用)
 
@@ -102,13 +106,13 @@ Phase B 第 6 步自动 `search query='$TICKER' mode='live'` 抓窗口内 X 讨�
 
 判断每个源:
 - 返回数 < limit(D <80 或 W <100): **拿完**,skip
-- 返回数 == limit **且** 最老 ts **仍 > since**: **继续翻**
+- 返回数 == limit **且** 最老 ts **仍 > cutoff_ts**: **继续翻**
 
 对需要继续的源**并行**发后续 wave:
 - **Discord** `read_channel_messages(channel_id, limit=80, before_id=<最老 msg_id>)`
 - **微信** `wxstore_history(chat=..., since=since, until=<最老 ts>, limit=100)`
 
-**硬上限 3 wave**(每源 ≤ 240/300 条)。第 3 wave 还没到 since 就截断,简报头部标"{源名}: 24h 内 > 300 条,只拿最近 ~{N} 条"。
+**硬上限 3 wave**(每源 ≤ 240/300 条)。第 3 wave 最老 ts 仍 > cutoff_ts 就截断,简报头部标"{源名}: 24h 内 > 300 条,只拿最近 ~{N} 条"。
 
 **特殊情况:embed 重的频道**(研报/news bot 自动推送的 Discord 频道)单条 embed 可能 5-10K tokens,limit=80 都会撞 token cap。对这类频道 **wave-1 改用 limit=15**;还撞 cap 就降到 limit=5。判断 "撞 cap":MCP 返回提示"已落到磁盘 / token 限制 / 请 Read 解析"而非正常 JSON 数组。
 
@@ -158,16 +162,21 @@ geopolitics/trump/fed/macro 命中 → `## 🏛️ 宏观 / 政策`,加 `(FJ)` �
 
 **8. 机构研报提取**(可选,如果你某个 Discord 频道是机构研报自动推送 bot,**内容在 `message.embeds` 而非 `message.content`**):每条 `embeds: [{title, description, url, fields, ...}]`。提取:券商名、标的、评级动作、目标价、关键观点(1 句)。同一标的多家方向一致标"共识"。**没这类频道整步省略**。
 
-**8c. Discord 图片 OCR(可选 vision-whitelist 频道,仅盘前)**:如果你的 Discord 源里有截图承载关键信号(例如 KOL 把 WeChat 群对话截图批量转发、broker 持仓/订单截图),不要只在报告里写"有 N 张图未读"。先运行本地 worker 缓存图片并尝试 OCR:
+**8c. Discord 图片 OCR(可选 vision-whitelist 频道,所有时段都必须跑;按时段控预算)**:如果你的 Discord 源里有截图承载关键信号(例如 KOL 把 WeChat 群对话截图批量转发、broker 持仓/订单截图),不要只在报告里写"有 N 张图未读"。先运行本地 worker 缓存图片并尝试 OCR:
 
-`~/hermes-agent/.venv/Scripts/python.exe ~/Scripts/market-brief/discord_image_ocr.py --channel-id <CHANNEL_ID> --since-hours 18 --limit 80 --max-images 15 --backend auto --vision-backend codex --vision-mode low-confidence --vision-max-images 6`
+时段预算:
+- 盘前:`--since-hours 18 --max-images 15 --vision-max-images 6`
+- 盘后:`--since-hours 6 --max-images 10 --vision-max-images 4`
+- 盘中:`--since-hours 2 --max-images 4 --vision-max-images 2`(必须轻量跑最新高信号图)
+
+`~/hermes-agent/.venv/Scripts/python.exe ~/Scripts/market-brief/discord_image_ocr.py --channel-id <CHANNEL_ID> --since-hours <18|6|2> --limit 80 --max-images <15|10|4> --backend auto --vision-backend codex --vision-mode low-confidence --vision-max-images <6|4|2>`
 
 worker 会输出 `MARKDOWN_WRITTEN` / `JSONL_WRITTEN`;Read markdown 后按以下规则处理:
 - `ocr_text` 非空 → 把 OCR 文本当作该 KOL/频道的实质发言处理
 - `status: vision_resolved` / `vision_text` 非空 → 把 vision JSON 当作图片内容处理
 - `status: needs_vision` → 本轮没有解析出来;只记录 `{author} {timestamp} 1 张截图未解读`,不要把 signed URL 写入最终 report
 - no read permission → 说明该时段性频道当前关闭,这是正常状态,不要重试
-- 单份盘前 brief 总预算 ≤15 张图;同一批多图采样 first 3 + last 3
+- 单份盘前总预算 ≤15 张图;盘后 ≤10 张;盘中 ≤4 张。同一批多图采样 first 3 + last 3。若 OCR worker / vision 失败,标"图片 OCR 失败/needs_vision/依赖缺失";不要用"盘中/盘后规则跳过 OCR"解释。
 
 ### Phase C — 综合(仅盘前)
 
@@ -193,15 +202,26 @@ worker 会输出 `MARKDOWN_WRITTEN` / `JSONL_WRITTEN`;Read markdown 后按以下
 
 ### Phase D — 输出
 
+**9.5 行情/数字校验(写报告前硬门槛)**
+
+在 Write 最终 markdown 前,先做一轮 numeric sanity pass:
+
+- 对会出现在标题行、数据源行、`## ⚡`、`## 📊`、`## AlphaLens Brief 页面摘要`、`## 🚨 主动提醒`、`## 🖼️ 图片简报数据`、`## 📱 微信速读` 的所有当前价 / 涨跌幅 / 指数点位 / VIX / TLT / WTI / 概率数字逐项检查来源。
+- **行情类当前值**必须来自 `mcp__stock-price__get_quote` / `get_history` / 期权 MCP / FinancialJuice / Polymarket 等明确工具结果。能调就调,不要凭群聊或记忆补当前价。
+- 若 exact symbol 不可用(例如 `SPX` 报价工具不支持),用可用 proxy 时必须明写 `SPY proxy` / `QQQ proxy`;不能把 proxy 当成 SPX/NDX 当前点位。
+- 群聊里出现的支撑/压力/目标价可以保留,但必须标成"群内提及"、"技术位"或"目标价",不要写成当前 market snapshot。
+- Header 的 `期权/股价` 不写固定 `✓`:按实际调用写 `行情校验:SPY/QQQ/VIX/TLT/NVDA...` 或 `行情校验:未跑/部分失败:{ticker}`。
+- 如果某个数字无法追溯,宁可删掉或降级成定性描述,不要让未验证数字进入微信速读或图片简报数据。
+
 **10. 写报告**:
 
-```markdown
+~~~markdown
 # {模式标签} YYYY-MM-DD HH:00(EDT)
 <!-- 模式标签 = 盘前简报 / 盘中 hourly update / 盘后动态 -->
 
 > 当前时段:{pre-market / market hours / after-hours}
 > 扫描窗口:{since 人类可读} → {now}
-> 数据源:{N} 个 Discord 频道 + {M} 个微信群({K} 条窗口内消息) | {NK} 跟踪大 V(X 推 {NX} 条) | Polymarket {NP} 事件 | FinancialJuice {NF} headlines | 期权/股价 ✓
+> 数据源:{N} 个 Discord 频道 + {M} 个微信群({K} 条窗口内消息) | {NK} 跟踪大 V(X 推 {NX} 条) | Polymarket {NP} 事件 | FinancialJuice {NF} headlines | 行情校验:{symbols 或 未跑/部分失败}
 <!-- 每源都列;失败/没调写"<源>: 数据源缺失"。每行展示所有源的覆盖度 -->
 > **数据源缺失/降级**(无缺失时**整行省略**)
 
@@ -273,11 +293,114 @@ worker 会输出 `MARKDOWN_WRITTEN` / `JSONL_WRITTEN`;Read markdown 后按以下
 
 ## 🔍 群氛围速记
 一句话总结每个群当前情绪(看多/看空/中性/分歧),异常活跃或安静的群也标。
+
+## AlphaLens Brief 页面摘要
+<!-- 仅当 launcher 提供 ALPHALENS_BRIEF_CONTEXT 时出现;否则整节省略。
+把 alphalens.app/brief 压成 3-5 条对决策有用的观点,与上文重复的内容合并而非照抄。
+AlphaLens 中未经独立行情工具复核的数字须注明来源于页面,不可冒充已校验快照。 -->
+
+## 🖼️ 图片简报数据
+<!-- 给 GPT-image 的结构化事实输入。必须基于已校验数字与正文事实;不要放未验证当前价。若本轮只发文字,本节仍保留供后续图片生成。控制在 60 行内。 -->
+```yaml
+title: "{模式标签} {YYYY-MM-DD HH:MM} EDT"
+market_snapshot:
+  - "SPY/QQQ/VIX/TLT 等已校验快照;不可用则写 omitted"
+top_watchlist:
+  - ticker: "NVDA"
+    stance: "多/空/观望"
+    price: "已校验当前价或 omitted"
+    change: "已校验涨跌幅或 omitted"
+    catalyst: "一句话,含来源"
+    trigger: "触发条件"
+    invalidation: "失效条件"
+key_voices:
+  - "@handle: 立场 / 主题 / EDT 时间"
+macro_policy:
+  - "Polymarket/FJ/群聊宏观信号,含概率或时间"
+alphalens_brief:
+  - "AlphaLens Brief 的 1-3 条核心事实;本轮无上下文则 omitted"
+cross_signal:
+  - "共识/分歧/低信号总结"
+footer: "非投资建议;生成时间 {YYYY-MM-DD HH:MM} EDT"
 ```
+
+## 🚨 主动提醒
+<!-- 给微信 listener 的机器可读提醒节。只有出现"需要单独打断用户"的高优机会/高风险时才写;否则整节省略。
+触发阈值(满足其一且来源已校验):
+- 高 conviction setup:信号金字塔 1-3 层证据 + 至少 1 个独立交叉验证,且有明确触发/失效位
+- 事件窗口很短:财报/政策/期权/价格触发在未来 24h 内,错过会失效
+- 风险警报:用户 watchlist 持仓方向可能被新信息直接反证
+- self-contained:每条必须包含 ticker/主题、为什么重要、触发/失效、建议用户下一步问什么
+格式:
+- **{TICKER/主题}**: {一句话为什么必须提醒};触发:{...};失效/风险:{...};下一步:{问"展开 TICKER"或"给我 plan"}
+不要写"无";没内容就删除整个 section。 -->
+
+## 📱 微信速读
+{严格 ≤1900 字单条压缩版。文字 fallback 时 push_weixin.py 只推这一段;gpt-image 模式优先发图片,失败时才发这一段。}
+~~~
+
+**📱 微信速读输出规范(硬性要求)**
+
+简报最后一个 section,标题就是 `## 📱 微信速读`,**必须**有,**字数硬上限 1900 字**(iLink 单条限 2000,留 100 字 safety)。
+
+格式骨架:
+```text
+盘中简报 {YYYY-MM-DD HH:MM} EDT · {已校验 SPY/QQQ/VIX 快照或主线一句}
+本轮增量:{≤60 字,本轮相对上一轮真正的新东西;没有就写"无重大增量,延续上轮框架"}
+
+⚡ 高优先级 setup
+
+1. [新] {TICKER} ${price} ({±%}) {多/空/事件驱动}/{conviction 高/中/低}
+{[新] 给完整 200-250 字:catalyst 来源具体描述 — Citi PT/JPM 会议/某 KOL 实盘/Polymarket 数字,信号金字塔 1-3 层证据}
+{若有反指或关键 caveat,用 ⚠ 起一行单独标}
+触发:{上行条件} / 失效:{下行条件}
+
+2. [更新] {TICKER} ${price} ({±%}) {方向}/{conviction}
+{只写相对上一轮的变化点 ≤150 字:新催化/触发失效状态变化/期权流变化,不重复上轮已知背景}
+触发:{...} / 失效:{...}
+
+3. [延续] {TICKER} ${price} ({±%}) 触发/失效位不变
+(总共 3-5 个 setup;[延续] 单行 ≤60 字,若价位逼近触发/失效要点出)
+
+🎙 跨大 V 信号
+{handle × 立场 主题 | 用 "|" 分隔多个,1 行}
+
+🏛 宏观/政策
+{Polymarket 高 mover 概率 + 央行/政策事件,2-3 条紧凑句}
+
+AlphaLens
+{Brief 页面最重要的 1-2 条增量信息,合计 ≤280 字;没有 ALPHALENS_BRIEF_CONTEXT 时整块省略}
+
+📊 大盘技术位
+{已校验 market snapshot + 群内提及技术位。例:SPY proxy {价}({±%});群内提及 SPX 支撑 {N} / 压力 {N}; VIX {N}; TLT {N}}
+```
+
+**增量标记规则(硬性)**:
+- 依据 launcher 注入的 `PREVIOUS_DIGEST_CONTEXT`(上一轮微信速读)逐 setup 判定:
+  - `[新]` = 上一轮速读中没有的 ticker/主题 → 完整格式 200-250 字
+  - `[更新]` = 上一轮出现过,且本窗口有新催化、触发/失效状态变化或关键期权流变化 → 只写变化点 ≤150 字
+  - `[延续]` = 上一轮出现过且无新信息 → 单行 ≤60 字
+- 本窗口证据已消失的 setup **直接删除**,不标 [延续] 硬留——防 setup 单调堆积顶到字数上限
+- 没有 `PREVIOUS_DIGEST_CONTEXT` 时,全部标 `[新]`
+- 上一轮速读只用于增量判定,是历史快照:所有价格/数字仍必须走本轮 9.5 校验,不得照抄
+- 盘前 08 点与盘后 22 点总报:标记照打,但 [更新]/[延续] 允许用完整格式重述(总报要自足);盘中 hourly 严格执行压缩
+- `触发:… / 失效:…` 必须独立成行([延续] 可并入其单行)
+
+**极短版速读(盘中降噪)**:非 08/22 轮,同时满足 ①没有任何 `[新]` setup ②宏观/大 V 无重大增量 ③已校验 SPY 与 QQQ 相对上一轮速读标题行快照变动均 <0.5% → 用极短版替代完整速读,目标 ≤400 字:
+
+    盘中简报 {时间} EDT · SPY {价}({±%}) / QQQ {...} / VIX {...}
+    本轮增量:无
+    1. [延续] {TICKER} ${price}({±%}) 触发/失效位不变
+    2. ...
+    📊 {必要技术位一行,可省}
+
+极短版标题行必须保留 SPY/QQQ/VIX 快照(下一轮增量对比链依赖它)。
+
+约束:不写完整 brief 路径;不放链接;没内容的整节省略;保留出处、触发/失效条件;AlphaLens 块须与其它来源去重;没有通过 9.5 校验的当前价/涨跌幅不进微信速读,群聊点位必须标"群内提及/技术位/目标价";写完估算 < 1900 字。每个 setup 首行带 [新/更新/延续] 标记,「本轮增量:」行必须存在;本窗口证据消失的 setup 直接删除不硬留;极短版(无增量+SPY/QQQ 变动<0.5%)≤400 字,标题行保留指数快照。
 
 **11. 写完**:用 Write 工具落地后,**单独**给一行 stdout `REPORT_WRITTEN: {path}`,然后停止。
 
-**关键**:`REPORT_WRITTEN` 行**只在 stdout**(run launcher 解析),**绝不**写进 markdown 文件。Write 时 brief 内容**结束于"## 🔍 群氛围速记" section** 或最后有内容的 section。看到自己生成的 brief 末尾有 `REPORT_WRITTEN` 字符串,Edit 删掉那行再 stdout 输出。
+**关键**:`REPORT_WRITTEN` 行**只在 stdout**(run launcher 解析),**绝不**写进 markdown 文件。Write 时 brief 内容**结束于"## 📱 微信速读" section** 或最后有内容的 section。看到自己生成的 brief 末尾有 `REPORT_WRITTEN` 字符串,Edit 删掉那行再 stdout 输出。
 
 ### 盘中/盘后简化规则
 
@@ -287,7 +410,7 @@ worker 会输出 `MARKDOWN_WRITTEN` / `JSONL_WRITTEN`;Read markdown 后按以下
 - 📊 大盘技术位(除非新点位)
 - 🔍 群氛围速记(每小时变化不大,可省)
 
-保留:⚡ + 🎯(改名"个股新动向")+ 🎙️ + 🔥。
+保留:⚡ + 🎯(改名"个股新动向")+ 🎙️ + 🔥 + **📱 微信速读(任何时段必给)**。
 
 ## 行为约束
 
