@@ -28,7 +28,8 @@ SECTION_ORDER = [
 ]
 INCREMENT_RE = re.compile(r"^本轮增量[:：]")
 SHORT_RE = re.compile(r"^本轮增量[:：]\s*无\s*$")
-SETUP_HEAD_RE = re.compile(r"^(\d+)\.\s*(?:\[(新|更新|延续)\])?\s*(.*)$")
+# (?!\d) so decimal-leading body lines (1.5% ...) are not setup heads.
+SETUP_HEAD_RE = re.compile(r"^(\d+)\.(?!\d)\s*(?:\[(新|更新|延续)\])?\s*(.*)$")
 TRIGGER_RE = re.compile(r"触发[:：]")
 
 
@@ -69,9 +70,7 @@ def lint_digest(body: str) -> list[str]:
         start = flash_rows[0] + 1
         later = [i for i, _ in hits if i > flash_rows[0]]
         end = later[0] if later else len(lines)
-        setup_idxs = [
-            i for i in range(start, end) if SETUP_HEAD_RE.match(lines[i].strip()) and lines[i].strip()[0].isdigit()
-        ]
+        setup_idxs = [i for i in range(start, end) if SETUP_HEAD_RE.match(lines[i].strip())]
         for k, i in enumerate(setup_idxs):
             m = SETUP_HEAD_RE.match(lines[i].strip())
             num, tag = m.group(1), m.group(2)

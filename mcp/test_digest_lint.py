@@ -85,6 +85,15 @@ class DigestLintTests(unittest.TestCase):
         )
         self.assertEqual(dl.lint_digest(variant), [])
 
+    def test_decimal_continuation_line_not_a_setup(self) -> None:
+        # ⚡ 段正文里以小数开头的行(1.5% ...)不是 setup 首行,不得触发
+        # 「缺标记」误报,也不得切断真 setup 的块导致「缺触发行」误报。
+        variant = GOOD.replace(
+            "财报 beat,Azure +43%,capex 有需求支撑。\n",
+            "财报 beat,Azure +43%,capex 有需求支撑。\n1.5% 的隐含波动对应 straddle $6。\n",
+        )
+        self.assertEqual(dl.lint_digest(variant), [])
+
     def test_unreadable_file_exits_gracefully(self) -> None:
         # 非 UTF-8 报告文件必须 warn+exit 1,不得 traceback(never-throw 承诺)。
         script = Path(__file__).resolve().parent / "digest_lint.py"
