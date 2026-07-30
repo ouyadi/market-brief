@@ -26,10 +26,10 @@ SECTION_ORDER = [
     ("复盘", True),
     ("📊", False),
 ]
-INCREMENT_RE = re.compile(r"^本轮增量[::]")
-SHORT_RE = re.compile(r"^本轮增量[::]\s*无\s*$")
+INCREMENT_RE = re.compile(r"^本轮增量[:：]")
+SHORT_RE = re.compile(r"^本轮增量[:：]\s*无\s*$")
 SETUP_HEAD_RE = re.compile(r"^(\d+)\.\s*(?:\[(新|更新|延续)\])?\s*(.*)$")
-TRIGGER_RE = re.compile(r"触发[::]")
+TRIGGER_RE = re.compile(r"触发[:：]")
 
 
 def _delimiter_hits(lines: list[str]) -> list[tuple[int, int]]:
@@ -95,7 +95,9 @@ def main() -> int:
 
     try:
         markdown = args.report.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError: a non-UTF-8 report must warn,
+        # not traceback (warn-only contract).
         print("LINT: 报告文件不可读")
         return 1
     section = extract_section(markdown, "微信速读")
