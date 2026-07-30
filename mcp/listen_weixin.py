@@ -8,6 +8,7 @@ WEIXIN_HOME_CHANNEL so we only respond to the bot owner, not strangers):
   2. Match special slash commands first (cheap, no LLM spend):
        /ping              -> reply "pong" + uptime
        /brief             -> Start-ScheduledTask MarketBrief (forces a run now)
+       /alphabrief        -> fetch the latest alphalens.app /brief digest
        /help              -> reply the command list
   3. Anything else: spawn the configured LLM CLI (`codex exec` by default,
      or `claude --print` when MARKET_BRIEF_LLM_BACKEND=claude)
@@ -46,6 +47,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -971,6 +973,55 @@ async def _handle_brief(text: str = "") -> str:
         return f"✗ 触发异常: {exc}"
 
 
+async def _handle_alphabrief(text: str = "") -> str:
+    """Fetch the cached AlphaLens website Brief summary without an LLM run."""
+    url = (
+        os.environ.get("ALPHALENS_BRIEF_URL")
+        or "https://alphalens.app/api/brief/digest"
+    ).strip()
+    token = (os.environ.get("ALPHALENS_BRIEF_TOKEN") or "").strip()
+    timeout_s = int(os.environ.get("ALPHALENS_BRIEF_TIMEOUT_S", "20"))
+
+    if not token:
+        return "✗ AlphaLens Brief 尚未配置 token。"
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "✗ ALPHALENS_BRIEF_URL 配置无效。"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=max(3, min(timeout_s, 60)))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                allow_redirects=False,
+            ) as response:
+                if response.status == 401:
+                    return "✗ AlphaLens Brief token 不匹配。"
+                if response.status == 404:
+                    return "AlphaLens 还没有生成可用的 Brief。"
+                if response.status == 503:
+                    return "✗ AlphaLens Brief 接口尚未启用。"
+                if response.status < 200 or response.status >= 300:
+                    return f"✗ AlphaLens Brief 请求失败 (HTTP {response.status})。"
+                payload = await response.json(content_type=None)
+    except asyncio.TimeoutError:
+        return f"✗ AlphaLens Brief 请求超时 ({timeout_s}s)。"
+    except (aiohttp.ClientError, ValueError, TypeError) as exc:
+        log.warning("alphabrief: fetch failed: %s", exc)
+        return "✗ AlphaLens Brief 返回异常,请稍后重试。"
+
+    if not isinstance(payload, dict):
+        return "✗ AlphaLens Brief 返回格式无效。"
+    summary = payload.get("text")
+    if not isinstance(summary, str) or not summary.strip():
+        return "✗ AlphaLens Brief 摘要为空。"
+    return summary.strip()[:1_950]
+
+
 async def _handle_context(text: str = "") -> str:
     chat_id = _creds().get("home_channel", "")
     if not chat_id:
@@ -1006,6 +1057,7 @@ async def _handle_help(text: str = "") -> str:
         "可用命令:\n"
         "  /ping              测试 listener 在线\n"
         "  /brief             立刻触发一次 market-brief\n"
+        "  /alphabrief        总结 alphalens.app 的最新 Brief 页面\n"
         "  /context           查看微信短期记忆状态和最近几条上下文\n"
         "  /reset_context     清空微信短期记忆和滚动摘要\n"
         "  /reminders         查看待确认主动提醒\n"
@@ -1827,6 +1879,8 @@ async def _handle_rollback(text: str = "") -> str:
 COMMANDS = {
     "/ping": _handle_ping,
     "/brief": _handle_brief,
+    "/alphabrief": _handle_alphabrief,
+    "/albrief": _handle_alphabrief,
     "/context": _handle_context,
     "/reset_context": _handle_reset_context,
     "/reminders": _handle_reminders,

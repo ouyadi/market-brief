@@ -172,6 +172,7 @@ phase3_copy() {
     for entry in \
         "$MAC_SCRIPTS:run.sh" \
         "$MCP_DIR:push_weixin.py" \
+        "$MCP_DIR:alphalens_brief.py" \
         "$MCP_DIR:qr_login_bootstrap.py" \
         "$MCP_DIR:listen_weixin.py" \
         "$CONFIG_DIR:secrets.example.json"; do

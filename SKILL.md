@@ -15,10 +15,12 @@ Claude Code with a fixed prompt that:
    WebFetches them
 3. Optionally extracts research-report embeds from a Discord research-bot
    channel
-4. Writes a tier-tagged markdown report to `C:\Users\<u>\Reports\YYYY-MM-DD-HH-brief.md`
-5. Pushes it to the user's WeChat via Hermes Agent's iLink adapter
+4. Optionally fetches the protected `alphalens.app/brief` digest and folds a
+   deduplicated summary into the report, phone speed-read, and image data
+5. Writes a tier-tagged markdown report to `C:\Users\<u>\Reports\YYYY-MM-DD-HH-brief.md`
+6. Pushes it to the user's WeChat via Hermes Agent's iLink adapter
    (split into ~3–5 chunks of ≤2000 chars each)
-6. Falls back to SMTP email only if the WeChat push fails
+7. Falls back to SMTP email only if the WeChat push fails
 
 ```
 Task Scheduler ─→ run.ps1 ─→ claude --print (prompt.md)
@@ -103,6 +105,7 @@ market-brief/                       <— repo root = skill bundle
 │
 ├── mcp/                            <— Python MCP servers + helpers (cross-platform)
 │   ├── push_weixin.py              <— WeChat push helper with smart H2/H3-aware chunking
+│   ├── alphalens_brief.py           <— protected AlphaLens Brief reader + prompt context
 │   ├── qr_login_bootstrap.py       <— one-time iLink QR bind
 │   ├── listen_weixin.py            <— long-poll listener + typing keepalive
 │   ├── twitter_playwright_mcp.py   <— X scraper MCP (port 3031)
@@ -195,7 +198,9 @@ Open `C:\Users\<u>\Scripts\market-brief\secrets.json` and fill in:
   "smtpUser":    "<user>@gmail.com",
   "smtpPassword":"abcd efgh ijkl mnop",            // 16-char App Password, NOT real password
   "fromAddress": "<user>@gmail.com",
-  "toAddress":   "<user>@gmail.com"
+  "toAddress":   "<user>@gmail.com",
+  "alphalensBriefUrl": "https://alphalens.app/api/brief/digest",
+  "alphalensBriefToken": "<same value as ALPHALENS_BRIEF_API_TOKEN>"
 }
 ```
 
@@ -633,6 +638,7 @@ After the listener is up (Step 9), the user can DM the bot from WeChat with:
 |---|---|
 | `/ping` | Check listener is alive |
 | `/brief` | Trigger one `MarketBrief` run immediately |
+| `/alphabrief` | Fetch the latest read-only summary of the `alphalens.app/brief` page |
 | `/dv [handle] [Nh]` | KOL digest. `/dv` = all KOLs × 2h; `/dv cathiedwood 24h` = single handle, custom window |
 | `/xfeed [tab] [N]` | X home timeline brief. `/xfeed` = For You + Following each 15; `/xfeed for_you`; `/xfeed following 25` |
 | `/plan [tickers]` | Enriched execution plan (stock-price + X live news + tech levels + entry/stop/target). `/plan` = top 3 from latest brief; `/plan TSLA NVDA` = specific tickers |
@@ -705,7 +711,7 @@ a fresh token.
 ## macOS variant
 
 The Mac port is shipped as a parallel set of files in the same repo. The
-Python helpers (`push_weixin.py`, `qr_login_bootstrap.py`, `listen_weixin.py`,
+Python helpers (`push_weixin.py`, `alphalens_brief.py`, `qr_login_bootstrap.py`, `listen_weixin.py`,
 `twitter_playwright_mcp.py`, `stock_price_mcp.py`) are now cross-platform —
 they resolve paths from `Path.home()` instead of hardcoded `C:\Users\...`.
 Only the launchers and scheduler glue differ.
@@ -724,7 +730,7 @@ All paths below are relative to the repo root.
 | Polymarket MCP daemon | `install-polymarket-mcp.ps1` | `launchd/com.ouyadi.polymarket-mcp.plist` |
 | One-command installer | `quickstart.ps1` | `quickstart-mac.sh` |
 
-Python helpers (cross-platform, in `mcp/`): `push_weixin.py`, `qr_login_bootstrap.py`,
+Python helpers (cross-platform, in `mcp/`): `push_weixin.py`, `alphalens_brief.py`, `qr_login_bootstrap.py`,
 `listen_weixin.py`, `twitter_playwright_mcp.py`, `stock_price_mcp.py`, `polymarket_mcp.py`.
 
 Config templates (in `config/`): `prompt.template.md`, `secrets.example.json`.

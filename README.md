@@ -13,6 +13,7 @@
 Task Scheduler / launchd  (美东 08:00–22:00,每小时)
         ↓
 run.ps1 / run.sh
+        ↓ 先只读抓取 alphalens.app/brief 摘要(已配置时)
         ↓
 claude --print  (prompt.md → 调用 mcp__chatlog + mcp__discord-selfbot + mcp__twitter + mcp__stock-price)
         ↓
@@ -26,6 +27,7 @@ SMTP → Gmail → 邮箱 (完整简报)
 ```
 
 - **分时段感知**:盘前(扫过去 24h)/盘中(90min)/盘后(90min),`prompt.md` 按美东时间自动切结构
+- **AlphaLens Brief 自动并入**:launcher 用本地 token 读取受保护摘要,模型去重后写入完整报告、微信速读和图片简报;接口失败不会阻断原简报
 - **推 3 个核心 section**:`⚡ 高优先级关注` + `🎯 个股新动向` + `🎙️ 大 V 速读`,各一条微信消息。完整报告还在盘上 + 邮箱兜底里
 - **智能切分**:超长 section 自动按 H2/H3 标题边界切,绝不把 `### TSLA` 标题孤立在上一条末尾(详见 [`push_weixin.py`](mcp/push_weixin.py) 的 `smart_chunks`)
 - **失败邮件兜底**:微信是主通道,只有 push 失败才发邮件。Hermes 已经做了 tokenless retry,实测 30 天 0 失败
@@ -40,7 +42,7 @@ WeixinListener 任务(At log on,run-listener.ps1 / launchd)
 listen_weixin.py 长轮询 iLink /getupdates
         ↓
   11 个斜杠命令(便宜,不耗 Claude):
-    基础: /ping /brief /help
+    基础: /ping /brief /alphabrief /help
     分析: /dv [handle] [Xh]    大 V 速读
           /xfeed [tab] [N]     X 个人时间线
           /plan [tickers]      可执行方案富化(stock-price + X news)
@@ -244,6 +246,7 @@ Claude 读 SKILL.md 把 install 步骤一步步走完。手动环节(填群、�
 | &nbsp;&nbsp;[`launchd/*.plist`](scripts/macos/launchd/) | 6 个 macOS 守护 plist(market-brief / weixin-listener / twitter-mcp / stock-mcp / polymarket-mcp / financialjuice-mcp) |
 | &nbsp;&nbsp;[`quickstart-mac.sh`](scripts/macos/quickstart-mac.sh) | **macOS 一键安装器** —— 7 个幂等阶段 |
 | **`mcp/`** | Python MCP servers + 工具(跨平台共用) |
+| &nbsp;&nbsp;[`alphalens_brief.py`](mcp/alphalens_brief.py) | 安全读取 AlphaLens Brief API 并生成简报上下文(token 不进入 prompt) |
 | &nbsp;&nbsp;[`push_weixin.py`](mcp/push_weixin.py) | 微信发送器,支持 `--section` 多 H2 推 + smart 切分 |
 | &nbsp;&nbsp;[`qr_login_bootstrap.py`](mcp/qr_login_bootstrap.py) | 一次性 iLink QR 绑定 |
 | &nbsp;&nbsp;[`listen_weixin.py`](mcp/listen_weixin.py) | 入站长轮询 listener(微信 → claude → 回复)+ typing keepalive |

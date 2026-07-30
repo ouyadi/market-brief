@@ -21,6 +21,7 @@ set -euo pipefail
 MARKET_BRIEF_DIR="${MARKET_BRIEF_DIR:-$HOME/Scripts/market-brief}"
 REPORTS_DIR="${REPORTS_DIR:-$HOME/Reports}"
 HERMES_VENV="${HERMES_VENV:-$HOME/hermes-agent/.venv}"
+VENV_PY="$HERMES_VENV/bin/python"
 
 PROMPT_FILE="$MARKET_BRIEF_DIR/prompt.md"
 SECRETS_FILE="$MARKET_BRIEF_DIR/secrets.json"
@@ -82,7 +83,8 @@ export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH"
 # needing a manual prompt.md re-edit.
 MEMORY_FILE="$MARKET_BRIEF_DIR/memory.md"
 PROMPT_INPUT="$(mktemp)"
-trap 'rm -f "$PROMPT_INPUT"' EXIT
+ALPHA_CONTEXT="$(mktemp)"
+trap 'rm -f "$PROMPT_INPUT" "$ALPHA_CONTEXT"' EXIT
 if [ -f "$MEMORY_FILE" ]; then
     {
         echo "<!-- PERSISTENT MEMORY (from memory.md) -->"
@@ -97,6 +99,28 @@ else
     cp "$PROMPT_FILE" "$PROMPT_INPUT"
 fi
 
+# Fetch source data before the LLM run. The helper reads the token from the
+# secrets file and never writes it to stdout, logs, or the prompt.
+ALPHA_TOOL="$MARKET_BRIEF_DIR/alphalens_brief.py"
+if [ -x "$VENV_PY" ] && [ -f "$ALPHA_TOOL" ]; then
+    if ALPHA_FETCH_LOG="$("$VENV_PY" "$ALPHA_TOOL" --secrets "$SECRETS_FILE" \
+            --format prompt --output "$ALPHA_CONTEXT" 2>&1)"; then
+        printf '\n\n' >> "$PROMPT_INPUT"
+        cat "$ALPHA_CONTEXT" >> "$PROMPT_INPUT"
+        log "appended AlphaLens Brief source context"
+    elif grep -q 'alphalensBriefToken' "$SECRETS_FILE"; then
+        log "[WARN] AlphaLens Brief unavailable; regular brief continues: $ALPHA_FETCH_LOG"
+        cat >> "$PROMPT_INPUT" <<'ALPHAEOF'
+
+<!-- ALPHALENS_BRIEF_STATUS -->
+AlphaLens /brief was configured but unavailable this run. Mention
+`AlphaLens Brief: unavailable` once in the report source-degradation line.
+Do not invent an AlphaLens section or facts.
+<!-- END_ALPHALENS_BRIEF_STATUS -->
+ALPHAEOF
+    fi
+fi
+
 # Run Claude
 log "launching claude --print (takes a few minutes)..."
 claude --print --dangerously-skip-permissions --output-format text < "$PROMPT_INPUT" \
@@ -108,8 +132,6 @@ log "report ready: $REPORT_FILE"
 # --- Push WeChat (primary) ---
 WX_OK=0
 PUSH_TOOL="$MARKET_BRIEF_DIR/push_weixin.py"
-VENV_PY="$HERMES_VENV/bin/python"
-
 if [ -x "$VENV_PY" ] && [ -f "$PUSH_TOOL" ]; then
     # Push three sections as separate iLink messages so 🎯 个股 and 🎙️ 大V
     # signal don't get squeezed out of the single ⚡ chunk. push_weixin.py

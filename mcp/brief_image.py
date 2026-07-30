@@ -22,6 +22,7 @@ SECTION_ORDER = (
     "🎯",
     "🎙",
     "🏛",
+    "AlphaLens",
     "🏦",
     "🔥",
     "📊",

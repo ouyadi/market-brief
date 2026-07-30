@@ -176,6 +176,7 @@ function Phase3-CopyFiles {
         @{Dir=$WIN_SCRIPTS; Name='hermes-py.ps1'},
         @{Dir=$WIN_SCRIPTS; Name='run-hidden.vbs'},   # no-flash launcher used by schedule-install.ps1 + install-listener.ps1
         @{Dir=$MCP_DIR;     Name='push_weixin.py'},
+        @{Dir=$MCP_DIR;     Name='alphalens_brief.py'},
         @{Dir=$MCP_DIR;     Name='qr_login_bootstrap.py'},
         @{Dir=$MCP_DIR;     Name='listen_weixin.py'},
         @{Dir=$MCP_DIR;     Name='selfevolve.py'},
