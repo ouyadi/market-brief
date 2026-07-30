@@ -1,4 +1,4 @@
-# Market brief runner -- invoked by Windows Task Scheduler hourly 08:00-22:00 EDT.
+# Market brief runner -- invoked by Windows Task Scheduler during trading-day windows.
 #
 # Pipeline:
 #   1) run the configured LLM backend with prompt.md (Codex by default)
@@ -9,8 +9,9 @@
 # Flags:
 #   -SkipEmail   never send the email fallback even if WeChat push fails
 #                (useful for manual smoke tests where you don't want noise)
+#   -Force       bypass market-hours guard for an explicit manual run
 
-param([switch]$SkipEmail)
+param([switch]$SkipEmail, [switch]$Force)
 
 $ErrorActionPreference = "Stop"
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -25,6 +26,9 @@ $env:MARKET_BRIEF_DIR = $here
 $promptFile  = Join-Path $here "prompt.md"
 $secretsFile = Join-Path $here "secrets.json"
 $logDir      = Join-Path $here "logs"
+$venvPy      = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
+                else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
+$alphaBriefTool = Join-Path $here 'alphalens_brief.py'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 
 # crude EDT (UTC-4) -- swap to -5 in Nov when DST ends, or use a proper TZ lookup.
@@ -98,6 +102,101 @@ if (Test-Path $logFile) {
     } catch { }
 }
 
+function Test-TruthyEnv {
+    param([string]$Name)
+    $value = [string](Get-Item "Env:$Name" -ErrorAction SilentlyContinue).Value
+    return $value -match '^(1|true|yes|on)$'
+}
+
+function Get-NthWeekday {
+    param([int]$Year, [int]$Month, [DayOfWeek]$DayOfWeek, [int]$Nth)
+    $d = Get-Date -Year $Year -Month $Month -Day 1 -Hour 0 -Minute 0 -Second 0
+    while ($d.DayOfWeek -ne $DayOfWeek) { $d = $d.AddDays(1) }
+    return $d.AddDays(7 * ($Nth - 1)).Date
+}
+
+function Get-LastWeekday {
+    param([int]$Year, [int]$Month, [DayOfWeek]$DayOfWeek)
+    $d = (Get-Date -Year $Year -Month $Month -Day 1 -Hour 0 -Minute 0 -Second 0).AddMonths(1).AddDays(-1)
+    while ($d.DayOfWeek -ne $DayOfWeek) { $d = $d.AddDays(-1) }
+    return $d.Date
+}
+
+function Get-ObservedFixedHoliday {
+    param([int]$Year, [int]$Month, [int]$Day)
+    $d = Get-Date -Year $Year -Month $Month -Day $Day -Hour 0 -Minute 0 -Second 0
+    if ($d.DayOfWeek -eq [DayOfWeek]::Saturday) { return $d.AddDays(-1).Date }
+    if ($d.DayOfWeek -eq [DayOfWeek]::Sunday) { return $d.AddDays(1).Date }
+    return $d.Date
+}
+
+function Get-EasterSunday {
+    param([int]$Year)
+    $a = $Year % 19
+    $b = [math]::Floor($Year / 100)
+    $c = $Year % 100
+    $d = [math]::Floor($b / 4)
+    $e = $b % 4
+    $f = [math]::Floor(($b + 8) / 25)
+    $g = [math]::Floor(($b - $f + 1) / 3)
+    $h = (19 * $a + $b - $d - $g + 15) % 30
+    $i = [math]::Floor($c / 4)
+    $k = $c % 4
+    $l = (32 + 2 * $e + 2 * $i - $h - $k) % 7
+    $m = [math]::Floor(($a + 11 * $h + 22 * $l) / 451)
+    $month = [math]::Floor(($h + $l - 7 * $m + 114) / 31)
+    $day = (($h + $l - 7 * $m + 114) % 31) + 1
+    return (Get-Date -Year $Year -Month $month -Day $day -Hour 0 -Minute 0 -Second 0).Date
+}
+
+function Test-IsMarketHoliday {
+    param([datetime]$Date)
+    if (Test-TruthyEnv "MARKET_BRIEF_IGNORE_MARKET_HOLIDAYS") { return $false }
+    $year = $Date.Year
+    $closed = @(
+        (Get-ObservedFixedHoliday $year 1 1),                  # New Year's Day
+        (Get-NthWeekday $year 1 ([DayOfWeek]::Monday) 3),      # Martin Luther King Jr. Day
+        (Get-NthWeekday $year 2 ([DayOfWeek]::Monday) 3),      # Washington's Birthday
+        (Get-EasterSunday $year).AddDays(-2),                  # Good Friday
+        (Get-LastWeekday $year 5 ([DayOfWeek]::Monday)),       # Memorial Day
+        (Get-ObservedFixedHoliday $year 6 19),                 # Juneteenth
+        (Get-ObservedFixedHoliday $year 7 4),                  # Independence Day
+        (Get-NthWeekday $year 9 ([DayOfWeek]::Monday) 1),      # Labor Day
+        (Get-NthWeekday $year 11 ([DayOfWeek]::Thursday) 4),   # Thanksgiving
+        (Get-ObservedFixedHoliday $year 12 25)                 # Christmas
+    )
+    $extra = [string](Get-Item Env:MARKET_BRIEF_EXTRA_CLOSED_DATES -ErrorAction SilentlyContinue).Value
+    foreach ($raw in ($extra -split ',')) {
+        $s = $raw.Trim()
+        if (-not $s) { continue }
+        try { $closed += ([datetime]::Parse($s)).Date } catch { }
+    }
+    return $closed -contains $Date.Date
+}
+
+function Test-ShouldRunAutoBrief {
+    param([datetime]$NowEdt, [int]$HourInt)
+    if ($Force -or (Test-TruthyEnv "MARKET_BRIEF_FORCE_RUN")) { return $true }
+    if ($NowEdt.DayOfWeek -in @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)) { return $false }
+    if (Test-IsMarketHoliday $NowEdt) { return $false }
+    $allowed = [string](Get-Item Env:MARKET_BRIEF_AUTO_HOURS -ErrorAction SilentlyContinue).Value
+    if (-not $allowed) {
+        # One premarket scan, hourly during cash session, and one after-hours wrap.
+        $allowed = "08,09,10,11,12,13,14,15,16,18"
+    }
+    $hours = @($allowed -split ',' | ForEach-Object {
+        $s = $_.Trim()
+        if ($s -match '^\d{1,2}$') { [int]$s }
+    })
+    return $hours -contains $HourInt
+}
+
+$hourInt = [int]$hour
+if (-not (Test-ShouldRunAutoBrief $nowEdt $hourInt)) {
+    Log "[$([DateTime]::Now)] ==== market-brief skipped: market closed / outside auto hours (edt=$($nowEdt.ToString('yyyy-MM-dd HH:mm')), weekday=$($nowEdt.DayOfWeek), allowed=$([string](Get-Item Env:MARKET_BRIEF_AUTO_HOURS -ErrorAction SilentlyContinue).Value)) ===="
+    exit 0
+}
+
 # Keep one active brief run per install. Task Scheduler is configured with
 # MultipleInstances=IgnoreNew, but that only works if the scheduled action
 # stays alive for the whole child process. The lock also protects manual smoke
@@ -125,7 +224,6 @@ try {
 $env:MARKET_BRIEF_OUTPUT = $reportFile
 
 # Pick a label for the email subject based on the trading-session bucket.
-$hourInt = [int]$hour
 if     ($hourInt -lt 9)  { $sessionTag = "pre-market"  }
 elseif ($hourInt -le 16) { $sessionTag = "market"      }
 else                     { $sessionTag = "after-hours" }
@@ -179,6 +277,42 @@ if (-not (Test-Path $secretsFile)) {
 }
 $secrets = Get-Content -Raw $secretsFile | ConvertFrom-Json
 
+# Fetch the protected AlphaLens website Brief before launching the LLM. The
+# helper reads the token directly from secrets.json and writes only source data
+# plus synthesis instructions; the credential never enters the prompt or logs.
+$alphaBriefContext = ""
+$alphaBriefUrl = if ($env:ALPHALENS_BRIEF_URL) { $env:ALPHALENS_BRIEF_URL } else { [string]$secrets.alphalensBriefUrl }
+$alphaBriefToken = if ($env:ALPHALENS_BRIEF_TOKEN) { $env:ALPHALENS_BRIEF_TOKEN } else { [string]$secrets.alphalensBriefToken }
+$alphaBriefConfigured = [bool]($alphaBriefUrl -and $alphaBriefToken -and $alphaBriefToken -ne 'REPLACE_WITH_A_RANDOM_TOKEN')
+if ($alphaBriefConfigured -and (Test-Path $venvPy) -and (Test-Path $alphaBriefTool)) {
+    $alphaContextFile = Join-Path $logDir "alphalens-context-$date-$hour-$PID.md"
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $alphaFetchOut = & $venvPy $alphaBriefTool `
+            --secrets $secretsFile `
+            --format prompt `
+            --output $alphaContextFile `
+            2>&1
+        $alphaFetchExit = $LASTEXITCODE
+    } catch {
+        $alphaFetchOut = @("ALPHALENS_BRIEF_UNAVAILABLE: helper invocation failed")
+        $alphaFetchExit = 4
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($alphaFetchExit -eq 0 -and (Test-Path $alphaContextFile)) {
+        $alphaBriefContext = Get-Content -Raw -Encoding UTF8 $alphaContextFile
+        Log "[$([DateTime]::Now)] AlphaLens Brief source ready ($($alphaBriefContext.Length) chars)"
+    } else {
+        foreach ($line in @($alphaFetchOut)) { Log "    [alphalens] $line" }
+        Log "[WARN] AlphaLens Brief unavailable; the regular brief will continue"
+    }
+    Remove-Item $alphaContextFile -ErrorAction SilentlyContinue
+} elseif ($alphaBriefConfigured) {
+    Log "[WARN] AlphaLens Brief helper or Python runtime missing; the regular brief will continue"
+}
+
 if ($backend -eq "claude") {
     if (-not $secrets.claudeCodeOauthToken) {
         Log "[ERROR] secrets.json missing claudeCodeOauthToken. Generate one with: claude setup-token"
@@ -205,6 +339,19 @@ if (Test-Path $memoryFile) {
               $prompt
     Log "[$([DateTime]::Now)] prepended memory.md ($($memory.Length) chars)"
 }
+if ($alphaBriefContext) {
+    $prompt += "`n`n" + $alphaBriefContext
+    Log "[$([DateTime]::Now)] appended AlphaLens Brief source context"
+} elseif ($alphaBriefConfigured) {
+    $prompt += @'
+
+<!-- ALPHALENS_BRIEF_STATUS -->
+AlphaLens /brief was configured but unavailable this run. Mention
+`AlphaLens Brief: unavailable` once in the report source-degradation line.
+Do not invent an AlphaLens section or facts.
+<!-- END_ALPHALENS_BRIEF_STATUS -->
+'@
+}
 Log "[$([DateTime]::Now)] launching $backend (this may take a few minutes)..."
 
 # Pipe prompt via stdin to avoid quoting hell.
@@ -222,7 +369,7 @@ if ($backend -eq "codex" -or $backend -eq "gpt" -or $backend -eq "openai") {
         "--output-last-message", $lastMessageFile,
         "--color", "never"
     )
-    $codexModel = if ($env:MARKET_BRIEF_CODEX_MODEL) { $env:MARKET_BRIEF_CODEX_MODEL } else { "gpt-5.4" }
+    $codexModel = if ($env:MARKET_BRIEF_CODEX_MODEL) { $env:MARKET_BRIEF_CODEX_MODEL } else { "gpt-5.5" }
     $codexArgs += @("--model", $codexModel)
     Log "[$([DateTime]::Now)] codex model: $codexModel"
     $codexArgs += "-"
@@ -281,9 +428,6 @@ if (-not (Test-Path $reportFile)) {
 Log "[$([DateTime]::Now)] report ready: $reportFile"
 
 # --- 5. Push to WeChat via Hermes Agent iLink (primary channel) --------
-# Allow power users to point at a non-default venv via $env:HERMES_VENV.
-$venvPy   = if ($env:HERMES_VENV) { Join-Path $env:HERMES_VENV 'Scripts\python.exe' }
-            else { Join-Path $env:USERPROFILE 'hermes-agent\.venv\Scripts\python.exe' }
 $pushTool = Join-Path $here 'push_weixin.py'
 $imageTool = Join-Path $here 'brief_image.py'
 $gptImageTool = Join-Path $here 'brief_image_gpt.py'
