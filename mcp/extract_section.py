@@ -14,6 +14,9 @@ import sys
 from pathlib import Path
 
 H2_RE = re.compile(r"^##\s+(.*)$")
+# Clamp mirrors alphalens_brief.py's MAX_DIGEST_CHARS: a runaway section must
+# not blow up the prompt (the speed-read is contractually <=1900 chars anyway).
+MAX_SECTION_CHARS = 4_000
 
 _PREVIOUS_DIGEST_TMPL = """<!-- PREVIOUS_DIGEST_CONTEXT -->
 下面是上一轮简报的「微信速读」原文(来自 {source}),仅用于逐 setup 判定本轮
@@ -108,6 +111,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 4
+        if len(section) > MAX_SECTION_CHARS:
+            section = section[:MAX_SECTION_CHARS] + "\n[truncated]"
         rendered = wrap_context(args.wrap, section, source.name)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

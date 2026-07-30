@@ -44,6 +44,14 @@ def _delimiter_hits(lines: list[str]) -> list[tuple[int, int]]:
     return hits
 
 
+def lint_heading(heading_line: str) -> list[str]:
+    """push_weixin.py selects the text-push section by the 📱 needle; a heading
+    that lost the emoji would silently break that fallback channel."""
+    if "📱" in heading_line:
+        return []
+    return ["LINT: 「微信速读」标题缺 📱(push_weixin 按 📱 选段,缺了会文字推送落空)"]
+
+
 def lint_digest(body: str) -> list[str]:
     problems: list[str] = []
     if len(body) > MAX_CHARS:
@@ -103,8 +111,8 @@ def main() -> int:
     if section is None:
         print("LINT: 报告缺少「微信速读」section")
         return 1
-    body = section.split("\n", 1)[1].strip()  # drop the H2 heading line
-    problems = lint_digest(body)
+    heading_line, rest = section.split("\n", 1)
+    problems = lint_heading(heading_line) + lint_digest(rest.strip())
     if problems:
         for p in problems:
             print(p)

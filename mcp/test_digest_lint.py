@@ -108,6 +108,12 @@ class DigestLintTests(unittest.TestCase):
         self.assertIn(b"LINT:", result.stdout)
         self.assertNotIn(b"Traceback", result.stderr)
 
+    def test_heading_without_phone_emoji_flagged(self) -> None:
+        # push_weixin.py 按 📱 选段;标题丢 emoji 会让文字推送落空,须警告。
+        self.assertEqual(dl.lint_heading("## 📱 微信速读"), [])
+        problems = dl.lint_heading("## 微信速读")
+        self.assertTrue(any("📱" in p for p in problems))
+
     def test_section_order_violation(self) -> None:
         bad = GOOD.replace(
             "🏛 宏观/政策\nPolymarket:9 月加息 25bp 53.5%。\n\nAlphaLens\n页面姿态中性偏防御,降 beta。",

@@ -324,7 +324,7 @@ $extractTool = Join-Path $here 'extract_section.py'
 if ((Test-Path $venvPy) -and (Test-Path $extractTool)) {
     $secDigest = [System.Text.Encoding]::UTF8.GetString([byte[]](0xE5,0xBE,0xAE,0xE4,0xBF,0xA1,0xE9,0x80,0x9F,0xE8,0xAF,0xBB)) # 微信速读
     $prevContextFile = Join-Path $logDir "prev-digest-context-$date-$hour-$PID.md"
-    $prevEAPx = $ErrorActionPreference
+    $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
         $prevOut = & $venvPy $extractTool `
@@ -339,10 +339,12 @@ if ((Test-Path $venvPy) -and (Test-Path $extractTool)) {
         $prevOut = @("EXTRACT_SECTION_UNAVAILABLE: helper invocation failed")
         $prevExit = 4
     } finally {
-        $ErrorActionPreference = $prevEAPx
+        $ErrorActionPreference = $prevEAP
     }
     if ($prevExit -eq 0 -and (Test-Path $prevContextFile)) {
-        $prevDigestContext = Get-Content -Raw -Encoding UTF8 $prevContextFile
+        # EXTRACT_SECTION_READY <file> names the comparison-baseline report.
+        foreach ($line in @($prevOut)) { Log "    [prev-digest] $line" }
+        $prevDigestContext = Get-Content -Raw -Encoding UTF8 $prevContextFile -ErrorAction SilentlyContinue
         Log "[$([DateTime]::Now)] previous digest context ready ($($prevDigestContext.Length) chars)"
     } else {
         foreach ($line in @($prevOut)) { Log "    [prev-digest] $line" }
@@ -475,7 +477,7 @@ Log "[$([DateTime]::Now)] report ready: $reportFile"
 # stray stderr line would kill the run before the WeChat push.
 $lintTool = Join-Path $here 'digest_lint.py'
 if ((Test-Path $venvPy) -and (Test-Path $lintTool)) {
-    $prevEAPl = $ErrorActionPreference
+    $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
         $lintOut = & $venvPy $lintTool $reportFile 2>&1
@@ -484,7 +486,7 @@ if ((Test-Path $venvPy) -and (Test-Path $lintTool)) {
         $lintOut = @("digest lint invocation failed: $($_.Exception.Message)")
         $lintExit = 1
     } finally {
-        $ErrorActionPreference = $prevEAPl
+        $ErrorActionPreference = $prevEAP
     }
     foreach ($line in @($lintOut)) { Log "    [digest-lint] $line" }
     if ($lintExit -ne 0) { Log "[WARN] digest lint reported problems (push continues)" }

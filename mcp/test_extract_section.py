@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +84,31 @@ class ExtractSectionTests(unittest.TestCase):
         self.assertIn("<!-- SETUP_REVIEW_CONTEXT -->", wrapped)
         self.assertIn("行情工具核对", wrapped)
         self.assertIn("<!-- END_SETUP_REVIEW_CONTEXT -->", wrapped)
+
+    def test_overlong_section_is_truncated(self) -> None:
+        # A runaway section must be clamped before prompt injection.
+        md = "# t\n\n## 📱 微信速读\n\n" + "字" * 4500 + "\n"
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "2026-07-30-08-brief.md").write_text(md, encoding="utf-8")
+            out = d / "ctx.md"
+            argv_backup = sys.argv
+            sys.argv = [
+                "extract_section.py",
+                "--reports-dir", str(d),
+                "--section", "微信速读",
+                "--pick", "latest",
+                "--wrap", "none",
+                "--output", str(out),
+            ]
+            try:
+                rc = ex.main()
+            finally:
+                sys.argv = argv_backup
+            self.assertEqual(rc, 0)
+            text = out.read_text(encoding="utf-8")
+        self.assertLess(len(text), 4200)
+        self.assertIn("[truncated]", text)
 
 
 if __name__ == "__main__":
