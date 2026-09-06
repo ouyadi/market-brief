@@ -45,18 +45,15 @@ COPY mcp/ /app/mcp/
 
 # Supervisor config — one process per MCP.
 COPY mcp-bundle/supervisord.conf /etc/supervisord.conf
+COPY mcp-bundle/healthcheck.py /usr/local/bin/mcp-bundle-healthcheck.py
 
 # Document which ports this container exposes. Coolify maps them
 # internally via the coolify network so sibling containers can reach
 # alphalens-mcp-bundle:3032 etc.
 EXPOSE 3032 3033 3034 3035 3036 3037 3038 3039 3040 3041 3042 3043 7050
 
-# Tiny TCP healthcheck against fred (lightest MCP).
+# Check enabled processes without opening persistent MCP sessions.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS -o /dev/null -X POST -H "Content-Type: application/json" \
-      -H "Accept: application/json, text/event-stream" \
-      -H "Authorization: Bearer $MCP_SHARED_SECRET" \
-      --data-raw '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1"}}}' \
-      http://127.0.0.1:3035/mcp || exit 1
+  CMD python /usr/local/bin/mcp-bundle-healthcheck.py
 
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]
